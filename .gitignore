@@ -1,0 +1,26 @@
+# Build intermediates
+src/build/
+*.obj
+*.exp
+*.ilk
+
+# Multi-GB research payloads (PIX captures, C++ replay exports, harness exes)
+research/
+frames/
+
+# User-local runtime data: logs, crash reports, driver DLLs
+User/*
+!User/README.md
+
+# Crash/trace artifacts
+*.dmp
+*.wpix
+*.etl
+*.pml
+
+# OS junk
+Thumbs.db
+Desktop.ini
+
+# Gameplay recordings
+*.mp4
