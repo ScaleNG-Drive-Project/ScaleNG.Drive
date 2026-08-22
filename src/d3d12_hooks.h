@@ -5,6 +5,8 @@
 struct ScaleNgConfig {
     bool enabled = true;
     bool dlaa = false;
+    bool hud = true;
+    bool legacyScale = false;
     bool passive = false;
     float renderScale = 0.67f;
     float sharpness = 0.0f;

@@ -105,6 +105,8 @@ static void LoadConfig()
     if (renderScale > 0.99f) renderScale = 0.99f;
     g_config.renderScale = renderScale;
     g_config.dlaa = getBool(L"dlaa", false);
+    g_config.hud = getBool(L"hud", true);
+    g_config.legacyScale = getBool(L"legacyScale", false);
     g_config.passive = getBool(L"passive", false);
     g_config.sharpness = getFloat(L"sharpness", 0.0f);
     g_config.perfQuality = getInt(L"perfQuality", 1);
@@ -167,10 +169,10 @@ extern "C" __declspec(dllexport) void InitializeASI()
             Log("ScaleNG.asi disabled via config - no hooks installed");
             return;
         }
-        Log("config: renderScale=%.2f sharpness=%.2f perfQuality=%d mvJittered=%d autoExposure=%d appId=%u dlaa=%d",
+        Log("config: renderScale=%.2f sharpness=%.2f perfQuality=%d mvJittered=%d autoExposure=%d appId=%u dlaa=%d hud=%d legacyScale=%d",
             g_config.renderScale, g_config.sharpness, g_config.perfQuality,
             g_config.mvJittered ? 1 : 0, g_config.autoExposure ? 1 : 0, g_config.appId,
-            g_config.dlaa ? 1 : 0);
+            g_config.dlaa ? 1 : 0, g_config.hud ? 1 : 0, g_config.legacyScale ? 1 : 0);
         Log("init: setting config");
         HooksSetConfig(g_config);
         Log("init: installing D3D12CreateDevice detour");

@@ -196,6 +196,8 @@ unsigned int g_patchFramesWithoutInject = 0;
 // scene/depth/MV resources we can see satisfy the driver's size validation.
 // The viewport patch is not armed (nothing should shrink the render).
 bool g_dlaaMode = false;
+bool g_hudIniOn = true;
+bool g_legacyScale = false;
 
 // Swapchain Present-time injection (DLAA mode only): the game renders every
 // frame DIRECTLY into its swapchain backbuffers (no copy chain), so the only
@@ -327,7 +329,7 @@ void StartFrame()
         g_renderH = (unsigned int)((float)g_displayH * g_cfg.renderScale);
     }
 
-    g_patchViewport = !g_patchAborted && !g_dlaaMode;
+    g_patchViewport = !g_patchAborted && !g_dlaaMode && g_legacyScale;
     static int s_frameLogs = 0;
     ++s_frameLogs;
     if (s_frameLogs <= 20 || (s_frameLogs % 5000) == 0)
@@ -1233,9 +1235,57 @@ void* g_faultAddr = nullptr;
 const char* g_injStep = "init";
 CONTEXT g_faultCtx = {};
 int g_faultCount = 0;
+static void LogInjectFault(unsigned code);
+static bool g_catchFaults = true;
+
+
+// Dedicated init thread: builds injection resources + HUD pipeline OFF the
+// ECL hot path. Signaled by KickInitThread once gameplay is active.
+static HANDLE g_initThreadEv = nullptr;
+static HANDLE g_initThreadH = nullptr;
+static volatile long g_initThreadKick = 0;
+bool g_injResourcesReady = false;
+
+static DWORD WINAPI InitThreadProc(LPVOID)
+{
+    for (;;) {
+        WaitForSingleObject(g_initThreadEv, INFINITE);
+        if (!g_injResourcesReady) {
+            EnsureInjectionResources();
+            // HUD REMOVED from init: its creation surface (d3dcompiler,
+            // PSOs, heaps on the wrapped device) is the prime crash suspect.
+            // Activity signal moved to window title instead.
+            g_injResourcesReady = g_injAlloc && g_injList;
+            Log("hooks: init thread done (resources %s)",
+                g_injAlloc ? "ok" : "FAIL");
+        }
+    }
+    return 0;
+}
+
+static void KickInitThread()
+{
+    if (!g_initThreadEv) {
+        g_initThreadEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+        g_initThreadH = CreateThread(nullptr, 0, InitThreadProc, nullptr, 0, nullptr);
+    }
+    if (!g_initThreadKick) {
+        g_initThreadKick = 1;
+        SetEvent(g_initThreadEv);
+    }
+}
 void TryDeferredInject(ID3D12CommandQueue* injQueue)
 {
-    ID3D12GraphicsCommandList* dummyCl = nullptr; (void)dummyCl;
+    if (g_catchFaults) {
+        __try {
+            InjectAtPresentImpl(injQueue);
+        } __except (g_faultAddr = (void*)GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
+                    g_faultCtx = *GetExceptionInformation()->ContextRecord,
+                    EXCEPTION_EXECUTE_HANDLER) {
+            LogInjectFault(GetExceptionCode());
+        }
+        return;
+    }
     InjectAtPresentImpl(injQueue);
 }
 
@@ -1334,12 +1384,18 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         if (!g_dlssOutValid) CreateDlssOut();
     }
 
-    EnsureInjectionResources();
+    // One-time init runs on a DEDICATED THREAD, never inside the ECL callback.
+    // The creation burst (PSOs/resources mid-callback) correlated with every
+    // loading-phase crash of the fix20-22 era.
+    if (!g_injResourcesReady) {
+        bb->Release();
+        KickInitThread();
+        return;
+    }
     if (!g_injAlloc || !g_injList || !g_injHeap || !g_injSamplerHeap) {
         bb->Release();
         return;
     }
-    if (g_showHud) HudInitCompile();
 
     g_injStep = "gated";
     bool doDlss = g_dlaaMode && !g_dlaaHalted && g_upscaler && g_upscaler->IsReady() && g_dlssOutValid;
@@ -1373,18 +1429,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // possibly-freed COM objects - UB that can corrupt state even when caught.
     // Staleness is now handled purely via discovery stamps + scene-refresh
     // invalidation (map load resets stamps to force re-discovery).
-    bool doHud = g_showHud && g_hudReady;
+    bool doHud = false; // HUD removed: creation surface was the crash source
     if (!doDlss && !doHud) {
         bb->Release();
         return;
-    }
-    if (!doDlss && !doHud) {
         bb->Release();
         return;
     }
     g_injStep = "resources-ready";
-    if (doHud) HudEnsurePso();
-    if (doHud && bb != g_hudLastBb) HudEnsureRtv(bb);
 
     // The previous injected list must be finished before reusing the allocator.
     if (g_injSubmitted && g_injFence && g_injEvent) {
@@ -1502,9 +1554,6 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                 g_evalFailStreak = 0;
                 g_evalDidBridge = true;
                 doDlss = true;
-                ++g_evalOkCount;
-                g_evalFailStreak = 0;
-                doDlss = true;
             } else {
                 ++g_evalFailCount;
                 if (++g_evalFailStreak >= 30 && !g_dlaaHalted) {
@@ -1524,6 +1573,32 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     Real_ExecuteCommandLists(injQueue, 1, cls);
     if (g_injFence) injQueue->Signal(g_injFence, ++g_injFenceVal);
     g_injSubmitted = true;
+    // Copy the DLAA result from the shared texture into the backbuffer.
+    if (g_evalDidBridge) {
+        D3D12_RESOURCE_BARRIER bwo = {};
+        bwo.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bwo.Transition.pResource = g_gameOut;
+        bwo.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        bwo.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bwo.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_injList->Reset(g_injAlloc, nullptr);
+        g_injList->ResourceBarrier(1, &bwo);
+        D3D12_RESOURCE_BARRIER bbc = {};
+        bbc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bbc.Transition.pResource = bb;
+        bbc.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        bbc.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        bbc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_injList->ResourceBarrier(1, &bbc);
+        D3D12_TEXTURE_COPY_LOCATION dsto = {}; dsto.pResource = bb;
+        dsto.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dsto.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION srco = {}; srco.pResource = g_gameOut;
+        srco.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srco.SubresourceIndex = 0;
+        Real_CopyTextureRegion(g_injList, &dsto, 0, 0, 0, &srco, 0);
+        g_injList->Close();
+        ID3D12CommandList* rcls[] = { g_injList };
+        Real_ExecuteCommandLists(injQueue, 1, rcls);
+    }
     if (doDlss)
         Log("hooks: DLAA injection at present (frame %u)", g_frameCounter);
     bb->Release();
@@ -2254,8 +2329,9 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                         }
                         StartFrame();
                         EnsureUpscalerInit();
-                        ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
-                                            g_currJitter, g_prevJitter);
+                        if (g_dlaaMode)
+                            ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
+                                                g_currJitter, g_prevJitter);
                         std::memcpy(g_lastPatchedCameraCb, cb, kCameraCbSize);
                         g_cameraCbValid = true;
                         g_lastCamPatchFrame = g_frameCounter;
@@ -2740,6 +2816,8 @@ void HooksSetConfig(const ScaleNgConfig& config)
     g_cfg = config;
     g_cfgSet = true;
     g_dlaaMode = config.dlaa;
+    g_hudIniOn = config.hud;
+    g_legacyScale = config.legacyScale;
     g_passiveMode = config.passive;
     Log("hooks: config applied (dlaa=%d)", g_dlaaMode ? 1 : 0);
 }
