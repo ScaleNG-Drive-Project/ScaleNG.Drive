@@ -191,8 +191,6 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
     return true;
 }
 
-static ID3D12Resource* g_grave[4] = {};
-static int g_graveN = 0;
 
 // Which scene color was actually rendered this frame (set by the viewport patch).
 ID3D12Resource* g_activeSceneColor = nullptr;
@@ -211,6 +209,25 @@ bool g_frameStarted = false;
 bool g_patchViewport = false;
 bool g_patchAppliedThisFrame = false;
 bool g_injectedThisFrame = false;
+
+ID3D12Resource* g_grave[4] = {};
+int g_graveN = 0;
+
+// Tracked-resource ownership: discovery AddRefs every engine resource it
+// adopts so the pointer can never dangle if the engine releases its own ref
+// between our frames (use-after-free was the mv-barrier TDR source). The
+// previous occupant is parked in the graveyard and released after the next
+// injection fence proves the GPU is done with it.
+void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
+{
+    if (*slot == res) return;
+    if (*slot) {
+        if (g_graveN < 4) g_grave[g_graveN++] = *slot;
+        else (*slot)->Release();
+    }
+    *slot = res;
+    if (res) res->AddRef();
+}
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
 // is backgrounded and only renders the menu), patching the viewport to the render
 // size forever leaves the frame stretched/black and has been observed alongside
@@ -600,7 +617,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
             g_rtvMap[handle.ptr] = res;
             if (!g_sceneColorValid) {
-                g_sceneColor = res;
+                StoreTracked(&g_sceneColor, res);
                 g_sceneColorRtv = handle;
                 g_sceneColorValid = true;
                 AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
@@ -612,7 +629,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_sceneColorRtv = handle;
                 Log("hooks: scene color RTV handle refreshed %p", (void*)res);
             } else if (res != g_sceneColorAlt) {
-                g_sceneColorAlt = res;
+                StoreTracked(&g_sceneColorAlt, res);
                 g_sceneColorRtvAlt = handle;
                 Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
@@ -625,7 +642,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 g_rtvMap[handle.ptr] = res;
                 if (!g_sceneColorValid) {
-                    g_sceneColor = res;
+                    StoreTracked(&g_sceneColor, res);
                     g_sceneColorRtv = handle;
                     g_sceneColorValid = true;
                     Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM)", (void*)res);
@@ -635,7 +652,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     g_sceneColorRtv = handle;
                     Log("hooks: scene color RTV handle refreshed %p", (void*)res);
                 } else if (res != g_sceneColorAlt) {
-                    g_sceneColorAlt = res;
+                    StoreTracked(&g_sceneColorAlt, res);
                     g_sceneColorRtvAlt = handle;
                     Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM) (ALT)", (void*)res);
                 }
@@ -645,17 +662,17 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 g_rtvMap[handle.ptr] = res;
                 if (!g_mvValid) {
-                    g_mvResource = res;
+                    StoreTracked(&g_mvResource, res);
                     g_mvValid = true;
                     g_mvStamp = g_frameCounter;
                     Log("hooks: motion vector RTV %p (%ux%u R16G16_FLOAT)", (void*)res, g_mvW, g_mvH);
                 } else if (res == g_mvResource || res == g_mvResourceAlt) {
                     if (res == g_mvResource) {
-                        g_mvResource = res;
+                        StoreTracked(&g_mvResource, res);
                         Log("hooks: motion vector RTV handle refreshed %p", (void*)res);
                     }
                 } else if (res != g_mvResourceAlt) {
-                    g_mvResourceAlt = res;
+                    StoreTracked(&g_mvResourceAlt, res);
                     Log("hooks: motion vector RTV %p (%ux%u R16G16_FLOAT) (ALT)", (void*)res, g_mvW, g_mvH);
                 }
             }
@@ -665,7 +682,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
             g_rtvMap[handle.ptr] = res;
             if (!g_mvValid) {
-                g_mvResource = res;
+                StoreTracked(&g_mvResource, res);
                 g_mvValid = true;
                 g_mvStamp = g_frameCounter;
                 g_mvW = (unsigned int)rd.Width;
@@ -675,7 +692,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 if (res == g_mvResource)
                     Log("hooks: motion vector RTV handle refreshed %p", (void*)res);
             } else if (res != g_mvResourceAlt) {
-                g_mvResourceAlt = res;
+                StoreTracked(&g_mvResourceAlt, res);
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 Log("hooks: motion vector RTV %p (1920x1001 R16G16_FLOAT) (ALT)", (void*)res);
@@ -724,7 +741,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             rd.Width == g_displayW && rd.Height == g_displayH &&
             (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
              desc->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || desc->Format == DXGI_FORMAT_D32_FLOAT)) {
-            g_depthResource = res;
+            StoreTracked(&g_depthResource, res);
             g_depthValid = true;
             g_depthStamp = g_frameCounter;
             g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -1662,8 +1679,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             __except (EXCEPTION_EXECUTE_HANDLER) {
                 bridgeOk = false;
                 Log("hooks: bridge FAULTED at %s - invalidating all inputs", g_injStep);
-                g_depthResource = nullptr; g_depthValid = false; g_depthStamp = 0;
-                g_mvResource = nullptr; g_mvValid = false; g_mvStamp = 0;
+                StoreTracked(&g_depthResource, nullptr); g_depthValid = false; g_depthStamp = 0;
+                StoreTracked(&g_mvResource, nullptr); g_mvValid = false; g_mvStamp = 0;
             }
 
         }
@@ -2580,7 +2597,7 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                 if (sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     sd.MipLevels == 1 &&
                     sd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
-                    g_sceneColor = src->pResource;
+                    StoreTracked(&g_sceneColor, src->pResource);
                     g_sceneColorValid = true;
                     g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE;
                     AdoptDisplaySize((unsigned int)sd.Width, (unsigned int)sd.Height);
@@ -2623,7 +2640,7 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
             }
             // Depth candidate heuristic (copies NOT involving the scene color or MV).
             if (!isSceneSrc && !isMvDst && dst->pResource != g_dlssOut) {
-                g_depthResource = dst->pResource;
+                StoreTracked(&g_depthResource, dst->pResource);
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
                 auto it = g_resourceStates.find(dst->pResource);
@@ -2790,7 +2807,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                 if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
                     rd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
-                    g_sceneColor = g_boundRtvResource;
+                    StoreTracked(&g_sceneColor, g_boundRtvResource);
                     g_sceneColorRtv = pRenderTargets[0];
                     g_sceneColorValid = true;
                     AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
@@ -2806,7 +2823,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
             if (g_sceneColorValid && g_boundRtvResource &&
                 g_boundRtv.ptr == g_sceneColorRtv.ptr &&
                 g_boundRtvResource != g_sceneColor) {
-                g_sceneColor = g_boundRtvResource;
+                StoreTracked(&g_sceneColor, g_boundRtvResource);
                 g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 Log("hooks: scene color refreshed on bind %p", (void*)g_sceneColor);
                 D3D12_RESOURCE_DESC rd = g_sceneColor->GetDesc();
@@ -2817,7 +2834,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
             if (g_sceneColorAlt && g_boundRtvResource &&
                 g_boundRtv.ptr == g_sceneColorRtvAlt.ptr &&
                 g_boundRtvResource != g_sceneColorAlt) {
-                g_sceneColorAlt = g_boundRtvResource;
+                StoreTracked(&g_sceneColorAlt, g_boundRtvResource);
                 Log("hooks: scene color ALT refreshed on bind %p", (void*)g_sceneColorAlt);
                 // Scene-target churn = renderer re-init / map load: the old
                 // MV/depth pointers are almost certainly dead now. Reset the
