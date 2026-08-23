@@ -1475,6 +1475,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     }
 
     g_injStep = "gated";
+    bool bridgeOk = true;
     bool doDlss = g_dlaaMode && !g_dlaaHalted && g_upscaler && g_upscaler->IsReady() && g_dlssOutValid;
     if (doDlss) {
         // STALENESS INVALIDATION: if depth/MV stamps are too old, the tracked
@@ -1557,6 +1558,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                     (void*)g_depthResource, (void*)g_mvResource);
             bb->Release(); return;
         } else {
+            // Single outer SEH: stale engine resources pass null checks but
+            // fault inside the driver when used. On fault we abandon the list,
+            // invalidate all tracked inputs, and skip DLAA safely.
+            __try {
             // ---- BRIDGE FLOW (game queue -> our device -> game queue) ----
             // Per-call instrumentation: g_injStep updated between EVERY D3D12
             // call so the fault handler pinpoints the exact crash point.
@@ -1685,14 +1690,27 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                     g_dlaaHalted = true;
                     Log("hooks: DLAA HALTED after %u consecutive eval failures", g_evalFailStreak);
                 }
-                doDlss = false;
-                g_evalDidBridge = false;
+                doDlss = false;g_evalDidBridge = false;
+            }            } // end __try
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                bridgeOk = false;
+                Log("hooks: bridge FAULTED at %s - invalidating all inputs", g_injStep);
+                g_depthResource = nullptr; g_depthValid = false; g_depthStamp = 0;
+                g_mvResource = nullptr; g_mvValid = false; g_mvStamp = 0;
             }
+
         }
     }
 
 
-    // Cross-queue sync for copy-back: game queue waits on the SAME fence.
+                if (!bridgeOk) {
+                // Abandoned list - do not submit. bb was AddRef'd at entry;
+                // release it and return without touching D3D12 further.
+                Log("hooks: bridge fault path - skipping frame submit");
+                bb->Release();
+                return;
+            }
+// Cross-queue sync for copy-back: game queue waits on the SAME fence.
     if (g_evalDidBridge && g_gameFence) {
         injQueue->Wait(g_gameFence, g_bridgeVal);
     }
