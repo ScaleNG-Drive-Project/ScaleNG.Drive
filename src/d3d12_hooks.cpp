@@ -18,58 +18,7 @@ extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR
 
 PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
-static ID3D12Device* g_bridgeDev = nullptr;
 void EnsureUpscalerInit();
-
-// ---------------------------------------------------------------------------
-// EARLY NGX INITIALIZATION: create our clean device and initialize NGX on it
-// BEFORE any game activity. This eliminates process-state contamination that
-// caused RWFlagMissing when NGX was initialized later in the session.
-// Uses placeholder dims (1920x1080) — AdoptDisplaySize/UpdateSizes recreates
-// the feature at real dimensions once discovered.
-// ---------------------------------------------------------------------------
-static ID3D12Device* g_earlyDev = nullptr;
-static bool g_earlyNgxReady = false;
-
-static void EarlyInitNGX()
-{
-    if (g_earlyNgxReady) return;
-
-    // Create NVIDIA adapter device via GetProcAddress (no static lib dep)
-    typedef HRESULT(WINAPI* PFN_MkDev)(void*, unsigned, const IID&, void**);
-    PFN_MkDev mk = (PFN_MkDev)(void*)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateDevice");
-    if (!mk) { Log("early-init: no D3D12CreateDevice"); return; }
-
-    // Enumerate adapters to find NVIDIA (hybrid laptops)
-    typedef HRESULT(WINAPI* PFN_CreateDXGI1)(const IID&, void**);
-    PFN_CreateDXGI1 mkFactory = (PFN_CreateDXGI1)(void*)GetProcAddress(
-        GetModuleHandleA("dxgi.dll"), "CreateDXGIFactory1");
-    IDXGIFactory4* factory = nullptr;
-    IDXGIAdapter1* adapter = nullptr;
-    if (mkFactory) {
-        HRESULT fhr = mkFactory(__uuidof(IDXGIFactory4), (void**)&factory);
-        if (SUCCEEDED(fhr)) {
-            for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
-                DXGI_ADAPTER_DESC1 d; adapter->GetDesc1(&d);
-                if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.VendorId == 0x10DE) break;
-                adapter = nullptr;
-            }
-        }
-    }
-    HRESULT dhr = mk(adapter, 0xb000, __uuidof(ID3D12Device), (void**)&g_bridgeDev);
-    Log("early-init: bridge device hr=0x%08X dev=%p", (unsigned)dhr, (void*)g_bridgeDev);
-    if (FAILED(dhr) || !g_bridgeDev) return;
-    if (factory) factory->Release();
-    if (adapter) adapter->Release();
-
-    // Initialize NGX on our clean device BEFORE any game GPU work
-    EnsureUpscalerInit();
-
-    // Only mark ready after ALL initialization succeeded
-    g_earlyNgxReady = true;
-    Log("early-init: NGX initialized on bridgeDev=%p", (void*)g_bridgeDev);
-}
-
 ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
 
 

@@ -8,7 +8,9 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
-## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)## Status (last updated: 2026-08-23 00:0x)## Status (last updated: 2026-08-23 04:3x)
+## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)## Status (last updated: 2026-08-23 00:0x)## Status (last updated: 2026-08-23 04:3x)## Status (last updated: 2026-08-23 04:5x)
+- **fix37 DEPLOYED (hash 49CB0C8B...): SEH guard around NVSDK_NGX_D3D12_Init.** Crash confirmed inside NGX Init (nvngx.log shows Architecture check + DRS profile then fault). SafeNgxInit() standalone helper wraps pInit in __try/__except; on fault logs SEH code and disables DLAA. Game should now survive NGX init failure - DLAA unavailable but no crash.
+
 - **fix36 DEPLOYED (hash 40D313CB...): EnsureUpscalerInit now WAITS for g_bridgeDev.** Previous run showed NGX diag on wrapper device (QI IDXGIDevice=E_NOINTERFACE) because EnsureUpscalerInit fired before bridge creation. Now returns without marking attempted if bridge missing - retries later. Also decoded NGX errors: 0xBAD00007=NotInitialized, 0xBAD00004=FeatureNotFound.
 
 - **fix35 DEPLOYED (hash 4B0BC49A...): outer SEH around entire bridge flow.** Stale engine resources (freed between frames) pass null checks but fault in the driver. Now: __try wraps alloc-reset through eval; __except logs g_injStep, nulls depth+MV, sets bridgeOk=false. Fault path skips list submit entirely (abandons partial commands) and releases bb safely. Prevents cascading corruption from one bad resource.
