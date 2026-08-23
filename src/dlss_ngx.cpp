@@ -376,6 +376,21 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     if (!params.commandList || !params.color || !params.depth || !params.motionVectors || !params.output)
         return false;
 
+    // DEVICE MISMATCH GUARD: cmdList must belong to the same device as m_device.
+    // Cross-device usage is illegal in D3D12 and causes undefined behavior.
+    {
+        ID3D12Device* cmdDev = nullptr;
+        if (SUCCEEDED(params.commandList->GetDevice(__uuidof(ID3D12Device), (void**)&cmdDev)) && cmdDev) {
+            if (cmdDev != m_device) {
+                Log("DLSS: DEVICE MISMATCH! cmdList dev=%p but NGX dev=%p — skipping eval",
+                    (void*)cmdDev, (void*)m_device);
+                cmdDev->Release();
+                return false;
+            }
+            cmdDev->Release();
+        }
+    }
+
     if (!m_featureCreated) {
         if (!CreateFeature(params.commandList))
             return false;

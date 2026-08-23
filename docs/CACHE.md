@@ -8,7 +8,9 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
-## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)
+## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)
+- **fix35 DEPLOYED (hash 1BF7936E..., awaiting user run): STALE INPUT INVALIDATION.** Root cause of loading crashes: g_mvResource/g_depthResource point to FREED engine resources after map transitions. Barrier() on freed resource = driver C0000005 at non-module address. Fix: null out stale pointers when stamps exceed 120 frames.
+
 - **PHASE B1 RESULT + fix34 DEPLOYED (hash 561DC1F4..., awaiting user run): DELAYED INIT + LOADING PHASE PROTECTION.** Root cause of loading crashes: our creation burst fires DURING volatile loading phase. **Fix: require 300 stable gameplay frames before kicking init thread.** During those frames, TryDeferredInject returns immediately — zero wrapper-device interaction beyond passive tracking.
 
 ## Status (last updated: 2026-08-22 20:0x)

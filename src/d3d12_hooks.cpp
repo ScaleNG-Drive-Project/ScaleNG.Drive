@@ -34,7 +34,6 @@ static bool g_earlyNgxReady = false;
 static void EarlyInitNGX()
 {
     if (g_earlyNgxReady) return;
-    g_earlyNgxReady = true;
 
     // Create NVIDIA adapter device via GetProcAddress (no static lib dep)
     typedef HRESULT(WINAPI* PFN_MkDev)(void*, unsigned, const IID&, void**);
@@ -48,8 +47,8 @@ static void EarlyInitNGX()
     IDXGIFactory4* factory = nullptr;
     IDXGIAdapter1* adapter = nullptr;
     if (mkFactory) {
-        IFACEMETHODIMP hr = mkFactory(__uuidof(IDXGIFactory4), (void**)&factory);
-        if (SUCCEEDED(hr)) {
+        HRESULT fhr = mkFactory(__uuidof(IDXGIFactory4), (void**)&factory);
+        if (SUCCEEDED(fhr)) {
             for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
                 DXGI_ADAPTER_DESC1 d; adapter->GetDesc1(&d);
                 if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.VendorId == 0x10DE) break;
@@ -65,6 +64,9 @@ static void EarlyInitNGX()
 
     // Initialize NGX on our clean device BEFORE any game GPU work
     EnsureUpscalerInit();
+
+    // Only mark ready after ALL initialization succeeded
+    g_earlyNgxReady = true;
     Log("early-init: NGX initialized on bridgeDev=%p", (void*)g_bridgeDev);
 }
 
