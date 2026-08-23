@@ -75,6 +75,7 @@ ID3D12Fence* g_bridgeFence = nullptr;
 HANDLE g_bridgeFenceEv = nullptr;
 HANDLE g_bridgeFenceShared = nullptr;
 UINT64 g_bridgeVal = 0;
+UINT64 g_bridgeLastSubmit = 0;
 ID3D12Resource* g_brColor = nullptr;  HANDLE g_hColor = nullptr;
 ID3D12Resource* g_brDepth = nullptr;  HANDLE g_hDepth = nullptr;
 ID3D12Resource* g_brMv = nullptr;     HANDLE g_hMv = nullptr;
@@ -419,8 +420,23 @@ void CreateDlssOut()
 // render size, invalidate the DLSS output, and re-configure the upscaler.
 void AdoptDisplaySize(unsigned int w, unsigned int h)
 {
-    if (w == 0 || h == 0 || (w == g_displayW && h == g_displayH))
+    if (w == 0 || h == 0) return;
+
+    // Proper hysteresis: track a candidate separately from accepted globals.
+    // Only commit after 15 consecutive identical observations. This prevents
+    // loading-screen RTVs (1902x954 etc.) from thrashing the DLSS feature.
+    static unsigned int candW = 0, candH = 0;
+    static int candStable = 0;
+    if (w == candW && h == candH) {
+        if (candStable < 1000) ++candStable;
+    } else {
+        candW = w; candH = h; candStable = 1;
+        return; // new candidate: wait for confirmation next call
+    }
+    // Candidate confirmed stable — commit only if different from current.
+    if (w == g_displayW && h == g_displayH)
         return;
+
     g_displayW = w;
     g_displayH = h;
     if (g_dlaaMode) {
@@ -432,26 +448,8 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
     }
     g_patchAborted = false;
     g_patchFramesWithoutInject = 0;
-    // HYSTERESIS: adoption sources (menu RTVs, viewports, backbuffer) fight
-    // each other during loading; switching per-call thrashed features and
-    // stalled frames on the drain-wait. Only adopt dims that persist.
-    static unsigned int candW = 0, candH = 0;
-    static int candStable = 0;
-    if (w == candW && h == candH) {
-        if (candStable < 1000) ++candStable;
-    } else {
-        candW = w; candH = h; candStable = 1;
-    }
-    if ((w != g_displayW || h != g_displayH)) {
-        if (candStable < 15)
-            return;
-        candStable = 0;
-    }
     if (g_dlssOutValid && g_dlssOut) {
-        // Park in the graveyard. NO signal, NO wait here - flushing happens
-        // inside InjectAtPresent after its fence wait proves GPU drain.
-        // (The old inline Signal+wait raced with the injection fence and
-        // released textures mid-flight = heap corruption = random faults.)
+        // Park in the graveyard — released after GPU drain inside ECL flush.
         if (g_graveN < 4) {
             g_grave[g_graveN++] = g_dlssOut;
         } else {
@@ -462,9 +460,6 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
     }
     if (g_upscaler)
         g_upscaler->UpdateSizes(g_renderW, g_renderH, g_displayW, g_displayH);
-    // NOTE: deliberately NOT resetting g_evalFailStreak/g_dlaaHalted here -
-    // size-churn adoptions fired constantly and kept re-arming the breaker
-    // mid-storm. Halt is sticky until F10 or process restart.
     Log("hooks: display size adopted %ux%u (render %ux%u)", g_displayW, g_displayH,
         g_renderW, g_renderH);
 }
@@ -604,8 +599,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
             }
-        } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            rd.Width == 1920 && rd.Height == 992 && rd.MipLevels == 1) {
+    } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1) {
             if (desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
                 g_displayW = (unsigned int)rd.Width;
                 g_displayH = (unsigned int)rd.Height;
@@ -647,7 +642,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 }
             }
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                   rd.Width == 1920 && rd.Height == 1001 && rd.MipLevels == 1 &&
+                   rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
                    desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
             g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
             g_rtvMap[handle.ptr] = res;
@@ -1520,6 +1515,13 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             // Our device: wait for inputs, evaluate DLAA.
             UINT64 v1 = g_bridgeVal;
             g_bridgeQueue->Wait(g_bridgeFence, v1);
+            // CPU-side safety: prove GPU finished prior bridge work before Reset
+            if (g_bridgeFence && g_bridgeLastSubmit > 0 && g_bridgeFenceEv) {
+                if (g_bridgeFence->GetCompletedValue() < g_bridgeLastSubmit) {
+                    g_bridgeFence->SetEventOnCompletion(g_bridgeLastSubmit, g_bridgeFenceEv);
+                    WaitForSingleObject(g_bridgeFenceEv, 5000);
+                }
+            }
             g_bridgeAlloc->Reset();
             g_bridgeList->Reset(g_bridgeAlloc, nullptr);
             g_injStep = "pre-evaluate";
@@ -1566,6 +1568,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             ID3D12CommandList* cl2[] = { g_bridgeList };
             g_bridgeQueue->ExecuteCommandLists(1, cl2);
             g_bridgeQueue->Signal(g_bridgeFence, v2);
+            g_bridgeLastSubmit = v2;
 
             // Open the shared fence on the game device for cross-queue sync
             static ID3D12Fence* s_gameFence = nullptr;
@@ -1578,7 +1581,6 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             if (evalOk) {
                 // GPU-side wait: game queue blocks until bridge signals v2
                 if (s_gameFence) injQueue->Wait(s_gameFence, g_bridgeVal);
-                ++g_evalOkCount;
                 ++g_evalOkCount;
                 g_evalFailStreak = 0;
                 g_evalDidBridge = true;
