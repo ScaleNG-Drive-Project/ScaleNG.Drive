@@ -1,152 +1,74 @@
-[2026-08-21 16:08:59] [NGXCheckArchitectureSupport:229] Found matching adapter with NVAPI physical GPU handle: 0x100 and LUID: { 0x0, 0xeabf }
-[2026-08-21 16:08:59] [NGXGetPathUsingQAI:475] Checking for path to NGX using QueryAdapterInfo
-[2026-08-21 16:08:59] [NGXGetPathUsingQAI:512] Path to driverStore found using QAI: C:\Windows\System32\DriverStore\FileRepository\nvlti.inf_amd64_af02d12a5c2283af
-[2026-08-21 16:08:59] [NGXIsUpdaterEnabledBase:621] OTA disabled by environment. Using embedded snippet only
-[2026-08-21 16:08:59] [NGXDRSInit:327] NvAPI_DRS_FindApplicationByName -166
-[2026-08-21 16:08:59] [NGXInitContext:245] called from module test_eval.exe at C:\Users\Admin\Documents\Default Project\ScaleNG.Drive\research\dlss_sdk_370
-[2026-08-21 16:08:59] [NGXGetPath:1045] using path for models: C:\ProgramData\NVIDIA\NGX\models
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dldenoiser.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXReportStatusFeedback:1060] Override shared memory was opened successfully
-[2026-08-21 16:08:59] [NGXReportStatusFeedback:1072] Override shared memory was mapped successfully
-[2026-08-21 16:08:59] [NGXReportStatusFeedback:1101] Override feedback found available slot 0
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [NGXLoadLibrary:34] Loaded NGXCore from path (C:\Users\Admin\Documents\Default Project\ScaleNG.Drive\research\dlss_sdk_370/nvngx_dlss.dll)
-[2026-08-21 16:08:59] [NGXValidateSnippetMetaData:1509] Validating snippet C:\Users\Admin\Documents\Default Project\ScaleNG.Drive\research\dlss_sdk_370/nvngx_dlss.dll
-[2026-08-21 16:08:59] [NGXValidateSnippetMetaData:1511] NGX CORE API version : 0x15, Snippet requires at least : 0x13
-[2026-08-21 16:08:59] [NGXValidateSnippetMetaData:1515] GPU architecture : 0x170, Snippet expects at least : 0x160
-[2026-08-21 16:08:59] [NGXValidateSnippetMetaData:1530] Driver support flags : 0xF(SEAMLESS_OTA|LINUX_EXTENDED_DRIVER_VERSIONS|API_SPECIFIC_POPULATE_PARAMS|REQUIRE_CMSID), Snippet required flags : 0xF(SEAMLESS_OTA|LINUX_EXTENDED_DRIVER_VERSIONS|API_SPECIFIC_POPULATE_PARAMS|REQUIRE_CMSID)
-[2026-08-21 16:08:59] [NGXValidateSnippetMetaData:1558] Driver version : 596.49, Snippet expects at least : 470.0
-[2026-08-21 16:08:59] [NGXValidateSnippetMetaData:1585] Snippet version : 310.6.0, Embedded app Id : E658703 (0)
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1445] app 3 feature dlss snippet: C:\Users\Admin\Documents\Default Project\ScaleNG.Drive\research\dlss_sdk_370/nvngx_dlss.dll version: 310.6.0
-[2026-08-21 16:08:59] [NGXLoadFeature:1527] Setting telemetry callback for dlss [schema 3.0+]
-[2026-08-21 16:08:59] [NGXLoadFeature:1532] Setting override status callback for dlss
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlinpainting.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlisr.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlslowmo.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlvsr.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlcolorize.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlstyletransfer.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlvdenoiser.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlisp.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlresolve.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlssg.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_deepdvc.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlssd.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_truehdr.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_latewarp.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_vsr.dll doesn't exist in any of the search paths!
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
-[2026-08-21 16:08:59] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
-[2026-08-21 16:08:59] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_fgx.dll doesn't exist in any of the search paths!
-[2026-08-21 16:09:00] [GetSystemInfo:985] Detected Windows Version 10.0.26100.2454
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:302] Sending Telemetry Init Data
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:303] appExeName = test_eval.exe
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:304] drsProfileName = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:305] drsName = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:307] AppIdType = CMS_ID
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:308] ProjectId = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:309] EngineVersion = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:310] EngineType = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:311] cmsId = 241534720
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:312] featureType = SuperSampling
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:313] gpuDeviceId = 9634
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:314] gpuVendorId = 4318
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:315] gpuSubSys = 979179434
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:316] gpuRev = 161
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:317] ngxSDKVersion = 1.5
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:318] ngxCoreVersion = 1.4.0.0
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:319] ngxFeatureVersion = 310.6.0
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:320] displayDriverVersion = 596.49
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:321] osVersion = 10.0.26100.2454
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:322] APIType = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:323] FeatureInitResult = NvNGXFeatureInitSuccess
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:324] GpuAPI = 2
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:326] StreamlineVersion = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:327] StreamlineGitSHA = 
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:328] ExeModuleName = test_eval.exe
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:329] OTAEnabled = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryInitializeData:335] -- END telemetry init data --
-[2026-08-21 16:09:00] [NVSDK_NGX_CreateFeature_Validate:731] app id is 3 
-[2026-08-21 16:09:00] [NGXStoreCallToCreateFeature:780] stored create feature dlss handle 1
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:467] Sending Telemetry: DLSS Eval Data
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:512] QualityMode = 2
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:513] DenoiseMode = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:514] Width = 960
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:515] Height = 540
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:516] OutWidth = 960
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:517] OutHeight = 540
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:518] MVScaleX = 0.000000
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:519] MVScaleY = 0.000000
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:520] FullscreenMode = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:521] AutoExposure = 1
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:522] Sharpness = -1.000000
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:523] WeightName = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:524] WeightVariantName = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:525] DepthInverted = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:526] MVJittered = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:528] ColorExtentWidth = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:529] ColorExtentHeight = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:530] ColorExtentBaseX = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:531] ColorExtentBaseY = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:532] MVExtentWidth = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:533] MVExtentHeight = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:534] MVExtentBaseX = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:535] MVExtentBaseY = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:536] VRAMAllocated = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:875] appExeName = test_eval.exe
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:876] drsProfileName = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:877] drsName = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:879] AppIdType = CMS_ID
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:880] ProjectId = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:881] EngineVersion = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:882] EngineType = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:883] cmsId = 241534720
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:884] gpuDeviceId = 9634
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:885] gpuVendorId = 4318
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:886] gpuSubSys = 979179434
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:887] gpuRev = 161
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:888] ngxSDKVersion = 1.5
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:889] ngxCoreVersion = 1.4.0.0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:890] ngxFeatureVersion = 310.6.0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:891] displayDriverVersion = 596.49
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:892] osVersion = 10.0.26100.2454
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:893] APIType = 0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:894] GpuAPI = 2
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:896] StreamlineVersion = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:897] StreamlineGitSHA = 
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:898] ExeModuleName = test_eval.exe
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:899] SnippetSchemaVer = 0.0
-[2026-08-21 16:09:00] [NGXSendTelemetryEvaluateDataV3:905] -- END telemetry evaluate data --
+[2026-08-22 20:43:34] [NGXCheckArchitectureSupport:229] Found matching adapter with NVAPI physical GPU handle: 0x100 and LUID: { 0x0, 0xdbf9 }
+[2026-08-22 20:43:34] [NGXGetPathUsingQAI:475] Checking for path to NGX using QueryAdapterInfo
+[2026-08-22 20:43:34] [NGXGetPathUsingQAI:512] Path to driverStore found using QAI: C:\Windows\System32\DriverStore\FileRepository\nvlti.inf_amd64_af02d12a5c2283af
+[2026-08-22 20:43:34] [NGXIsUpdaterEnabledBase:621] OTA disabled by environment. Using embedded snippet only
+[2026-08-22 20:43:34] [NGXDRSInit:341] DRS PROFILE FOUND : ProfileName "BeamNG.drive", AppName "beamng.drive.x64.exe"
+[2026-08-22 20:43:34] [NGXInitContext:245] called from module ScaleNG.asi at C:\games\BeamNG.drive\Bin64\plugins
+[2026-08-22 20:43:34] [NGXGetPath:1045] using path for models: C:\ProgramData\NVIDIA\NGX\models
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dldenoiser.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXReportStatusFeedback:1060] Override shared memory was opened successfully
+[2026-08-22 20:43:34] [NGXReportStatusFeedback:1072] Override shared memory was mapped successfully
+[2026-08-22 20:43:34] [NGXReportStatusFeedback:1101] Override feedback found available slot 0
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [NGXLoadLibrary:34] Loaded NGXCore from path (C:\games\BeamNG.drive\Bin64\plugins/nvngx_dlss.dll)
+[2026-08-22 20:43:34] [NGXValidateSnippetMetaData:1509] Validating snippet C:\games\BeamNG.drive\Bin64\plugins/nvngx_dlss.dll
+[2026-08-22 20:43:34] [NGXValidateSnippetMetaData:1511] NGX CORE API version : 0x15, Snippet requires at least : 0x13
+[2026-08-22 20:43:34] [NGXValidateSnippetMetaData:1515] GPU architecture : 0x170, Snippet expects at least : 0x160
+[2026-08-22 20:43:34] [NGXValidateSnippetMetaData:1530] Driver support flags : 0xF(SEAMLESS_OTA|LINUX_EXTENDED_DRIVER_VERSIONS|API_SPECIFIC_POPULATE_PARAMS|REQUIRE_CMSID), Snippet required flags : 0xF(SEAMLESS_OTA|LINUX_EXTENDED_DRIVER_VERSIONS|API_SPECIFIC_POPULATE_PARAMS|REQUIRE_CMSID)
+[2026-08-22 20:43:34] [NGXValidateSnippetMetaData:1558] Driver version : 596.49, Snippet expects at least : 470.0
+[2026-08-22 20:43:34] [NGXValidateSnippetMetaData:1585] Snippet version : 310.6.0, Embedded app Id : E658703 (0)
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1445] app 3 feature dlss snippet: C:\games\BeamNG.drive\Bin64\plugins/nvngx_dlss.dll version: 310.6.0
+[2026-08-22 20:43:34] [NGXLoadFeature:1527] Setting telemetry callback for dlss [schema 3.0+]
+[2026-08-22 20:43:34] [NGXLoadFeature:1532] Setting override status callback for dlss
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlinpainting.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlisr.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlslowmo.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlvsr.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlcolorize.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlstyletransfer.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlvdenoiser.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlisp.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlresolve.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlssg.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_deepdvc.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_dlssd.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_truehdr.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_latewarp.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_vsr.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1166] unable to read the deny list. Assuming that the feature is allowed.
+[2026-08-22 20:43:34] [`anonymous-namespace'::SnippetLocationInfo::load:695] NGXLoadFromPath failed: -1160773628
+[2026-08-22 20:43:34] [NGXSecureLoadFeature:1231] warning: ModuleName - nvngx_fgx.dll doesn't exist in any of the search paths!
+[2026-08-22 20:43:35] [NVSDK_NGX_CreateFeature_Validate:731] app id is 3 
