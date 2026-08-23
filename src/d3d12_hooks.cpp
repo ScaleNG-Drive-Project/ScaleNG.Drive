@@ -148,13 +148,14 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         g_bridgeDev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_bridgeAlloc, nullptr, IID_PPV_ARGS(&g_bridgeList));
         g_bridgeList->Close();
         g_bridgeDev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_bridgeFence));
-                {
-            typedef HRESULT(STDMETHODCALLTYPE* PFN_FenceSH)(ID3D12Fence*, const SECURITY_ATTRIBUTES*, DWORD, LPCWSTR, HANDLE*);
-            PFN_FenceSH fsh = (PFN_FenceSH)(void*)GetProcAddress(GetModuleHandleA("d3d12.dll"), "CreateSharedHandle");
+        // CreateSharedHandle is a COM method on ID3D12Device - NOT a d3d12.dll
+        // export (GetProcAddress returns NULL for it, which silently disabled
+        // the whole shared-fence path and forced illegal cross-device signals).
+        if (g_bridgeFence) {
             HANDLE hf = nullptr;
-            if (fsh && SUCCEEDED(fsh(g_bridgeFence, nullptr, GENERIC_ALL, nullptr, &hf))) {
-                g_bridgeFenceShared = hf;
-            }
+            HRESULT shr = g_bridgeDev->CreateSharedHandle(g_bridgeFence, nullptr, GENERIC_ALL, nullptr, &hf);
+            if (SUCCEEDED(shr)) g_bridgeFenceShared = hf;
+            else Log("bridge: fence CreateSharedHandle failed hr=0x%08X", (unsigned)shr);
         }
         g_bridgeFenceEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         // Open the game-device view of the shared fence NOW - the game queue
@@ -1599,8 +1600,17 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             if (g_injFence) injQueue->Signal(g_injFence, ++g_injFenceVal);
             g_injSubmitted = true;
             g_injStep = "bridge:signal-v1";
-            if (g_gameFence) injQueue->Signal(g_gameFence, g_bridgeVal); // game queue uses ITS fence view
-            else injQueue->Signal(g_bridgeFence, g_bridgeVal); // fallback (should not happen)
+            // Game queue may ONLY signal its own device's fence view. If the
+            // open failed, skip the signal - bridge eval will CPU-timeout on
+            // its Wait rather than corrupting driver state with an illegal
+            // cross-device fence op.
+            if (g_gameFence) {
+                injQueue->Signal(g_gameFence, g_bridgeVal);
+            } else {
+                static int s_noGameFence = 0;
+                if (++s_noGameFence <= 3)
+                    Log("hooks: gameFence MISSING - copy-in signal skipped");
+            }
 
             // Our device: wait for inputs, evaluate DLAA.
             UINT64 v1 = g_bridgeVal;
