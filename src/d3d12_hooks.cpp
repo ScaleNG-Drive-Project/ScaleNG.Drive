@@ -1667,12 +1667,11 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Their safety is the 3-frame liveness stamps + bridge SEH instead.
 
         unsigned int fc2 = g_frameCounter;
-        // Depth refreshes via frequent SRV binds - tight cap fine. MV however
-        // is written WITHOUT further barriers by this engine, so barrier-
-        // liveness never fires and a tight cap invalidated it every frame
-        // (mvV=0 entire sessions). Generous MV window; remaining safety =
-        // veteran gate + weak ptrs + bridge SEH (19-min stable proof).
-        bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
+        // MV and depth are both adopted once and reused for thousands of
+        // frames WITHOUT barrier traffic in this engine (ages 6052+ observed),
+        // so tight staleness caps invalidated them every single frame.
+        // Trust the veteran gate + weak pointers + bridge SEH instead.
+        bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 20000);
         bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 240);
         if (depthStale || mvStale) {
             static int s_staleLogs = 0;
