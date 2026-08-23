@@ -247,6 +247,8 @@ int g_createdN = 0;
 // Slots currently owning a transferred ref (graveyard/replace decisions).
 ID3D12Resource* g_owned[16] = {};
 int g_ownedN = 0;
+// Composite-source persistence counters (scene-color promotion proof).
+std::map<void*, int> g_copySrcCount;
 
 static bool Owned_Remove(ID3D12Resource* res)
 {
@@ -2742,6 +2744,7 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
         srcBox && dstX == 0 && dstY == 0) {
         long w = srcBox->right - srcBox->left;
         long h = srcBox->bottom - srcBox->top;
+        ++g_copySrcCount[(void*)src->pResource];
         bool isMvDst = (dst->pResource == g_mvResource || dst->pResource == g_mvResourceAlt);
         bool isSceneSrc = (src->pResource == g_sceneColor ||
                            (g_sceneColorAlt && src->pResource == g_sceneColorAlt));
@@ -2979,7 +2982,12 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
             // reusing the same CPU descriptor slot. Refresh the tracked scene
             // color to the CURRENT resource bound at that slot, otherwise we
             // keep injecting with a stale (freed/recycled) resource.
-            if (g_sceneColorValid && g_boundRtvResource &&
+            // Persistence gate: only refresh the scene slot to a resource that
+            // has fed the full-res composite copy repeatedly - transient post/
+            // bloom targets bound at recycled descriptors would otherwise churn
+            // the identity every frame and keep the churn-quarantine armed.
+            int persist = 0; { auto ci = g_copySrcCount.find((void*)g_boundRtvResource); if (ci != g_copySrcCount.end()) persist = ci->second; }
+            if (g_sceneColorValid && persist >= 40 && g_boundRtvResource &&
                 g_boundRtv.ptr == g_sceneColorRtv.ptr &&
                 g_boundRtvResource != g_sceneColor) {
                 StoreTracked(&g_sceneColor, g_boundRtvResource);
@@ -2990,7 +2998,8 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                     rd.Width >= 1000 && rd.Height >= 500)
                     AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
             }
-            if (g_sceneColorAlt && g_boundRtvResource &&
+            int persistA = 0; { auto ci = g_copySrcCount.find((void*)g_boundRtvResource); if (ci != g_copySrcCount.end()) persistA = ci->second; }
+            if (g_sceneColorAlt && persistA >= 40 && g_boundRtvResource &&
                 g_boundRtv.ptr == g_sceneColorRtvAlt.ptr &&
                 g_boundRtvResource != g_sceneColorAlt) {
                 StoreTracked(&g_sceneColorAlt, g_boundRtvResource);
