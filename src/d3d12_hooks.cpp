@@ -450,6 +450,12 @@ void StartFrame()
     }
 
     g_patchViewport = !g_patchAborted && !g_dlaaMode && g_legacyScale;
+    // First accepted camera patch + a tracked depth = live gameplay.
+    // Discovery hooks were pass-through during load; arm them now.
+    if (g_cameraCbValid && g_depthValid &&
+        InterlockedCompareExchange(&g_loadPhase, 0, 1) == 1) {
+        Log("hooks: gameplay detected - discovery armed");
+    }
     static int s_frameLogs = 0;
     ++s_frameLogs;
     if (s_frameLogs <= 20 || (s_frameLogs % 5000) == 0)
