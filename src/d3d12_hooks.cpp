@@ -1571,6 +1571,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             ++g_bridgeVal;
             ID3D12CommandList* cl1[] = { g_injList };
             Real_ExecuteCommandLists(injQueue, 1, cl1);
+            if (g_injFence) injQueue->Signal(g_injFence, ++g_injFenceVal);
+            g_injSubmitted = true;
             g_injStep = "bridge:signal-v1";
             injQueue->Signal(g_bridgeFence, g_bridgeVal);
 
@@ -1675,14 +1677,17 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     if (g_evalDidBridge && g_gameFence) {
         injQueue->Wait(g_gameFence, g_bridgeVal);
     }
-    g_injStep = "submit";
-    g_injList->Close();
-    ID3D12CommandList* cls[] = { g_injList };
-    Real_ExecuteCommandLists(injQueue, 1, cls);
-    if (g_injFence) injQueue->Signal(g_injFence, ++g_injFenceVal);
-    g_injSubmitted = true;
     // Copy the DLAA result from the shared texture into the backbuffer.
+    // NOTE: the copy-in list was already Closed+submitted inside the bridge
+    // flow. Before reusing g_injList here we must CPU-wait until that
+    // submission has RETIRED - resetting an in-flight list is illegal.
     if (g_evalDidBridge) {
+        if (g_injSubmitted && g_injFence && g_injEvent) {
+            if (g_injFence->GetCompletedValue() < g_injFenceVal) {
+                g_injFence->SetEventOnCompletion(g_injFenceVal, g_injEvent);
+                WaitForSingleObject(g_injEvent, 5000);
+            }
+        }
         D3D12_RESOURCE_BARRIER bwo = {};
         bwo.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         bwo.Transition.pResource = g_gameOut;
