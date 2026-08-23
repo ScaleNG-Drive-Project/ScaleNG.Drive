@@ -1746,6 +1746,23 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         D3D12_TEXTURE_COPY_LOCATION srco = {}; srco.pResource = g_gameOut;
         srco.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srco.SubresourceIndex = 0;
         Real_CopyTextureRegion(g_injList, &dsto, 0, 0, 0, &srco, 0);
+        // Restore both touched resources - without these, next frame records
+        // the same transitions again against stale states (invalid barrier,
+        // driver dies after N frames).
+        D3D12_RESOURCE_BARRIER bro = {};
+        bro.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bro.Transition.pResource = g_gameOut;
+        bro.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bro.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        bro.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_injList->ResourceBarrier(1, &bro);
+        D3D12_RESOURCE_BARRIER brb = {};
+        brb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        brb.Transition.pResource = bb;
+        brb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        brb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        brb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_injList->ResourceBarrier(1, &brb);
         g_injList->Close();
         ID3D12CommandList* rcls[] = { g_injList };
         Real_ExecuteCommandLists(injQueue, 1, rcls);
