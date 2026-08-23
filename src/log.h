@@ -184,5 +184,5 @@ inline void LogInit()
         }
         CloseHandle(h);
     }
-    Log("ScaleNG.asi log started");
+    Log("ScaleNG.asi log started - build %s %s (reliability phase)", __DATE__, __TIME__);
 }
