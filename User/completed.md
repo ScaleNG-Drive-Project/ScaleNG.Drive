@@ -11,6 +11,8 @@
 |---|------|--------|-------|
 | 1 | Display-size hysteresis | [PARTIAL] | Basic stability counter exists (fix12). Missing: separate accepted/candidate variables, explicit transition logic |
 | 2 | Bridge game sync | [DONE] | fix27: game queue opens shared fence + enqueues GPU-side Wait(v2) before copy-back list. This was THE missing cross-queue sync causing all post-load crashes |
+| 2b | NVIDIA adapter enumeration for bridge device | [DONE] | fix28: bridge device explicitly created on NVIDIA adapter (was nullptr=maybe AMD iGPU on hybrid laptop) |
+| 2c | appId corrected to proven-working value | [DONE] | Changed from appId=1 to appId=241534720 (0xE658700) matching harness test_mini which succeeded |
 | 3 | Bridge allocator reuse | [NOT DONE] | bridgeAlloc still Reset without proving GPU completion. Needs allocator ring or fence-tagged reuse check |
 | 4 | Direct Release() of in-flight resources | [PARTIAL] | Graveyard pattern exists for dlssOut (fix17). But g_gameOut/g_brOut/g_brColor/g_brDepth/g_brMv have no retirement protection. Full fence-tagged queue not implemented |
 | 5 | Renderer-generation tracking | [NOT DONE] | No generation counter exists anywhere |

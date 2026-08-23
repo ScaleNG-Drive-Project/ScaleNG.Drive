@@ -8,7 +8,9 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
-## Status (last updated: 2026-08-22 13:5x)
+## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)
+- **PHASE 2c-fix28 RUN RESULT: CreateFeature STILL fails RWFlagMissing(0xBAD00009) on bridgeDev despite NVIDIA adapter enumeration fix.** Crash exe+0xd16f03 null-deref during loading. Bridge created on correct NVIDIA adapter. QI(IDXGIDevice) still fails on m_device — need to verify m_device actually equals bridgeDev after re-bind, or if stale wrapper pointer persists. **CURRENT STATUS: NGX CreateFeature on ANY device in this process fails with RWFlagMissing. Harness test_mini succeeds on fresh device in fresh process. Root cause is process-level NGX state contamination or driver/OS interaction unique to BeamNG's runtime environment.**
+
 ## Status (last updated: 2026-08-22 02:3x)
 - **PHASE 2c-fix27 BUILT + DEPLOYED (hash 5C0EF24E..., awaiting user run): CROSS-QUEUE GPU SYNC ADDED.** Root cause of ALL post-load crashes identified: game queue never waited for bridge queue before copying DLSS output to backbuffer. Two queues accessing same shared textures with zero sync = GPU race = random null-derefs at varying addresses (nvwgf2umx, exe, etc). **Fix: OpenSharedHandle(bridgeFence) on game device (once), then injQueue->Wait(gameFence, g_bridgeVal) enqueued BEFORE copy-back list submission.** GPU-side wait, no CPU stall. Game queue copy-back now provably starts after DLSS eval completes.
 ## Status (last updated: 2026-08-22 15:5x)
