@@ -239,6 +239,7 @@ volatile unsigned g_quietUntilFrame = 0;
 volatile LONG g_loadPhase = 1;
 volatile unsigned g_lastSceneChangeFrame = 0;
 volatile unsigned g_lastDiscoveryChangeFrame = 0; // any tracked input swap
+unsigned g_lastDlaaFrame = 0; // per-frame DLAA flow cap (file-scope: set at submit, checked in gates)
 bool g_frameStarted = false;
 bool g_patchViewport = false;
 bool g_patchAppliedThisFrame = false;
@@ -1621,8 +1622,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // (Present + Present1 + child windows) otherwise run full NGX
         // evaluates back-to-back within one frame (7x seen at frame 338)
         // and overwhelm the driver.
-        static unsigned s_lastDlaaFrame = 0;
-        if (doDlss && s_lastDlaaFrame == g_frameCounter) {
+        if (doDlss && g_lastDlaaFrame == g_frameCounter) {
             doDlss = false;
         }
         // Depth must be single-sample with a KNOWN format before we can build
@@ -1939,7 +1939,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     }
     if (doDlss) {
         Log("hooks: DLAA injection at present (frame %u)", g_frameCounter);
-        s_lastDlaaFrame = g_frameCounter; // consumed this frame's DLAA slot
+        g_lastDlaaFrame = g_frameCounter; // consumed this frame's DLAA slot
     }
     bb->Release();
 }
