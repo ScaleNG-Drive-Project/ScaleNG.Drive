@@ -8390,3 +8390,440 @@ init: entered InitializeASI
 [20:43:35.003] DLSS: CreateFeature failed, result=-1160773625
 [20:43:35.003] hooks: installing cmdlist hooks on 12BB048C510
 [20:43:35.003] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:36.648] ScaleNG.asi log started
+init: entered InitializeASI
+[23:52:36.649] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:36.649] ========================================
+[23:52:36.649] ScaleNG.asi loaded
+[23:52:36.649] init: loading config
+[23:52:36.649] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:36.649] init: setting config
+[23:52:36.649] hooks: config applied (dlaa=1)
+[23:52:36.649] init: installing D3D12CreateDevice detour
+[23:52:36.649] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:36.664] hooks: D3D12CreateDevice detour installed
+[23:52:36.681] hooks: CreateDXGIFactory2 detour installed
+[23:52:36.696] hooks: CreateDXGIFactory1 detour installed
+[23:52:36.712] hooks: CreateDXGIFactory detour installed
+[23:52:36.712] ScaleNG.asi initialization complete
+[23:52:38.081] hooks: factory 1D9D80F4C90 swapchain creation hooks installed
+[23:52:38.090] hooks: D3D12CreateDevice called #1 (g_device=0)
+[23:52:38.384] hooks: adapter 1D9D81541A0 captured (for factory lookup)
+[23:52:38.384] hooks: device 1D9E198E510 created (QI IDXGIDevice hr=0x80004002)
+[23:52:38.418] hooks: device vtable hooks (20:0 18:0)
+[23:52:38.463] hooks: queue slot 10 hooked
+[23:52:38.463] hooks: EGSH real factory 1D9D814A6E0
+[23:52:38.463] hooks: EGSH factory slots 10..17: 7FFF1DFD9F80 7FFF1DFD71A0 7FFF1DFD8850 7FFF1DFB96B0 7FFF1E010CB0 7FFF1DF9ADE0 7FFF1E00F240 7FFF1E010A70
+[23:52:38.464] hooks: EGSH dummy window 904BA
+[23:52:38.467] hooks: EGSH fresh device hr=00000000 dev=1D9E198E510
+[23:52:38.493] hooks: EGSH fresh factory hr=00000000 f=1D9E1B19BB0
+[23:52:38.537] hooks: CreateSwapChainForHwnd returned CCCCCCC328C48348 (hwnd 904BA, format 28, hr=00000000)
+[23:52:38.537] hooks: ForHwnd sc CCCCCCC328C48348 NOT readable
+[23:52:38.537] hooks: EGSH fresh ForHwnd hr=00000000 sc=1D9E1AEEF00
+[23:52:38.553] hooks: swapchain 1D9E1AEEF00 Present hooked
+[23:52:38.571] hooks: swapchain 1D9E1AEEF00 Present1 hooked
+[23:52:38.591] hooks: EGSH dummy result - Real_Present HOOKED
+[23:52:38.592] hooks: D3D12CreateDevice called #2 (g_device=1D9E198E510)
+[23:52:38.633] hooks: device 1D9E1DCD3E0 created (QI IDXGIDevice hr=0x80004002)
+[23:52:38.633] hooks: device vtable hooks (20:3 18:3)
+[23:52:38.636] hooks: queue slot 10 already hooked (shared vtable)
+[23:52:38.645] hooks: D3D12CreateDevice called #3 (g_device=1D9E1DCD3E0)
+[23:52:38.647] hooks: device 1D9E198E510 created (QI IDXGIDevice hr=0x80004002)
+[23:52:38.647] hooks: device vtable hooks (20:3 18:3)
+[23:52:38.670] hooks: queue slot 10 already hooked (shared vtable)
+[23:52:38.778] hooks: CreateSwapChainForHwnd returned 3231643364 (hwnd 15072E, format 28, hr=00000000)
+[23:52:38.778] hooks: ForHwnd sc 3231643364 NOT readable
+[23:52:39.310] hooks: scene color RTV 1D9E25419F0 (1902x945 R16G16B16A16_UNORM)
+[23:52:39.310] hooks: motion vector RTV 1DA7AFC4300 (1902x945 R16G16_FLOAT)
+[23:52:39.320] hooks: ExecuteCommandLists #1 (queue 1D9D81707D0, 1 lists)
+[23:52:39.320] hooks: installing cmdlist hooks on 1D9D856ADD0
+[23:52:39.335] hooks: motion vector RTV 1DA7AFC85F0 (1902x945 R16G16_FLOAT) (ALT)
+[23:52:39.350] hooks: CopyBufferRegion size=1344 (src 1DA7B16BC40 dst 1DA7B16D770)
+[23:52:39.352] hooks: CopyBufferRegion size=1344 (src 1DA7B16D770 dst 1DA7B16C550)
+[23:52:39.352] hooks: camera CB reject: f0..7=0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 w2c15=1.00 w2s11=0.00 c2s7=1.00 vp11=0.00 vpp11=0.00 w2sp11=0.00 proj=0.10 500.00 -0.00 0.10 (srcOff 2556416)
+[23:52:39.352] hooks: reject hex w2c=3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 80000000 80000000 80000000 3F800000
+[23:52:39.352] hooks: reject hex w2s=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.352] hooks: reject hex c2s=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.352] hooks: reject hex vp =3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.352] hooks: reject hex vpp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.352] hooks: reject hex w2sp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.352] hooks: reject hex proj=3DCCCCCD 43FA0000 B951C1D5 3DCCD74A
+[23:52:39.407] hooks: camera CB reject: f0..7=0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 w2c15=1.00 w2s11=0.00 c2s7=1.00 vp11=0.00 vpp11=0.00 w2sp11=0.00 proj=0.10 500.00 -0.00 0.10 (srcOff 17308160)
+[23:52:39.407] hooks: reject hex w2c=3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 80000000 80000000 80000000 3F800000
+[23:52:39.407] hooks: reject hex w2s=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.407] hooks: reject hex c2s=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.407] hooks: reject hex vp =3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.407] hooks: reject hex vpp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.407] hooks: reject hex w2sp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:39.407] hooks: reject hex proj=3DCCCCCD 43FA0000 B951C1D5 3DCCD74A
+[23:52:39.482] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.482] hooks: ExecuteCommandLists #2 (queue 1D9D8170550, 6 lists)
+[23:52:39.482] hooks: installing cmdlist hooks on 1DA7B136930
+[23:52:39.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.547] hooks: installing cmdlist hooks on 1D9E25B9F20
+[23:52:39.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.547] hooks: installing cmdlist hooks on 1D9E1FB2420
+[23:52:39.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.547] hooks: installing cmdlist hooks on 1DA7B1466B0
+[23:52:39.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.547] hooks: installing cmdlist hooks on 1DA7B147B20
+[23:52:39.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.547] hooks: installing cmdlist hooks on 1D9D8569960
+[23:52:39.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.549] hooks: ExecuteCommandLists #3 (queue 1D9D81707D0, 1 lists)
+[23:52:39.549] hooks: installing cmdlist hooks on 1DA7B1354C0
+[23:52:39.549] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.549] hooks: ExecuteCommandLists #4 (queue 1D9D8170550, 5 lists)
+[23:52:39.551] hooks: installing cmdlist hooks on 1DA7B1C1650
+[23:52:39.551] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.551] hooks: installing cmdlist hooks on 1D9E24D6C90
+[23:52:39.551] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.551] hooks: installing cmdlist hooks on 1DA7B12FA50
+[23:52:39.551] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.551] hooks: installing cmdlist hooks on 1DA7B159550
+[23:52:39.551] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.551] hooks: ExecuteCommandLists #5 (queue 1D9D81707D0, 1 lists)
+[23:52:39.551] hooks: installing cmdlist hooks on 1DA7B1BEC30
+[23:52:39.551] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.552] hooks: installing cmdlist hooks on 1DA7B294BB0
+[23:52:39.552] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.552] hooks: installing cmdlist hooks on 1DA7B1C0140
+[23:52:39.552] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.552] hooks: installing cmdlist hooks on 1DA7B1BD720
+[23:52:39.552] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.575] hooks: installing cmdlist hooks on 1DA7B1C2B60
+[23:52:39.575] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.575] hooks: installing cmdlist hooks on 1DA7B1C4070
+[23:52:39.575] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:39.916] ScaleNG.asi log started
+init: entered InitializeASI
+[23:52:39.916] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:39.916] ========================================
+[23:52:39.916] ScaleNG.asi loaded
+[23:52:39.916] init: loading config
+[23:52:39.916] ScaleNG.asi log started
+init: entered InitializeASI
+[23:52:39.916] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:39.917] ========================================
+[23:52:39.917] ScaleNG.asi loaded
+[23:52:39.917] init: loading config
+[23:52:39.917] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:39.917] init: setting config
+[23:52:39.917] hooks: config applied (dlaa=1)
+[23:52:39.917] init: installing D3D12CreateDevice detour
+[23:52:39.917] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:39.917] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:39.917] ScaleNG.asi log started
+[23:52:39.917] init: setting config
+init: entered InitializeASI
+[23:52:39.917] hooks: config applied (dlaa=1)
+[23:52:39.917] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:39.917] init: installing D3D12CreateDevice detour
+[23:52:39.919] ========================================
+[23:52:39.919] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:39.919] ScaleNG.asi loaded
+[23:52:39.919] init: loading config
+[23:52:39.919] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:39.919] init: setting config
+[23:52:39.919] hooks: config applied (dlaa=1)
+[23:52:39.919] init: installing D3D12CreateDevice detour
+[23:52:39.919] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:39.937] hooks: D3D12CreateDevice detour installed
+[23:52:39.937] hooks: D3D12CreateDevice detour installed
+[23:52:39.940] hooks: D3D12CreateDevice detour installed
+[23:52:39.955] hooks: CreateDXGIFactory2 detour installed
+[23:52:39.955] hooks: CreateDXGIFactory2 detour installed
+[23:52:39.957] hooks: CreateDXGIFactory2 detour installed
+[23:52:39.973] hooks: CreateDXGIFactory1 detour installed
+[23:52:39.973] hooks: CreateDXGIFactory1 detour installed
+[23:52:39.973] hooks: CreateDXGIFactory1 detour installed
+[23:52:39.992] hooks: CreateDXGIFactory detour installed
+[23:52:39.992] hooks: CreateDXGIFactory detour installed
+[23:52:39.992] ScaleNG.asi initialization complete
+[23:52:39.992] ScaleNG.asi initialization complete
+[23:52:39.992] hooks: CreateDXGIFactory detour installed
+[23:52:39.992] ScaleNG.asi initialization complete
+[23:52:40.056] ScaleNG.asi log started
+init: entered InitializeASI
+[23:52:40.056] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:40.056] ========================================
+[23:52:40.056] ScaleNG.asi loaded
+[23:52:40.056] init: loading config
+[23:52:40.057] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:40.057] init: setting config
+[23:52:40.057] hooks: config applied (dlaa=1)
+[23:52:40.057] init: installing D3D12CreateDevice detour
+[23:52:40.057] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:40.074] ScaleNG.asi log started
+init: entered InitializeASI
+[23:52:40.075] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:40.075] ========================================
+[23:52:40.075] ScaleNG.asi loaded
+[23:52:40.075] init: loading config
+[23:52:40.075] hooks: D3D12CreateDevice detour installed
+[23:52:40.075] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:40.075] init: setting config
+[23:52:40.075] hooks: config applied (dlaa=1)
+[23:52:40.075] init: installing D3D12CreateDevice detour
+[23:52:40.075] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:40.094] hooks: CreateDXGIFactory2 detour installed
+[23:52:40.095] hooks: D3D12CreateDevice detour installed
+[23:52:40.114] hooks: CreateDXGIFactory1 detour installed
+[23:52:40.115] hooks: CreateDXGIFactory2 detour installed
+[23:52:40.134] hooks: CreateDXGIFactory detour installed
+[23:52:40.134] ScaleNG.asi initialization complete
+[23:52:40.134] hooks: CreateDXGIFactory1 detour installed
+[23:52:40.153] hooks: CreateDXGIFactory detour installed
+[23:52:40.153] ScaleNG.asi initialization complete
+[23:52:40.664] hooks: scene color RTV 1DA7B1DE260 (1920x992 R16G16B16A16_UNORM) (ALT)
+[23:52:40.664] hooks: motion vector RTV 1DA7B1E1BC0 (1920x992 R16G16_FLOAT) (ALT)
+[23:52:40.667] hooks: camera CB reject: f0..7=0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 w2c15=1.00 w2s11=0.00 c2s7=1.00 vp11=0.00 vpp11=0.00 w2sp11=0.00 proj=0.10 500.00 -0.00 0.10 (srcOff 17328128)
+[23:52:40.667] hooks: reject hex w2c=3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 80000000 80000000 80000000 3F800000
+[23:52:40.667] hooks: reject hex w2s=3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.667] hooks: reject hex c2s=3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.667] hooks: reject hex vp =3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.667] hooks: reject hex vpp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.668] hooks: reject hex w2sp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.668] hooks: reject hex proj=3DCCCCCD 43FA0000 B951C1D5 3DCCD74A
+[23:52:40.669] hooks: camera CB reject: f0..7=0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 w2c15=1.00 w2s11=0.00 c2s7=1.00 vp11=0.00 vpp11=0.00 w2sp11=0.00 proj=0.10 500.00 -0.00 0.10 (srcOff 17330176)
+[23:52:40.669] hooks: reject hex w2c=3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 80000000 80000000 80000000 3F800000
+[23:52:40.669] hooks: reject hex w2s=3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex c2s=3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex vp =3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex vpp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex w2sp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex proj=3DCCCCCD 43FA0000 B951C1D5 3DCCD74A
+[23:52:40.669] hooks: camera CB reject: f0..7=0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 w2c15=1.00 w2s11=0.00 c2s7=1.00 vp11=0.00 vpp11=0.00 w2sp11=0.00 proj=0.10 500.00 -0.00 0.10 (srcOff 17332224)
+[23:52:40.669] hooks: reject hex w2c=3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 00000000 00000000 00000000 3F800000 00000000 80000000 80000000 80000000 3F800000
+[23:52:40.669] hooks: reject hex w2s=3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex c2s=3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex vp =3F3BF1BA 00000000 00000000 00000000 00000000 B4060F3D B951C1D3 3F7FFFFE 00000000 3FB6CD8C AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex vpp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.669] hooks: reject hex w2sp=3F3EAF1C 00000000 00000000 00000000 3C1B0E06 BD4BB79A B951C1D3 3F7FFFFE 30636BA7 3FBFE50D AD99D398 33BBBD2D 00000000 00000000 3DCCD74A 00000000
+[23:52:40.671] hooks: reject hex proj=3DCCCCCD 43FA0000 B951C1D5 3DCCD74A
+[23:52:40.673] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B1DE260
+[23:52:40.677] hooks: motion vector RTV 1DA7B1E2EE0 (1920x987 R16G16_FLOAT) (ALT)
+[23:52:40.682] hooks: CopyBufferRegion size=1344 (src 1DA7B16BC40 dst 1DA7B16D770)
+[23:52:40.683] hooks: CopyBufferRegion size=1344 (src 1DA7B16D770 dst 1DA7B16CE60)
+[23:52:40.759] hooks: scene color RTV 1DA7B359A50 (1920x987 R16G16B16A16_UNORM) (ALT)
+[23:52:40.759] hooks: motion vector RTV 1DA7B35D3B0 (1920x987 R16G16_FLOAT) (ALT)
+[23:52:40.762] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:40.762] hooks: CopyBufferRegion size=1344 (src 1DA7B16BC40 dst 1DA7B16D770)
+[23:52:40.762] hooks: CopyBufferRegion size=1344 (src 1DA7B16D770 dst 1DA7B183A30)
+[23:52:40.770] hooks: present on real swapchain 1D9E2015260 (format 28)
+[23:52:40.779] hooks: installing cmdlist hooks on 1DA7B14BA00
+[23:52:40.779] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:40.789] hooks: installing cmdlist hooks on 1DA7B175310
+[23:52:40.789] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:40.790] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:40.790] hooks: CopyBufferRegion size=1344 (src 1DA7B16BC40 dst 1DA7B16D770)
+[23:52:40.791] hooks: CopyBufferRegion size=1344 (src 1DA7B16D770 dst 1DA7B16C550)
+[23:52:40.820] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:40.820] hooks: CopyBufferRegion size=1344 (src 1DA7B16BC40 dst 1DA7B16D770)
+[23:52:40.820] hooks: CopyBufferRegion size=1344 (src 1DA7B16D770 dst 1DA7B16CE60)
+[23:52:40.836] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:40.858] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.366] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.446] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.466] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.479] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.496] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.515] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.593] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.600] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.617] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.633] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.650] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.667] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:41.684] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:42.110] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7B359A50
+[23:52:42.365] hooks: installing cmdlist hooks on 1DA7BC2E010
+[23:52:42.365] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.513] hooks: installing cmdlist hooks on 1DA7B4E0010
+[23:52:42.514] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.514] hooks: installing cmdlist hooks on 1DA7B4E5450
+[23:52:42.514] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.514] hooks: installing cmdlist hooks on 1DA7BC34960
+[23:52:42.514] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.530] hooks: installing cmdlist hooks on 1DA7B4E6960
+[23:52:42.530] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.530] hooks: installing cmdlist hooks on 1DA7B4E2A30
+[23:52:42.530] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.547] hooks: installing cmdlist hooks on 1DA7B4E9380
+[23:52:42.547] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.547] hooks: installing cmdlist hooks on 1DA7B4E7E70
+[23:52:42.548] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.563] hooks: installing cmdlist hooks on 1DA7BC2F520
+[23:52:42.563] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:42.728] hooks: installing cmdlist hooks on 1DA7B4E1520
+[23:52:42.728] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:43.652] hooks: scene color RTV 1DA7BA12030 (1920x1001 R16G16B16A16_UNORM) (ALT)
+[23:52:43.653] hooks: motion vector RTV 1DA7BA116A0 (1920x1001 R16G16_FLOAT) (ALT)
+[23:52:43.655] hooks: motion vector RTV 1DA7BA18960 (1920x1001 R16G16_FLOAT) (ALT)
+[23:52:43.660] hooks: installing cmdlist hooks on 1DA7BC33450
+[23:52:43.661] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:43.661] hooks: installing cmdlist hooks on 1DA7BC31F40
+[23:52:43.661] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:52:45.190] ScaleNG.asi log started
+init: entered InitializeASI
+[23:52:45.190] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:52:45.190] ========================================
+[23:52:45.190] ScaleNG.asi loaded
+[23:52:45.190] init: loading config
+[23:52:45.190] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:52:45.190] init: setting config
+[23:52:45.190] hooks: config applied (dlaa=1)
+[23:52:45.191] init: installing D3D12CreateDevice detour
+[23:52:45.191] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:52:45.208] hooks: D3D12CreateDevice detour installed
+[23:52:45.226] hooks: CreateDXGIFactory2 detour installed
+[23:52:45.242] hooks: CreateDXGIFactory1 detour installed
+[23:52:45.259] hooks: CreateDXGIFactory detour installed
+[23:52:45.259] ScaleNG.asi initialization complete
+[23:52:56.000] hooks: scene RTV bound via OMSetRenderTargets (1 RTs) res=1DA7BA12030
+[23:53:13.473] ScaleNG.asi log started
+init: entered InitializeASI
+[23:53:13.473] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:53:13.473] ========================================
+[23:53:13.473] ScaleNG.asi loaded
+[23:53:13.473] ScaleNG.asi log started
+[23:53:13.473] init: loading config
+init: entered InitializeASI
+[23:53:13.473] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:53:13.473] ========================================
+[23:53:13.473] ScaleNG.asi log started
+[23:53:13.473] ScaleNG.asi loaded
+init: entered InitializeASI
+[23:53:13.475] init: loading config
+[23:53:13.475] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:53:13.475] ========================================
+[23:53:13.475] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:53:13.475] ScaleNG.asi loaded
+[23:53:13.475] init: setting config
+[23:53:13.475] init: loading config
+[23:53:13.475] hooks: config applied (dlaa=1)
+[23:53:13.475] init: installing D3D12CreateDevice detour
+[23:53:13.475] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:53:13.475] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:53:13.475] init: setting config
+[23:53:13.476] hooks: config applied (dlaa=1)
+[23:53:13.476] init: installing D3D12CreateDevice detour
+[23:53:13.476] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:53:13.476] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:53:13.476] init: setting config
+[23:53:13.476] hooks: config applied (dlaa=1)
+[23:53:13.476] init: installing D3D12CreateDevice detour
+[23:53:13.476] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:53:13.476] ScaleNG.asi log started
+init: entered InitializeASI
+[23:53:13.476] process: C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe
+[23:53:13.476] ========================================
+[23:53:13.476] ScaleNG.asi loaded
+[23:53:13.477] init: loading config
+[23:53:13.478] config: renderScale=0.67 sharpness=0.00 perfQuality=1 mvJittered=1 autoExposure=1 appId=241534720 dlaa=1 hud=0 legacyScale=0
+[23:53:13.478] init: setting config
+[23:53:13.478] hooks: config applied (dlaa=1)
+[23:53:13.478] init: installing D3D12CreateDevice detour
+[23:53:13.479] hooks: D3D12CreateDevice first bytes: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57
+[23:53:13.494] hooks: D3D12CreateDevice detour installed
+[23:53:13.496] hooks: D3D12CreateDevice detour installed
+[23:53:13.496] hooks: D3D12CreateDevice detour installed
+[23:53:13.501] hooks: D3D12CreateDevice detour installed
+[23:53:13.513] hooks: CreateDXGIFactory2 detour installed
+[23:53:13.513] hooks: CreateDXGIFactory2 detour installed
+[23:53:13.513] hooks: CreateDXGIFactory2 detour installed
+[23:53:13.519] hooks: CreateDXGIFactory2 detour installed
+[23:53:13.533] hooks: CreateDXGIFactory1 detour installed
+[23:53:13.533] hooks: CreateDXGIFactory1 detour installed
+[23:53:13.533] hooks: CreateDXGIFactory1 detour installed
+[23:53:13.537] hooks: CreateDXGIFactory1 detour installed
+[23:53:13.551] hooks: CreateDXGIFactory detour installed
+[23:53:13.551] hooks: CreateDXGIFactory detour installed
+[23:53:13.552] ScaleNG.asi initialization complete
+[23:53:13.552] ScaleNG.asi initialization complete
+[23:53:13.552] hooks: CreateDXGIFactory detour installed
+[23:53:13.552] ScaleNG.asi initialization complete
+[23:53:13.556] hooks: CreateDXGIFactory detour installed
+[23:53:13.556] ScaleNG.asi initialization complete
+[23:53:16.409] hooks: scene color RTV 1DAF76067E0 (1920x1001 R16G16B16A16_UNORM) (ALT)
+[23:53:16.413] hooks: motion vector RTV 1DAF7607B00 (1920x1001 R16G16_FLOAT) (ALT)
+[23:53:16.413] hooks: camera CB ring re-discovered 1DA8A02A670
+[23:53:16.413] hooks: ACCEPT f0..7=1.46 1.78 2.03 0.00 -0.08 -0.10 -0.11 0.00 jit=0.00/0.00
+[23:53:16.413] hooks: ACCEPT w2c=3F7F67D6 BD7E30DE BCE5D373 00000000 3D8B7ABA 3F68BA99 3ED26BE1 00000000 B2E00000 BED2E93D 3F694540 00000000 4440D5EA C42BFD80 C4017717 3F800000
+[23:53:16.414] hooks: ACCEPT w2s=3F510256 BD345F6E 35503C5C BD7E30DD 3D6448AF 3F2524C4 B73EA765 3F68BA98 B3478714 3FB7137F 36ACC7CD BED2E938 00000000 00000000 3DCCCD75 00000000
+[23:53:16.414] hooks: ACCEPT c2s=3F517EDC 00000000 00000000 00000000 3382EF49 B413578B B751B7C2 3F7FFFFE 27C00B19 3FC8EA30 AB99CC36 33BBBD2D 00000000 00000000 3DCCCD75 00000000
+[23:53:16.414] hooks: ACCEPT vp =3F510256 BD345F6E 35503C5C BD7E30DD 3D6448AF 3F2524C4 B73EA765 3F68BA98 B3478714 3FB7137F 36ACC7CD BED2E938 441DCE32 C44B36F0 3DDE6A22 C42BFD80
+[23:53:16.414] hooks: ACCEPT proj=3DCCCCCD 45FA0000 B751B7C3 3DCCCD75
+[23:53:16.414] hooks: frame 1 started (render 0x0, jitter -0.25/0.17)
+[23:53:16.417] DLSS: preloaded nvapi64.dll = 7FFF0B680000
+[23:53:16.420] DLSS: loaded driver core nvngx.dll (C:\Windows\System32\DriverStore\FileRepository\nvlti.inf_amd64_af02d12a5c2283af\nvngx.dll)
+[23:53:16.420] hooks: camera CB patched in place (dst 1DA7BB0E6F0 srcOff 91394048 far 8000.0 pos 1.5 1.8 2.0 w2s11 -0.4119)
+[23:53:16.420] hooks: camera CB patched in place (dst 1DA7B19B120 srcOff 91396608 far 8000.0 pos 1.5 1.8 2.0 w2s11 -0.4119)
+[23:53:16.421] hooks: camera CB patched in place (dst 1DA7BB0CBC0 srcOff 91398656 far 8000.0 pos 1.5 1.8 2.0 w2s11 -0.4119)
+[23:53:16.530] hooks: camera CB patched in place (dst 1DB9C34D850 srcOff 96522752 far 8000.0 pos 1.5 1.8 2.0 w2s11 -0.4119)
+[23:53:16.530] hooks: gameplay active - resuming present-time activity
+[23:53:16.533] hooks: D3D12CreateDevice called #4 (g_device=1D9E198E510)
+[23:53:16.534] hooks: device 1D9E198E510 created (QI IDXGIDevice hr=0x80004002)
+[23:53:16.548] hooks: frame 2 started (render 0x0, jitter 0.25/-0.39)
+[23:53:16.548] hooks: camera CB patched in place (dst 1DB9C34D850 srcOff 96601600 far 8000.0 pos 1.5 1.8 2.0 w2s11 -0.4119)
+[23:53:16.564] hooks: queue slot 10 already hooked (shared vtable)
+[23:53:16.590] bridge: our device/queue/fence ready
+[23:53:16.593] bridge: ready 1920x1001 fmt=28 (NGX re-bind armed)
+[23:53:16.593] hooks: DLSS output format -> 28 (backbuffer)
+[23:53:16.593] hooks: installing cmdlist hooks on 1DAA21975E0
+[23:53:16.593] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:16.593] hooks: display size adopted 1920x1001 (render 1920x1001)
+[23:53:16.594] hooks: dlssOut 1DAAF6FAEF0 allocated (1920x1001)
+[23:53:16.594] hooks: present-injection resources created (list 1DAB004C010 heap 1DA7B2B7820 sampler 1DA7B2B7490)
+[23:53:16.594] hooks: init thread done (resources ok)
+[23:53:16.596] hooks: DLAA skipped - null bridge/resource ptr
+[23:53:16.596] hooks: installing cmdlist hooks on 1DAA2194BC0
+[23:53:16.596] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:16.596] hooks: installing cmdlist hooks on 1DAAF1BF880
+[23:53:16.596] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:16.597] hooks: DLAA skipped - null bridge/resource ptr
+[23:53:16.600] hooks: DLAA skipped - null bridge/resource ptr
+[23:53:16.600] hooks: installing cmdlist hooks on 1DAAF4E9520
+[23:53:16.601] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:16.601] hooks: installing cmdlist hooks on 1DAAF1BCE60
+[23:53:16.601] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:16.601] hooks: installing cmdlist hooks on 1DAAF4ED450
+[23:53:16.601] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:16.602] hooks: DLAA skipped - null bridge/resource ptr
+[23:53:16.605] hooks: DLAA skipped - null bridge/resource ptr
+[23:53:16.616] hooks: installing cmdlist hooks on 1DAAF4EBF40
+[23:53:16.616] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:17.279] hooks: frame 3 started (render 1920x1001, jitter -0.38/-0.06)
+[23:53:17.293] hooks: installing cmdlist hooks on 1DAAF4EE960
+[23:53:17.293] hooks: command list slots 15/16/21/22/26/28/46 hooked
+[23:53:17.293] hooks: frame 4 started (render 1920x1001, jitter 0.13/0.28)
+[23:53:17.307] hooks: full-res copy dst 1DA7B3446F0 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 0 mvV 1 (src fmt 28 1920x1001)
+[23:53:17.307] hooks: depth candidate 1DA7B3446F0 (full-res copy)
+[23:53:17.307] hooks: full-res copy dst 1DA7BA15000 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 45 1920x1001)
+[23:53:17.307] hooks: depth candidate 1DA7BA15000 (full-res copy)
+[23:53:17.307] hooks: full-res copy dst 1DA7BA18960 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 34 1920x1001)
+[23:53:17.307] hooks: depth candidate 1DA7BA18960 (full-res copy)
+[23:53:17.307] hooks: barrier 1DA7BA0C090 0 -> 2048
+[23:53:17.307] hooks: barrier 1DA7BA18960 192 -> 2048
+[23:53:17.307] hooks: barrier 1DA7AFC4300 192 -> 2048
+[23:53:17.308] hooks: barrier 1DA7BA0C090 2048 -> 0
+[23:53:17.308] hooks: frame 5 started (render 1920x1001, jitter -0.13/-0.28)
+[23:53:17.308] hooks: barrier 1DA7BA18960 2048 -> 4
+[23:53:17.308] hooks: barrier 1DA7AFC4300 2048 -> 192
+[23:53:17.309] hooks: full-res copy dst 1DA7AFC8F80 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 10 1920x1001)
+[23:53:17.309] hooks: depth candidate 1DA7AFC8F80 (full-res copy)
+[23:53:17.309] hooks: full-res copy dst 1DA7BA10D10 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 10 1920x1001)
+[23:53:17.309] hooks: depth candidate 1DA7BA10D10 (full-res copy)
+[23:53:17.309] hooks: full-res copy dst 1DA7AFC8F80 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 10 1920x1001)
+[23:53:17.309] hooks: depth candidate 1DA7AFC8F80 (full-res copy)
+[23:53:17.309] hooks: full-res copy dst 1DA7BA10D10 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 10 1920x1001)
+[23:53:17.309] hooks: depth candidate 1DA7BA10D10 (full-res copy)
+[23:53:17.310] hooks: full-res copy dst 1DAF7396070 mv=0 scene=0 w 1920 h 1001 patchVp 0 depth 1 mvV 1 (src fmt 10 1920x1001)
+[23:53:17.310] hooks: depth candidate 1DAF7396070 (full-res copy)
+[23:53:17.943] DLSS diag: QI(IDXGIDevice) hr=0x80004002
+[23:53:17.943] hooks: D3D12CreateDevice called #5 (g_device=1D9E198E510)
+[23:53:17.947] DLSS diag: clean device hr=0x887A0001
+[23:53:17.947] DLSS diag: test buffer hr=0x887A0005
+[23:53:17.947] DLSS: CreateFeature failed, result=-1160773625
+[23:53:17.948] hooks: installing cmdlist hooks on 1DAA219CA20
+[23:53:17.948] hooks: command list slots 15/16/21/22/26/28/46 hooked

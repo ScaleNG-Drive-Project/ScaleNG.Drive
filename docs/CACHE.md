@@ -9,6 +9,8 @@
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
 ## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)
+## Status (last updated: 2026-08-22 20:0x)
+- **PHASE correctness-fix33 DEPLOYED (hash 81D2546B... ASI, git ecdc860, awaiting user run): THREAD SAFETY + STRUCTURAL FIXES per correctness.md Immediate Priority Queue.** (93) InitializeASI atomic InterlockedCompareExchange; (96) KickInitThread InterlockedCompareExchange; (97) g_injResourcesReady atomic volatile long; bridge device on explicit NVIDIA adapter; game-side fence consolidated to single g_gameFence global; hardcoded dims replaced with dynamic; duplicate evalOkCount removed. KEY QUESTION: does CreateFeature succeed on bridgeDev? nvngx.log telemetry live for diagnosis.
 ## Status (last updated: 2026-08-22 19:0x)
 - **PHASE 2c-fix31 DEPLOYED (hash BD2A6272..., awaiting user run): per-call instrumentation + once-only init.** InitializeASI now strictly once-only (static bool guard). Bridge-copy-in section instrumented with per-call g_injStep markers between EVERY D3D12 call. Null guards on shared resources before copies. If fault occurs, handler names the EXACT call.
 ## Status (last updated: 2026-08-22 17:1x)
