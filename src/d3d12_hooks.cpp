@@ -239,7 +239,8 @@ volatile unsigned g_quietUntilFrame = 0;
 volatile LONG g_loadPhase = 1;
 volatile unsigned g_lastSceneChangeFrame = 0;
 volatile unsigned g_lastDiscoveryChangeFrame = 0; // any tracked input swap
-unsigned g_lastDlaaFrame = 0; // per-frame DLAA flow cap (file-scope: set at submit, checked in gates)
+unsigned g_lastDlaaFrame = 0; // per-frame DLAA flow cap
+volatile LONG g_settledOnce = 0; // session latch: all heavy init deferred until set (file-scope: set at submit, checked in gates)
 bool g_frameStarted = false;
 bool g_patchViewport = false;
 bool g_patchAppliedThisFrame = false;
@@ -1555,7 +1556,18 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     if (g_bbFormat == DXGI_FORMAT_UNKNOWN)
         g_bbFormat = bb->GetDesc().Format;
 
-    if (g_dlaaMode) {
+    // SESSION SETTLE LATCH - computed every present from cheap counters.
+    // Scene identity unchanged 90f + quarantine expired. Until latched, ALL
+    // heavy work (bridge/NGX/PSOs/heaps) stays deferred so the load window
+    // stays passive-mode-light (protection against the teardown coin-flip).
+    if (!g_settledOnce &&
+        (int)(g_frameCounter - g_lastSceneChangeFrame) > 90 &&
+        (int)(g_frameCounter - g_quietUntilFrame) >= 0 &&
+        InterlockedCompareExchange(&g_settledOnce, 1, 0) == 0) {
+        Log("hooks: render graph settled - DLAA armed for session");
+    }
+
+    if (g_dlaaMode && g_settledOnce) {
         // Cross-device bridge: NGX lives on OUR clean device (the game's
         // wrapped device lacks IDXGIDevice and crashes the driver in-eval).
         if (!EnsureBridge((unsigned int)bbd.Width, (unsigned int)bbd.Height, bbd.Format, g_device)) {
@@ -1582,7 +1594,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // loading-phase crash of the fix20-22 era.
     if (!InterlockedCompareExchange(&g_injResourcesReady, 0, 0)) {
         bb->Release();
-        KickInitThread();
+        if (g_settledOnce)
+            KickInitThread(); // heavy PSO/heap creation only after settle
         return;
     }
     if (!g_injAlloc || !g_injList || !g_injHeap || !g_injSamplerHeap) {
@@ -1608,14 +1621,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Once settled for the session, scene-slot swaps are NORMAL gameplay
         // (engine rotates 3+ composite sources). Stamps+SEH are the safety net
         // (28-min stable run proof). Quarantine remains for pre-settle only.
-        static bool s_settledOnce = false;
-        if (!s_settledOnce &&
-            (int)(g_frameCounter - g_lastSceneChangeFrame) > 90 &&
-            (int)(g_frameCounter - g_quietUntilFrame) >= 0) {
-            s_settledOnce = true;
-            Log("hooks: render graph settled - DLAA armed for session");
-        }
-        if (!s_settledOnce) {
+        // Latch itself is computed early in the present path (before heavy
+        // init) - see SESSION SETTLE LATCH above.
+        if (!g_settledOnce) {
             doDlss = false;
         }
         // ONE DLAA flow per ENGINE frame. Multiple swapchain Present paths
