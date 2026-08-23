@@ -268,11 +268,22 @@ void CreatedRef_Put(ID3D12Resource* res)
     g_createdRefs[g_createdN++] = res;
 }
 
+// Pure weak pointer swap - no transition bookkeeping (ping-pong path).
+void StoreTracked_Weak(ID3D12Resource** slot, ID3D12Resource* res)
+{
+    *slot = res;
+}
+
 void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
     if (sceneSlot && *slot && res) {
+        // Routine double-buffer ping-pong (engine binds A,B,A,B...) must NOT
+        // count as a change - otherwise the settle gate can never elapse.
+        ID3D12Resource** other = (slot == (ID3D12Resource**)&g_sceneColor)
+                                     ? &g_sceneColorAlt : &g_sceneColor;
+        if (*other == res) return StoreTracked_Weak(slot, res); // pure reassignment
         g_lastSceneChangeFrame = g_frameCounter;
         static unsigned s_changeFrames[8] = {};
         static int s_changeHead = 0;
