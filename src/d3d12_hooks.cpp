@@ -1617,6 +1617,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         if (!s_settledOnce) {
             doDlss = false;
         }
+        // ONE DLAA flow per ENGINE frame. Multiple swapchain Present paths
+        // (Present + Present1 + child windows) otherwise run full NGX
+        // evaluates back-to-back within one frame (7x seen at frame 338)
+        // and overwhelm the driver.
+        static unsigned s_lastDlaaFrame = 0;
+        if (doDlss && s_lastDlaaFrame == g_frameCounter) {
+            doDlss = false;
+        }
         // Depth must be single-sample with a KNOWN format before we can build
         // a matching shared texture - MSAA or unknown formats made the copy
         // an illegal operation (silent GPU fault, instant death).
@@ -1929,8 +1937,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         ID3D12CommandList* rcls[] = { g_injList };
         Real_ExecuteCommandLists(injQueue, 1, rcls);
     }
-    if (doDlss)
+    if (doDlss) {
         Log("hooks: DLAA injection at present (frame %u)", g_frameCounter);
+        s_lastDlaaFrame = g_frameCounter; // consumed this frame's DLAA slot
+    }
     bb->Release();
 }
 
