@@ -744,8 +744,17 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_sceneColorRtv = handle;
                 Log("hooks: scene color RTV handle refreshed %p", (void*)res);
             } else if (res != g_sceneColorAlt) {
-                StoreTracked(&g_sceneColorAlt, res);
-                g_sceneColorRtvAlt = handle;
+                // ALT promotion now requires composite-copy persistence: the
+                // engine recreates post/bloom targets (display-sized UNORM)
+                // during normal play - auto-adopting each churned the scene
+                // identity every second and kept quarantine armed forever.
+                if (g_copySrcCount[(void*)res] >= 40) {
+                    StoreTracked(&g_sceneColorAlt, res);
+                    g_sceneColorRtvAlt = handle;
+                    Log("hooks: scene ALT promoted by persistence %p", (void*)res);
+                } else {
+                    g_rtvMap[handle.ptr] = res; // track state only
+                }
                 Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
             }
@@ -767,8 +776,13 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     g_sceneColorRtv = handle;
                     Log("hooks: scene color RTV handle refreshed %p", (void*)res);
                 } else if (res != g_sceneColorAlt) {
-                    StoreTracked(&g_sceneColorAlt, res);
-                    g_sceneColorRtvAlt = handle;
+                    if (g_copySrcCount[(void*)res] >= 40) {
+                        StoreTracked(&g_sceneColorAlt, res);
+                        g_sceneColorRtvAlt = handle;
+                        Log("hooks: scene ALT promoted by persistence %p", (void*)res);
+                    } else {
+                        g_rtvMap[handle.ptr] = res;
+                    }
                     Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM) (ALT)", (void*)res);
                 }
             } else if (desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
