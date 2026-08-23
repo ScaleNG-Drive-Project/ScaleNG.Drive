@@ -20,6 +20,8 @@ PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
 void EnsureUpscalerInit();
 static bool s_creatingBridge = false;   // true while EnsureBridge creates its device
+unsigned g_mvFirstValidFrame = 0;
+unsigned g_depthFirstValidFrame = 0;
 DXGI_FORMAT g_depthRealFmt = DXGI_FORMAT_UNKNOWN; // engine's actual depth format
 bool g_depthMsaa = false;
 
@@ -306,15 +308,13 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
         // count as a change - otherwise the settle gate can never elapse.
         ID3D12Resource** other = (slot == (ID3D12Resource**)&g_sceneColor)
                                      ? &g_sceneColorAlt : &g_sceneColor;
-        if (*other == res) return StoreTracked_Weak(slot, res); // pure reassignment
+        if (*other == res) { *slot = res; return; } // pure reassignment
+        // Only PERSISTENT composite sources are real scene changes - transient
+        // post targets on recycled descriptors swap constantly during play.
+        int persistNow = 0;
+        { auto ci = g_copySrcCount.find((void*)res); if (ci != g_copySrcCount.end()) persistNow = ci->second; }
+        if (persistNow < 40) { *slot = res; return; }
         g_lastSceneChangeFrame = g_frameCounter;
-        g_lastDiscoveryChangeFrame = g_frameCounter;
-    } else if (mvSlot) {
-        ID3D12Resource** oMv = (slot == (ID3D12Resource**)&g_mvResource)
-                                    ? &g_mvResourceAlt : &g_mvResource;
-        if (*oMv == res) return StoreTracked_Weak(slot, res);
-        g_lastDiscoveryChangeFrame = g_frameCounter;
-    } else if (depSlot) {
         g_lastDiscoveryChangeFrame = g_frameCounter;
         static unsigned s_changeFrames[8] = {};
         static int s_changeHead = 0;
@@ -330,6 +330,13 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
             Log("hooks: scene churn %d/90f - quarantine until frame %u",
                 recent, g_quietUntilFrame);
         }
+    } else if (mvSlot) {
+        ID3D12Resource** oMv = (slot == (ID3D12Resource**)&g_mvResource)
+                                    ? &g_mvResourceAlt : &g_mvResource;
+        if (*oMv == res) { *slot = res; return; }
+        g_lastDiscoveryChangeFrame = g_frameCounter;
+    } else if (depSlot) {
+        g_lastDiscoveryChangeFrame = g_frameCounter;
     }
     // STRICTLY WEAK: never hold refs on engine-owned resources. BeamNG's
     // lifecycle is refcount-exact - any extra ref (at observation OR at
@@ -795,13 +802,15 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 g_rtvMap[handle.ptr] = res;
                 if (!g_mvValid) {
-                    StoreTracked(&g_mvResource, res);
+                    if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
+            StoreTracked(&g_mvResource, res);
                     g_mvValid = true;
                     g_mvStamp = g_frameCounter;
                     Log("hooks: motion vector RTV %p (%ux%u R16G16_FLOAT)", (void*)res, g_mvW, g_mvH);
                 } else if (res == g_mvResource || res == g_mvResourceAlt) {
                     if (res == g_mvResource) {
-                        StoreTracked(&g_mvResource, res);
+                        if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
+            StoreTracked(&g_mvResource, res);
                         Log("hooks: motion vector RTV handle refreshed %p", (void*)res);
                     }
                 } else if (res != g_mvResourceAlt) {
@@ -815,7 +824,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
             g_rtvMap[handle.ptr] = res;
             if (!g_mvValid) {
-                StoreTracked(&g_mvResource, res);
+                if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
+            StoreTracked(&g_mvResource, res);
                 g_mvValid = true;
                 g_mvStamp = g_frameCounter;
                 g_mvW = (unsigned int)rd.Width;
@@ -1640,6 +1650,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Depth must be single-sample with a KNOWN format before we can build
         // a matching shared texture - MSAA or unknown formats made the copy
         // an illegal operation (silent GPU fault, instant death).
+        // Veteran-input gate: never inject on freshly-discovered inputs -
+        // every observed death burst was fresh discovery + immediate activity.
+        if (g_mvValid && (int)(g_frameCounter - g_mvFirstValidFrame) <= 120) doDlss = false;
+        if (g_depthValid && (int)(g_frameCounter - g_depthFirstValidFrame) <= 60) doDlss = false;
         if (g_depthMsaa || g_depthRealFmt == DXGI_FORMAT_UNKNOWN) {
             static int s_depthGateLogs = 0;
             if (++s_depthGateLogs <= 3)
@@ -2861,6 +2875,7 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
             // Depth candidate heuristic (copies NOT involving the scene color or MV).
             bool quietNow = ((int)(g_frameCounter - g_quietUntilFrame) < 0);
             if (!quietNow && !isSceneSrc && !isMvDst && dst->pResource != g_dlssOut) {
+                if (!g_depthValid) g_depthFirstValidFrame = g_frameCounter;
                 StoreTracked(&g_depthResource, dst->pResource);
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
