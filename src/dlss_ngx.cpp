@@ -220,7 +220,10 @@ bool NvDlssUpscaler::Init(const UpscalerInitParams& params)
     for (size_t i = 0; i < len; ++i)
         if (moduleDir[i] == L'\\') cut = i + 1;
     moduleDir[cut] = L'\0';
-    CopyW(m_ngxDataPath, MAX_PATH, moduleDir);
+    // Use the SAME data path as the harness (test_mini) which provably works.
+    // The module directory was causing NGX to search for snippets/models in
+    // the wrong location, leading to incomplete initialization.
+    CopyW(m_ngxDataPath, MAX_PATH, L"C:\\ProgramData\\NVIDIA\\NGX\\models");
 
     m_initialized = true;
     return true;
