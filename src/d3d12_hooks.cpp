@@ -450,11 +450,20 @@ void StartFrame()
     }
 
     g_patchViewport = !g_patchAborted && !g_dlaaMode && g_legacyScale;
-    // First accepted camera patch + a tracked depth = live gameplay.
-    // Discovery hooks were pass-through during load; arm them now.
-    if (g_cameraCbValid && g_depthValid &&
-        InterlockedCompareExchange(&g_loadPhase, 0, 1) == 1) {
-        Log("hooks: gameplay detected - discovery armed");
+    // Gameplay evidence: accepted camera patches. Do NOT arm immediately -
+    // flipping discovery on mid-session floods the creation hooks with
+    // GetDesc/adoption/log work exactly while the engine's render-graph
+    // burst is still draining (instant-crash signature). Delay 3s so late
+    // arming lands on an already-built, quiet graph.
+    if (g_cameraCbValid) {
+        static DWORD s_firstCamTick = 0;
+        DWORD now = GetTickCount();
+        if (!s_firstCamTick) {
+            s_firstCamTick = now;
+        } else if (now - s_firstCamTick > 3000 &&
+                   InterlockedCompareExchange(&g_loadPhase, 0, 1) == 1) {
+            Log("hooks: gameplay settled - discovery armed");
+        }
     }
     static int s_frameLogs = 0;
     ++s_frameLogs;
