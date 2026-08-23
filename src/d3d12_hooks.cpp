@@ -2739,8 +2739,17 @@ void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
         for (UINT i = 0; i < numBarriers; ++i) {
             if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
                 ID3D12Resource* res = pBarriers[i].Transition.pResource;
-                if (res)
+                if (res) {
                     g_resourceStates[res] = pBarriers[i].Transition.StateAfter;
+                    // LIVENESS: the engine transitions depth/MV every frame it
+                    // uses them. Refresh stamps so the staleness gate (which
+                    // protects against freed resources) only trips on real
+                    // renderer transitions, not on normal steady-state play.
+                    if (res == g_depthResource)
+                        g_depthStamp = g_frameCounter;
+                    if (res == g_mvResource || res == g_mvResourceAlt)
+                        g_mvStamp = g_frameCounter;
+                }
             }
         }
     }
