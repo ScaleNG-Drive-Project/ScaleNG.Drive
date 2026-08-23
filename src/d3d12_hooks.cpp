@@ -215,6 +215,13 @@ unsigned int g_frameCounter = 0;
 // adopting new candidates here races teardown (deterministic engine-side AV).
 // All adoption + DLAA freezes until this frame.
 volatile unsigned g_quietUntilFrame = 0;
+// LOAD-PHASE SILENCE: during map load our hooks do NOTHING but forward -
+// no GetDesc discovery, zero file logging - because even microsecond-scale
+// perturbation on engine threads flips a timing coin-flip at the render-
+// graph teardown (deterministic exe+0xD02EDA AV when lost). Armed once
+// gameplay evidence exists (camera CB + MV + depth all seen).
+volatile LONG g_loadPhase = 1;
+volatile unsigned g_lastSceneChangeFrame = 0;
 bool g_frameStarted = false;
 bool g_patchViewport = false;
 bool g_patchAppliedThisFrame = false;
@@ -266,6 +273,7 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     if (*slot == res) return;
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
     if (sceneSlot && *slot && res) {
+        g_lastSceneChangeFrame = g_frameCounter;
         static unsigned s_changeFrames[8] = {};
         static int s_changeHead = 0;
         s_changeFrames[s_changeHead] = g_frameCounter;
@@ -668,6 +676,10 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                                  const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                  D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
+    if (g_loadPhase) {
+        if (Real_CreateRenderTargetView) Real_CreateRenderTargetView(device, res, desc, handle);
+        return;
+    }
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
         // Hold a creation-ref on any interesting target NOW - the object is
@@ -798,6 +810,10 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                    D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
+    if (g_loadPhase) {
+        if (Real_CreateShaderResourceView) Real_CreateShaderResourceView(device, res, desc, handle);
+        return;
+    }
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
         desc->Texture2D.MipLevels == 1) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
@@ -1528,8 +1544,12 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // may be freed with heap memory reused, which passes null checks but
         // hands the driver garbage (TDR). Tight threshold trades rediscovery
         // cost for safety.
-        if ((int)(g_frameCounter - g_quietUntilFrame) < 0) {
-            doDlss = false; // render-graph rebuild in progress
+        // Sticky settle: scene identity must be UNCHANGED for 90 consecutive
+        // frames AND no active quarantine before we inject. Prevents slipping
+        // into gaps between churn re-arms while the graph is still rebuilding.
+        if ((int)(g_frameCounter - g_lastSceneChangeFrame) <= 90 ||
+            (int)(g_frameCounter - g_quietUntilFrame) < 0) {
+            doDlss = false; // render graph not settled yet
         }
         unsigned int fc2 = g_frameCounter;
         bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
