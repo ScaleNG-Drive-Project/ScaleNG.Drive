@@ -13,7 +13,7 @@ struct ScaleNgConfig {
     int perfQuality = 1;
     bool mvJittered = true;
     bool autoExposure = true;
-    unsigned int appId = 1;
+    unsigned int appId = 0xE658700;
     wchar_t dlssDllPath[MAX_PATH] = {};
 };
 

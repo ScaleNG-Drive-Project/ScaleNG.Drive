@@ -112,7 +112,7 @@ static void LoadConfig()
     g_config.perfQuality = getInt(L"perfQuality", 1);
     g_config.mvJittered = getBool(L"mvJittered", true);
     g_config.autoExposure = getBool(L"autoExposure", true);
-    g_config.appId = (unsigned int)getInt(L"appId", 1);
+    g_config.appId = (unsigned int)getInt(L"appId", 0xE658700);
     g_config.enabled = getBool(L"enabled", true);
 
     wchar_t upscaler[32] = {};

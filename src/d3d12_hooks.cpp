@@ -111,7 +111,21 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
     if (!g_bridgeDev) {
         typedef HRESULT(WINAPI* PFN_MkDev)(void*, unsigned, const IID&, void**);
         PFN_MkDev mk = (PFN_MkDev)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateDevice");
-        if (!mk || FAILED(mk(nullptr, 0xb000, __uuidof(ID3D12Device), (void**)&g_bridgeDev))) {
+        // Enumerate adapters to find NVIDIA (hybrid laptops have AMD iGPU)
+        IDXGIFactory4* brFactory = nullptr;
+        typedef HRESULT(WINAPI* PFN_CreateDXGI)(const IID&, void**);
+        PFN_CreateDXGI mkFactory = (PFN_CreateDXGI)(void*)GetProcAddress(GetModuleHandleA("dxgi.dll"), "CreateDXGIFactory1");
+        if (mkFactory) mkFactory(__uuidof(IDXGIFactory4), (void**)&brFactory);
+        IDXGIAdapter1* brAdapter = nullptr;
+        if (brFactory) {
+            for (UINT i = 0; brFactory->EnumAdapters1(i, &brAdapter) == S_OK; ++i) {
+                DXGI_ADAPTER_DESC1 d; brAdapter->GetDesc1(&d);
+                if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.VendorId == 0x10DE) break;
+                brAdapter = nullptr;
+            }
+        }
+        HRESULT bdevHr;
+        if (!mk || FAILED(bdevHr = mk(brAdapter, 0xb000, __uuidof(ID3D12Device), (void**)&g_bridgeDev))) {
             Log("bridge: clean device create failed");
             return false;
         }
@@ -1464,9 +1478,13 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     D3D12_RESOURCE_STATES mvState = mit != g_resourceStates.end() ? mit->second : D3D12_RESOURCE_STATE_COMMON;
 
     if (doDlss) {
-        if (!g_bridgeReady) {
+        if (!g_bridgeReady || !g_gameColor || !g_gameDepth || !g_gameMv || !g_gameOut
+            || !g_depthResource || !g_mvResource) {
             doDlss = false;
-            if (!doHud) { bb->Release(); return; }
+            static int s_nullSkip = 0;
+            if (++s_nullSkip <= 5)
+                Log("hooks: DLAA skipped - null bridge/resource ptr");
+            bb->Release(); return;
         } else {
             // ---- BRIDGE FLOW (game queue -> our device -> game queue) ----
             g_injStep = "bridge-copy-in";
@@ -1549,7 +1567,18 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             g_bridgeQueue->ExecuteCommandLists(1, cl2);
             g_bridgeQueue->Signal(g_bridgeFence, v2);
 
+            // Open the shared fence on the game device for cross-queue sync
+            static ID3D12Fence* s_gameFence = nullptr;
+            static bool s_fenceTried = false;
+            if (!s_fenceTried && g_bridgeFenceShared && g_device) {
+                s_fenceTried = true;
+                HRESULT fhr = g_device->OpenSharedHandle(g_bridgeFenceShared, IID_PPV_ARGS(&s_gameFence));
+                Log("bridge: opened fence on game device hr=0x%08X", (unsigned)fhr);
+            }
             if (evalOk) {
+                // GPU-side wait: game queue blocks until bridge signals v2
+                if (s_gameFence) injQueue->Wait(s_gameFence, g_bridgeVal);
+                ++g_evalOkCount;
                 ++g_evalOkCount;
                 g_evalFailStreak = 0;
                 g_evalDidBridge = true;
@@ -1567,6 +1596,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     }
 
 
+    // Cross-queue sync: game queue must GPU-wait for bridge eval completion.
+    // Without this, the copy-back races with DLSS execution = crashes.
+    static ID3D12Fence* s_gameFence = nullptr;
+    if (!s_gameFence && g_bridgeFenceShared && g_device) {
+        g_device->OpenSharedHandle(g_bridgeFenceShared, IID_PPV_ARGS(&s_gameFence));
+    }
+    if (g_evalDidBridge && s_gameFence) {
+        injQueue->Wait(s_gameFence, g_bridgeVal);
+    }
     g_injStep = "submit";
     g_injList->Close();
     ID3D12CommandList* cls[] = { g_injList };
