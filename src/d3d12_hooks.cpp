@@ -20,6 +20,8 @@ PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
 void EnsureUpscalerInit();
 static bool s_creatingBridge = false;   // true while EnsureBridge creates its device
+DXGI_FORMAT g_depthRealFmt = DXGI_FORMAT_UNKNOWN; // engine's actual depth format
+bool g_depthMsaa = false;
 
 
 static unsigned F2U(float v)
@@ -83,6 +85,8 @@ HANDLE g_bridgeFenceEv = nullptr;
 HANDLE g_bridgeFenceShared = nullptr;
 UINT64 g_bridgeVal = 0;
 UINT64 g_bridgeLastSubmit = 0;
+DXGI_FORMAT g_brDepthFmt = DXGI_FORMAT_UNKNOWN;
+bool g_brDepthFmtSet = false;
 ID3D12Resource* g_brColor = nullptr;  HANDLE g_hColor = nullptr;
 ID3D12Resource* g_brDepth = nullptr;  HANDLE g_hDepth = nullptr;
 ID3D12Resource* g_brMv = nullptr;     HANDLE g_hMv = nullptr;
@@ -183,7 +187,19 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
 
     bool ok = true;
     ok &= mkShared(&g_brColor, &g_hColor, &g_gameColor, W, H, fmt, D3D12_RESOURCE_FLAG_NONE);
-    ok &= mkShared(&g_brDepth, &g_hDepth, &g_gameDepth, W, H, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    DXGI_FORMAT depthFmt = (g_depthRealFmt != DXGI_FORMAT_UNKNOWN) ? g_depthRealFmt : DXGI_FORMAT_R32_FLOAT;
+    if (g_brDepthFmtSet && g_brDepthFmt != depthFmt) {
+        g_bridgeReady = false;
+        for (auto** p : { &g_gameColor, &g_gameDepth, &g_gameMv, &g_gameOut })
+            if (*p) { (*p)->Release(); *p = nullptr; }
+        for (auto** p : { &g_brColor, &g_brDepth, &g_brMv, &g_brOut })
+            if (*p) { (*p)->Release(); *p = nullptr; }
+        for (auto** h : { &g_hColor, &g_hDepth, &g_hMv, &g_hOut })
+            if (*h) { CloseHandle(*h); *h = nullptr; }
+        Log("bridge: depth format changed to %d - rebuilding shared", (int)depthFmt);
+    }
+    ok &= mkShared(&g_brDepth, &g_hDepth, &g_gameDepth, W, H, depthFmt, D3D12_RESOURCE_FLAG_NONE);
+    g_brDepthFmt = depthFmt; g_brDepthFmtSet = true;
     ok &= mkShared(&g_brMv, &g_hMv, &g_gameMv, W, H, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ok &= mkShared(&g_brOut, &g_hOut, &g_gameOut, W, H, fmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     if (!ok) { Log("bridge: shared resource creation failed"); return false; }
@@ -864,6 +880,8 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             StoreTracked(&g_depthResource, res);
             g_depthValid = true;
             g_depthStamp = g_frameCounter;
+            g_depthRealFmt = rd.Format;
+            g_depthMsaa = rd.SampleDesc.Count != 1;
             g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             Log("hooks: depth candidate SRV %p", (void*)res);
         }
@@ -1597,6 +1615,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             Log("hooks: render graph settled - DLAA armed for session");
         }
         if (!s_settledOnce) {
+            doDlss = false;
+        }
+        // Depth must be single-sample with a KNOWN format before we can build
+        // a matching shared texture - MSAA or unknown formats made the copy
+        // an illegal operation (silent GPU fault, instant death).
+        if (g_depthMsaa || g_depthRealFmt == DXGI_FORMAT_UNKNOWN) {
+            static int s_depthGateLogs = 0;
+            if (++s_depthGateLogs <= 3)
+                Log("hooks: DLAA blocked - depth msaa=%d fmt=%d", g_depthMsaa ? 1 : 0, (int)g_depthRealFmt);
             doDlss = false;
         }
         // Settle = scene identity stable 90f + no active quarantine.
@@ -2815,6 +2842,11 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                 StoreTracked(&g_depthResource, dst->pResource);
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
+                {
+                    D3D12_RESOURCE_DESC dd = dst->pResource->GetDesc();
+                    g_depthRealFmt = dd.Format;
+                    g_depthMsaa = dd.SampleDesc.Count != 1;
+                }
                 auto it = g_resourceStates.find(dst->pResource);
                 if (it == g_resourceStates.end())
                     g_resourceStates[dst->pResource] = D3D12_RESOURCE_STATE_COPY_DEST;
