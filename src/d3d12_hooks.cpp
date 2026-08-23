@@ -233,19 +233,23 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     if (*slot == res) return;
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
     if (sceneSlot && *slot && res) {
-        // Routine double-buffer ALT swaps flip between KNOWN pointers - those
-        // are not transitions. Only a NEVER-seen scene pointer marks a real
+        // Transition detection by CHURN RATE, not novelty: the engine
+        // legitimately creates new display-sized UNORM targets during play
+        // (post chain, bloom). Only MANY rapid scene-slot replacements mark a
         // render-graph rebuild worth quarantining over.
-        static ID3D12Resource* s_knownScene[8] = {};
-        static int s_knownN = 0;
-        bool known = false;
-        for (int i = 0; i < s_knownN; ++i)
-            if (s_knownScene[i] == res) { known = true; break; }
-        if (!known) {
-            if (s_knownN < 8) s_knownScene[s_knownN++] = res;
-            else { s_knownScene[0] = res; }
-            g_quietUntilFrame = g_frameCounter + 45;
-            Log("hooks: novel scene target %p - quarantine until frame %u", (void*)res, g_quietUntilFrame);
+        static unsigned s_changeFrames[8] = {};
+        static int s_changeHead = 0;
+        s_changeFrames[s_changeHead] = g_frameCounter;
+        s_changeHead = (s_changeHead + 1) & 7;
+        int recent = 0;
+        for (int i = 0; i < 8; ++i)
+            if ((int)(g_frameCounter - s_changeFrames[i]) >= 0 &&
+                g_frameCounter - s_changeFrames[i] <= 90)
+                ++recent;
+        if (recent >= 5) {
+            g_quietUntilFrame = g_frameCounter + 60;
+            Log("hooks: scene churn %d/90f - quarantine until frame %u",
+                recent, g_quietUntilFrame);
         }
     }
     if (*slot) {
