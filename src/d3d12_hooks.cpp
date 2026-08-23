@@ -232,7 +232,22 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
-    if (sceneSlot && *slot && res) g_quietUntilFrame = g_frameCounter + 45; // render-graph rebuild marker
+    if (sceneSlot && *slot && res) {
+        // Routine double-buffer ALT swaps flip between KNOWN pointers - those
+        // are not transitions. Only a NEVER-seen scene pointer marks a real
+        // render-graph rebuild worth quarantining over.
+        static ID3D12Resource* s_knownScene[8] = {};
+        static int s_knownN = 0;
+        bool known = false;
+        for (int i = 0; i < s_knownN; ++i)
+            if (s_knownScene[i] == res) { known = true; break; }
+        if (!known) {
+            if (s_knownN < 8) s_knownScene[s_knownN++] = res;
+            else { s_knownScene[0] = res; }
+            g_quietUntilFrame = g_frameCounter + 45;
+            Log("hooks: novel scene target %p - quarantine until frame %u", (void*)res, g_quietUntilFrame);
+        }
+    }
     if (*slot) {
         if (g_graveN < 4) g_grave[g_graveN++] = *slot;
         else (*slot)->Release();
