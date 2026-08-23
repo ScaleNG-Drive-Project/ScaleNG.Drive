@@ -525,6 +525,11 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
 void EnsureUpscalerInit()
 {
     if (g_upscalerInitAttempted) return;
+    // Wait for the bridge device - initializing NGX on the game's wrapper
+    // device crashes the driver. If bridge isn't ready yet, don't mark
+    // attempted; a later call will retry once it exists.
+    extern ID3D12Device* g_bridgeDev;
+    if (!g_bridgeDev) return;
     g_upscalerInitAttempted = true;
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
@@ -532,8 +537,7 @@ void EnsureUpscalerInit()
         return;
     }
     UpscalerInitParams ip = {};
-    extern ID3D12Device* g_bridgeDev;
-    ip.device = (g_bridgeDev ? g_bridgeDev : g_device);
+    ip.device = g_bridgeDev;
     ip.renderWidth = g_renderW;
     ip.renderHeight = g_renderH;
     ip.displayWidth = g_displayW;

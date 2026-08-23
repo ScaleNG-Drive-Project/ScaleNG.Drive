@@ -8,7 +8,9 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
-## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)
+## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)## Status (last updated: 2026-08-23 00:0x)
+- **fix35 DEPLOYED (hash 4B0BC49A...): outer SEH around entire bridge flow.** Stale engine resources (freed between frames) pass null checks but fault in the driver. Now: __try wraps alloc-reset through eval; __except logs g_injStep, nulls depth+MV, sets bridgeOk=false. Fault path skips list submit entirely (abandons partial commands) and releases bb safely. Prevents cascading corruption from one bad resource.
+
 - **fix34 DEPLOYED (hash 8d63242..., awaiting user run): EarlyInitNGX premature success flag fixed (g_earlyNgxReady set after init, not before). Device mismatch guard added to Evaluate: cmdList->GetDevice() compared against m_device.**
 
 - **fix35 DEPLOYED (hash 1BF7936E..., awaiting user run): STALE INPUT INVALIDATION.** Root cause of loading crashes: g_mvResource/g_depthResource point to FREED engine resources after map transitions. Barrier() on freed resource = driver C0000005 at non-module address. Fix: null out stale pointers when stamps exceed 120 frames.
