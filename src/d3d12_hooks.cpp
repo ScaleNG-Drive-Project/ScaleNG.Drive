@@ -19,7 +19,7 @@ extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR
 PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
 void EnsureUpscalerInit();
-ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
+static bool s_creatingBridge = false;   // true while EnsureBridge creates its device
 
 
 static unsigned F2U(float v)
@@ -119,6 +119,7 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
     if (!g_bridgeDev) {
         typedef HRESULT(WINAPI* PFN_MkDev)(void*, unsigned, const IID&, void**);
         PFN_MkDev mk = (PFN_MkDev)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateDevice");
+        s_creatingBridge = true;   // keep Hook_D3D12CreateDevice from hijacking g_device
         // Enumerate adapters to find NVIDIA (hybrid laptops have AMD iGPU)
         IDXGIFactory4* brFactory = nullptr;
         typedef HRESULT(WINAPI* PFN_CreateDXGI)(const IID&, void**);
@@ -134,9 +135,11 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         }
         HRESULT bdevHr;
         if (!mk || FAILED(bdevHr = mk(brAdapter, 0xb000, __uuidof(ID3D12Device), (void**)&g_bridgeDev))) {
+            s_creatingBridge = false;
             Log("bridge: clean device create failed");
             return false;
         }
+        s_creatingBridge = false;
         D3D12_COMMAND_QUEUE_DESC qd = {};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         g_bridgeDev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_bridgeQueue));
@@ -1434,9 +1437,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // STALENESS INVALIDATION: if depth/MV stamps are too old, the tracked
         // pointers likely reference freed engine resources. Null them out so
         // the bridge flow never touches them. Re-discovery will repopulate.
+        // 3-frame max age: during gameplay depth/MV render EVERY frame. A gap
+        // means a renderer transition (map load, resize) - the old pointers
+        // may be freed with heap memory reused, which passes null checks but
+        // hands the driver garbage (TDR). Tight threshold trades rediscovery
+        // cost for safety.
         unsigned int fc2 = g_frameCounter;
-        bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 120);
-        bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 120);
+        bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
+        bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 3);
         if (depthStale || mvStale) {
             static int s_staleLogs = 0;
             if (++s_staleLogs <= 5)
@@ -2820,6 +2828,12 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                                       REFIID riid, void** ppDevice)
 {
     static int s_createCalls = 0;
+    if (s_creatingBridge) {
+        // Bridge device creation: pure passthrough. Do NOT touch g_device,
+        // g_graphicsQueue, or reinstall vtable hooks - those must stay bound
+        // to the GAME's device.
+        return Real_D3D12CreateDevice_Tramp(adapter, minLevel, riid, ppDevice);
+    }
     if (s_createCalls < 5) {
         ++s_createCalls;
         Log("hooks: D3D12CreateDevice called #%d (g_device=%p)", s_createCalls, (void*)g_device);
