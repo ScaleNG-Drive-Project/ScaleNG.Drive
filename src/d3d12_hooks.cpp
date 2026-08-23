@@ -93,7 +93,7 @@ ID3D12Resource* g_gameMv = nullptr;
 ID3D12Resource* g_gameOut = nullptr;
 bool g_passiveMode = false;
 bool g_bridgeReady = false;
-bool g_upscalerInitAttempted = false;
+volatile LONG g_upscalerInitAttempted = 0;
 IUpscaler* g_upscaler = nullptr;
 bool g_evalDidBridge = false;
 static unsigned g_brW = 0, g_brH = 0;
@@ -192,7 +192,7 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
     g_bridgeReady = true;
     // Re-arm NGX init: it may have bound the wrapped game device before the
     // bridge existed. Next EnsureUpscalerInit re-runs on OUR clean device.
-    g_upscalerInitAttempted = false;
+    InterlockedExchange(&g_upscalerInitAttempted, 0);
     Log("bridge: ready %ux%u fmt=%d (NGX re-bind armed)", W, H, (int)fmt);
     return true;
 }
@@ -498,13 +498,15 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
 
 void EnsureUpscalerInit()
 {
-    if (g_upscalerInitAttempted) return;
+    // Atomic: the camera-CB hook (engine ECL thread) and the Present thread
+    // can both reach this simultaneously - a plain check allowed double NGX
+    // init and corrupted NVIDIA global state.
+    if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
     // Wait for the bridge device - initializing NGX on the game's wrapper
     // device crashes the driver. If bridge isn't ready yet, don't mark
     // attempted; a later call will retry once it exists.
     extern ID3D12Device* g_bridgeDev;
     if (!g_bridgeDev) return;
-    g_upscalerInitAttempted = true;
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
         Log("hooks: upscaler creation failed");
@@ -2477,7 +2479,9 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                                 F2U(ac[172]), F2U(ac[173]), F2U(ac[174]), F2U(ac[175]));
                         }
                         StartFrame();
-                        EnsureUpscalerInit();
+                        // NOTE: no EnsureUpscalerInit here - this runs on the
+                        // engine ECL thread; NGX init races the Present thread
+                        // (double-init corrupted NVIDIA global state).
                         if (g_dlaaMode)
                             ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
                                                 g_currJitter, g_prevJitter);
@@ -2641,7 +2645,6 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
             if (!g_dlaaMode && isSceneSrc && dst->pResource != g_dlssOut &&
                 (g_patchViewport) && g_mvValid &&
                 (g_patchAppliedThisFrame) && g_depthValid) {
-                EnsureUpscalerInit();
                 if (g_upscaler && g_upscaler->IsReady() && !g_bridgeReady) {
                     inject = true;
                     injectBefore = true;
