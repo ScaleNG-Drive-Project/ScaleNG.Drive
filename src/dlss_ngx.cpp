@@ -95,6 +95,23 @@ NvDlssUpscaler::~NvDlssUpscaler()
 
 bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
 {
+    // NGX searches for feature snippets beside the PROCESS EXE (plus driver
+    // store). Games ship nvngx_dlss.dll there; our copy lives in plugins\,
+    // which the core never scans -> CreateFeature returned NotInitialized.
+    // Self-host: mirror the snippet next to the exe once.
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        wchar_t* slash = wcsrchr(exePath, L'\\');
+        if (slash) *(slash + 1) = L'\0';
+        wchar_t dst[MAX_PATH] = {};
+        lstrcpyW(dst, exePath);
+        lstrcatW(dst, L"nvngx_dlss.dll");
+        if (GetFileAttributesW(dst) == INVALID_FILE_ATTRIBUTES && dllPath && *dllPath) {
+            if (CopyFileW(dllPath, dst, FALSE))
+                Log("DLSS: mirrored snippet to exe dir: %ls", dst);
+        }
+    }
     // PART 1: preload nvapi64.dll BEFORE the NGX core. Driver 596.49's
     // nvapi64.dll is a stripped "direct mode" shim (exports only
     // nvapi_QueryInterface + nvapi_Direct_GetMethod); without this preload
