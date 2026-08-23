@@ -1,3 +1,23 @@
+#define NOMINMAX
+#include "d3d12_hooks.h"
+#include "log.h"
+#include "camera_cb.h"
+#include "dlss_ngx.h"
+
+#include <dxgi1_4.h>
+#include <dxgi1_2.h>
+#include <d3dcompiler.h>
+#include <MinHook.h>
+
+extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR, DWORD);
+#include <map>
+#include <vector>
+#include <cstring>
+#include <cmath>
+
+static ID3D12Device* g_bridgeDev = nullptr;
+void EnsureUpscalerInit();
+
 // ---------------------------------------------------------------------------
 // EARLY NGX INITIALIZATION: create our clean device and initialize NGX on it
 // BEFORE any game activity. This eliminates process-state contamination that
@@ -44,22 +64,9 @@ static void EarlyInitNGX()
     EnsureUpscalerInit();
     Log("early-init: NGX initialized on bridgeDev=%p", (void*)g_bridgeDev);
 }
-#define NOMINMAX
-#include "d3d12_hooks.h"
-#include "log.h"
-#include "camera_cb.h"
-#include "dlss_ngx.h"
 
-#include <dxgi1_4.h>
-#include <dxgi1_2.h>
-#include <d3dcompiler.h>
-#include <MinHook.h>
+ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
 
-extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR, DWORD);
-#include <map>
-#include <vector>
-#include <cstring>
-#include <cmath>
 
 static unsigned F2U(float v)
 {
@@ -236,6 +243,7 @@ ID3D12Resource* g_activeSceneColor = nullptr;
 ID3D12Resource* g_dlssOut = nullptr;
 bool g_dlssOutValid = false;
 
+ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
 unsigned int g_renderW = 0;
 unsigned int g_renderH = 0;
 
@@ -1299,18 +1307,18 @@ static bool g_catchFaults = true;
 static HANDLE g_initThreadEv = nullptr;
 static HANDLE g_initThreadH = nullptr;
 static volatile long g_initThreadKick = 0;
-bool g_injResourcesReady = false;
+volatile long g_injResourcesReady = 0; // atomic: 0=not ready, 1=ready
 
 static DWORD WINAPI InitThreadProc(LPVOID)
 {
     for (;;) {
         WaitForSingleObject(g_initThreadEv, INFINITE);
-        if (!g_injResourcesReady) {
+        if (!InterlockedCompareExchange(&g_injResourcesReady, 0, 0)) {
             EnsureInjectionResources();
             // HUD REMOVED from init: its creation surface (d3dcompiler,
             // PSOs, heaps on the wrapped device) is the prime crash suspect.
             // Activity signal moved to window title instead.
-            g_injResourcesReady = g_injAlloc && g_injList;
+            InterlockedExchange(&g_injResourcesReady, (g_injAlloc && g_injList) ? 1 : 0);
             Log("hooks: init thread done (resources %s)",
                 g_injAlloc ? "ok" : "FAIL");
         }
@@ -1320,7 +1328,9 @@ static DWORD WINAPI InitThreadProc(LPVOID)
 
 static void KickInitThread()
 {
-    if (!g_initThreadEv) {
+    // Thread-safe: only create once even under concurrent ECL callbacks
+    static volatile long s_initThreadCreated = 0;
+    if (InterlockedCompareExchange(&s_initThreadCreated, 1, 0) == 0) {
         g_initThreadEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         g_initThreadH = CreateThread(nullptr, 0, InitThreadProc, nullptr, 0, nullptr);
     }
@@ -1442,7 +1452,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // One-time init runs on a DEDICATED THREAD, never inside the ECL callback.
     // The creation burst (PSOs/resources mid-callback) correlated with every
     // loading-phase crash of the fix20-22 era.
-    if (!g_injResourcesReady) {
+    if (!InterlockedCompareExchange(&g_injResourcesReady, 0, 0)) {
         bb->Release();
         KickInitThread();
         return;
@@ -1636,17 +1646,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             g_bridgeQueue->Signal(g_bridgeFence, v2);
             g_bridgeLastSubmit = v2;
 
-            // Open the shared fence on the game device for cross-queue sync
-            static ID3D12Fence* s_gameFence = nullptr;
-            static bool s_fenceTried = false;
-            if (!s_fenceTried && g_bridgeFenceShared && g_device) {
-                s_fenceTried = true;
-                HRESULT fhr = g_device->OpenSharedHandle(g_bridgeFenceShared, IID_PPV_ARGS(&s_gameFence));
-                Log("bridge: opened fence on game device hr=0x%08X", (unsigned)fhr);
+            // Cross-queue sync: open the shared fence on the game device ONCE,
+            // then use it for both evalOk Wait and copy-back Wait.
+            if (!g_gameFence && g_bridgeFenceShared && g_device) {
+                HRESULT fhr = g_device->OpenSharedHandle(g_bridgeFenceShared, IID_PPV_ARGS(&g_gameFence));
+                Log("bridge: opened game-side fence hr=0x%08X ptr=%p", (unsigned)fhr, (void*)g_gameFence);
             }
             if (evalOk) {
                 // GPU-side wait: game queue blocks until bridge signals v2
-                if (s_gameFence) injQueue->Wait(s_gameFence, g_bridgeVal);
+                if (g_gameFence) injQueue->Wait(g_gameFence, g_bridgeVal);
                 ++g_evalOkCount;
                 g_evalFailStreak = 0;
                 g_evalDidBridge = true;
@@ -1664,14 +1672,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     }
 
 
-    // Cross-queue sync: game queue must GPU-wait for bridge eval completion.
-    // Without this, the copy-back races with DLSS execution = crashes.
-    static ID3D12Fence* s_gameFence = nullptr;
-    if (!s_gameFence && g_bridgeFenceShared && g_device) {
-        g_device->OpenSharedHandle(g_bridgeFenceShared, IID_PPV_ARGS(&s_gameFence));
-    }
-    if (g_evalDidBridge && s_gameFence) {
-        injQueue->Wait(s_gameFence, g_bridgeVal);
+    // Cross-queue sync for copy-back: game queue waits on the SAME fence.
+    if (g_evalDidBridge && g_gameFence) {
+        injQueue->Wait(g_gameFence, g_bridgeVal);
     }
     g_injStep = "submit";
     g_injList->Close();

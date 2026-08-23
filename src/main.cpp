@@ -153,9 +153,9 @@ extern "C" __declspec(dllexport) void InitializeASI()
 {
     // STRICTLY once-only: UAL/loader calls this multiple times. Without this
     // guard, each call re-runs full init (log restart, hook re-install, etc).
-    static bool s_asiInitialized = false;
-    if (s_asiInitialized) return;
-    s_asiInitialized = true;
+    // Atomic once-only guard: thread-safe even if UAL calls from multiple threads
+    static volatile long s_asiState = 0; // 0=uninit 1=initializing 2=initialized
+    if (InterlockedCompareExchange(&s_asiState, 1, 0) != 0) return;
     LogInit();
     RawLog("init: entered InitializeASI\n");
     __try {
