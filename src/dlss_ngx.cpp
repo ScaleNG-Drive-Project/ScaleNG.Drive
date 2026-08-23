@@ -263,6 +263,22 @@ void NvDlssUpscaler::ResolveParamSlots()
     }
 }
 
+// SEH wrapper for NGX init - must be a standalone function because __try
+// cannot coexist with C++ object unwinding in the caller.
+static int SafeNgxInit(PFN_NVSDK_NGX_D3D12_Init f, unsigned appId,
+                       const wchar_t* dataPath, ID3D12Device* dev,
+                       NVSDK_NGX_Version version, unsigned* outCode)
+{
+    if (!f) return -1;
+    __try {
+        NVSDK_NGX_Result r = f(appId, dataPath, dev, version);
+        return (int)r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outCode = (unsigned)GetExceptionCode();
+        return -2;
+    }
+}
+
 bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
 {
     if (!cmdList)
@@ -275,9 +291,20 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
         return false;
 
 
-    NVSDK_NGX_Result r = pInit(m_appId, m_ngxDataPath, m_device, NVSDK_NGX_Version_API);
-    if (!NVSDK_NGX_SUCCEEDED(r)) {
-        Log("DLSS: NVSDK_NGX_D3D12_Init failed, result=%d", r);
+    // SEH around pInit: NGX's D3D12_Init faults at driver level when called
+    // on a secondary device while the game's primary device is active.
+    // Catching here lets the game survive - DLAA just stays disabled.
+    unsigned sehCode = 0;
+    int irc = SafeNgxInit(pInit, m_appId, m_ngxDataPath, m_device,
+                          NVSDK_NGX_Version_API, &sehCode);
+    if (irc == -2) {
+        Log("DLSS: NVSDK_NGX_D3D12_Init FAULTED (SEH 0x%08X) - DLAA unavailable", sehCode);
+        s_lastFailTick = GetTickCount();
+        return false;
+    }
+    if (irc < 0 || !NVSDK_NGX_SUCCEEDED((NVSDK_NGX_Result)irc)) {
+        Log("DLSS: NVSDK_NGX_D3D12_Init failed, result=%d", irc);
+        s_lastFailTick = GetTickCount();
         return false;
     }
 
@@ -356,7 +383,7 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
 
-    r = pCreateFeature(cmdList, NVSDK_NGX_Feature_SuperSampling, m_parameters, &m_feature);
+    NVSDK_NGX_Result r = pCreateFeature(cmdList, NVSDK_NGX_Feature_SuperSampling, m_parameters, &m_feature);
     if (!NVSDK_NGX_SUCCEEDED(r) || !m_feature) {
         Log("DLSS: CreateFeature failed, result=%d", r);
         s_lastFailTick = GetTickCount();

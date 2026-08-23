@@ -8,7 +8,9 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
-## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)## Status (last updated: 2026-08-23 00:0x)
+## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)## Status (last updated: 2026-08-23 00:0x)## Status (last updated: 2026-08-23 04:3x)
+- **fix36 DEPLOYED (hash 40D313CB...): EnsureUpscalerInit now WAITS for g_bridgeDev.** Previous run showed NGX diag on wrapper device (QI IDXGIDevice=E_NOINTERFACE) because EnsureUpscalerInit fired before bridge creation. Now returns without marking attempted if bridge missing - retries later. Also decoded NGX errors: 0xBAD00007=NotInitialized, 0xBAD00004=FeatureNotFound.
+
 - **fix35 DEPLOYED (hash 4B0BC49A...): outer SEH around entire bridge flow.** Stale engine resources (freed between frames) pass null checks but fault in the driver. Now: __try wraps alloc-reset through eval; __except logs g_injStep, nulls depth+MV, sets bridgeOk=false. Fault path skips list submit entirely (abandons partial commands) and releases bb safely. Prevents cascading corruption from one bad resource.
 
 - **fix34 DEPLOYED (hash 8d63242..., awaiting user run): EarlyInitNGX premature success flag fixed (g_earlyNgxReady set after init, not before). Device mismatch guard added to Evaluate: cmdList->GetDevice() compared against m_device.**
