@@ -744,17 +744,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_sceneColorRtv = handle;
                 Log("hooks: scene color RTV handle refreshed %p", (void*)res);
             } else if (res != g_sceneColorAlt) {
-                // ALT promotion now requires composite-copy persistence: the
-                // engine recreates post/bloom targets (display-sized UNORM)
-                // during normal play - auto-adopting each churned the scene
-                // identity every second and kept quarantine armed forever.
-                if (g_copySrcCount[(void*)res] >= 40) {
-                    StoreTracked(&g_sceneColorAlt, res);
-                    g_sceneColorRtvAlt = handle;
-                    Log("hooks: scene ALT promoted by persistence %p", (void*)res);
-                } else {
-                    g_rtvMap[handle.ptr] = res; // track state only
-                }
+                StoreTracked(&g_sceneColorAlt, res);
+                g_sceneColorRtvAlt = handle;
                 Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
             }
@@ -776,13 +767,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     g_sceneColorRtv = handle;
                     Log("hooks: scene color RTV handle refreshed %p", (void*)res);
                 } else if (res != g_sceneColorAlt) {
-                    if (g_copySrcCount[(void*)res] >= 40) {
-                        StoreTracked(&g_sceneColorAlt, res);
-                        g_sceneColorRtvAlt = handle;
-                        Log("hooks: scene ALT promoted by persistence %p", (void*)res);
-                    } else {
-                        g_rtvMap[handle.ptr] = res;
-                    }
+                    StoreTracked(&g_sceneColorAlt, res);
+                    g_sceneColorRtvAlt = handle;
                     Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM) (ALT)", (void*)res);
                 }
             } else if (desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
@@ -1600,15 +1586,25 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Sticky settle: scene identity must be UNCHANGED for 90 consecutive
         // frames AND no active quarantine before we inject. Prevents slipping
         // into gaps between churn re-arms while the graph is still rebuilding.
+        // Once settled for the session, scene-slot swaps are NORMAL gameplay
+        // (engine rotates 3+ composite sources). Stamps+SEH are the safety net
+        // (28-min stable run proof). Quarantine remains for pre-settle only.
+        static bool s_settledOnce = false;
+        if (!s_settledOnce &&
+            (int)(g_frameCounter - g_lastSceneChangeFrame) > 90 &&
+            (int)(g_frameCounter - g_quietUntilFrame) >= 0) {
+            s_settledOnce = true;
+            Log("hooks: render graph settled - DLAA armed for session");
+        }
+        if (!s_settledOnce) {
+            doDlss = false;
+        }
         // Settle = scene identity stable 90f + no active quarantine.
         // Depth/MV deliberately EXCLUDED from this gate: transient depth
         // candidates rotate every ~2s during NORMAL gameplay (shadow/composite
         // passes) - requiring them frozen forever blocks arming entirely.
         // Their safety is the 3-frame liveness stamps + bridge SEH instead.
-        if ((int)(g_frameCounter - g_lastSceneChangeFrame) <= 90 ||
-            (int)(g_frameCounter - g_quietUntilFrame) < 0) {
-            doDlss = false; // render graph not settled yet
-        }
+
         unsigned int fc2 = g_frameCounter;
         bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
         bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 3);
