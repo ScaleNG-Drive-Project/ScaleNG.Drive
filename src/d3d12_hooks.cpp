@@ -101,6 +101,7 @@ static DXGI_FORMAT g_brFmt = DXGI_FORMAT_UNKNOWN;
 unsigned int g_lastCamPatchFrame = 0;
 
 // Create/refresh the cross-device bridge for the given size+format.
+ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
 static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* gameDev)
 {
     
@@ -156,7 +157,11 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
             }
         }
         g_bridgeFenceEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        Log("bridge: our device/queue/fence ready");
+        // Open the game-device view of the shared fence NOW - the game queue
+        // must never Signal/Wait the bridge-device fence instance directly.
+        if (gameDev && g_bridgeFenceShared)
+            gameDev->OpenSharedHandle(g_bridgeFenceShared, IID_PPV_ARGS(&g_gameFence));
+        Log("bridge: our device/queue/fence ready (gameFence=%p)", (void*)g_gameFence);
     }
 
     auto mkShared = [&](ID3D12Resource** ours, HANDLE* hout, ID3D12Resource** theirs,
@@ -198,7 +203,6 @@ ID3D12Resource* g_activeSceneColor = nullptr;
 ID3D12Resource* g_dlssOut = nullptr;
 bool g_dlssOutValid = false;
 
-ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
 unsigned int g_renderW = 0;
 unsigned int g_renderH = 0;
 
@@ -1595,7 +1599,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             if (g_injFence) injQueue->Signal(g_injFence, ++g_injFenceVal);
             g_injSubmitted = true;
             g_injStep = "bridge:signal-v1";
-            injQueue->Signal(g_bridgeFence, g_bridgeVal);
+            if (g_gameFence) injQueue->Signal(g_gameFence, g_bridgeVal); // game queue uses ITS fence view
+            else injQueue->Signal(g_bridgeFence, g_bridgeVal); // fallback (should not happen)
 
             // Our device: wait for inputs, evaluate DLAA.
             UINT64 v1 = g_bridgeVal;
