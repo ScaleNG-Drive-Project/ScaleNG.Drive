@@ -1584,10 +1584,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Sticky settle: scene identity must be UNCHANGED for 90 consecutive
         // frames AND no active quarantine before we inject. Prevents slipping
         // into gaps between churn re-arms while the graph is still rebuilding.
+        // Settle = scene identity stable 90f + no active quarantine.
+        // Depth/MV deliberately EXCLUDED from this gate: transient depth
+        // candidates rotate every ~2s during NORMAL gameplay (shadow/composite
+        // passes) - requiring them frozen forever blocks arming entirely.
+        // Their safety is the 3-frame liveness stamps + bridge SEH instead.
         if ((int)(g_frameCounter - g_lastSceneChangeFrame) <= 90 ||
-            (int)(g_frameCounter - g_lastDiscoveryChangeFrame) <= 90 ||
             (int)(g_frameCounter - g_quietUntilFrame) < 0) {
-            doDlss = false; // inputs not settled yet
+            doDlss = false; // render graph not settled yet
         }
         unsigned int fc2 = g_frameCounter;
         bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
