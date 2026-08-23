@@ -507,6 +507,10 @@ void EnsureUpscalerInit()
 
 void DoInjection(ID3D12GraphicsCommandList* list)
 {
+    // Bridge mode owns DLAA exclusively (Present-time flow). This legacy
+    // path records NGX work into the ENGINE's command list - illegal when
+    // the feature lives on the bridge device. Hard-disable in DLAA mode.
+    if (g_dlaaMode) return;
     EnsureUpscalerInit();
     if (!g_upscaler || !g_upscaler->IsReady()) return;
 
@@ -2598,15 +2602,15 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                     g_patchAppliedThisFrame ? 1 : 0, g_depthValid ? 1 : 0, g_mvValid ? 1 : 0,
                     (unsigned int)sd.Format, (unsigned int)sd.Width, (unsigned int)sd.Height);
             }
-            // PRIMARY TRIGGER: the engine copies the (low-res rendered) scene color at
-            // display size every frame - this is the composite step. Replace it with the
-            // DLSS upscaled image: run DLSS first, then let the engine's copy proceed
-            // (it will now copy the full-res content).
-            if (isSceneSrc && dst->pResource != g_dlssOut &&
-                (g_patchViewport || g_dlaaMode) && g_mvValid &&
-                (g_patchAppliedThisFrame || g_dlaaMode) && g_depthValid) {
+            // PRIMARY TRIGGER - LEGACY PATH ONLY.
+            // In DLAA/bridge mode the Present-time bridge flow owns all NGX
+            // work; recording evaluate into the ENGINE's list here crosses
+            // devices (NGX feature lives on the bridge) and faults the GPU.
+            if (!g_dlaaMode && isSceneSrc && dst->pResource != g_dlssOut &&
+                (g_patchViewport) && g_mvValid &&
+                (g_patchAppliedThisFrame) && g_depthValid) {
                 EnsureUpscalerInit();
-                if (g_upscaler && g_upscaler->IsReady()) {
+                if (g_upscaler && g_upscaler->IsReady() && !g_bridgeReady) {
                     inject = true;
                     injectBefore = true;
                 } else {
