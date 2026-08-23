@@ -1567,13 +1567,17 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         Log("hooks: render graph settled - DLAA armed for session");
     }
 
-    if (g_dlaaMode && g_settledOnce) {
-        // Cross-device bridge: NGX lives on OUR clean device (the game's
-        // wrapped device lacks IDXGIDevice and crashes the driver in-eval).
+    // Bridge device + shared textures: SAFE during load (every stable run
+    // built it there; late builds hit DEVICE_REMOVED under render load).
+    if (g_dlaaMode) {
         if (!EnsureBridge((unsigned int)bbd.Width, (unsigned int)bbd.Height, bbd.Format, g_device)) {
             static int s_brFail = 0;
             if (++s_brFail <= 3) Log("hooks: bridge unavailable - DLAA disabled this session");
         }
+    }
+    // NGX runtime load + upscaler + injection PSOs/heaps: DEFERRED to settle
+    // (these were the load-window perturbations worth avoiding).
+    if (g_dlaaMode && g_settledOnce) {
         // The DLSS output must be in the backbuffer's format (copies require
         // identical formats), so force it before the feature is created.
         if (g_dlssOutFormat != g_bbFormat) {
