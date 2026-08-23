@@ -5,6 +5,9 @@
 #include "d3d12_hooks.h"
 
 #include <map>
+
+// Genuine D3D12CreateDevice trampoline (defined in d3d12_hooks.cpp)
+extern PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp;
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -295,7 +298,7 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
                 D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
                 ID3D12Device* clean = nullptr;
                 typedef HRESULT(WINAPI* PFN_D3D12CreateDevice)(void*, unsigned, const IID&, void**);
-                PFN_D3D12CreateDevice mkDev = (PFN_D3D12CreateDevice)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateDevice");
+                PFN_D3D12CreateDevice mkDev = (PFN_D3D12CreateDevice)(void*)Real_D3D12CreateDevice_Tramp;
                 HRESULT chr = mkDev ? mkDev(nullptr, (unsigned)fl, __uuidof(ID3D12Device), (void**)&clean) : E_FAIL;
                 Log("DLSS diag: clean device hr=0x%08X", (unsigned)chr);
                 if (SUCCEEDED(chr) && clean) {

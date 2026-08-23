@@ -13,7 +13,10 @@ extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR
 #include <map>
 #include <vector>
 #include <cstring>
+
 #include <cmath>
+
+PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
 static ID3D12Device* g_bridgeDev = nullptr;
 void EnsureUpscalerInit();
@@ -350,8 +353,7 @@ PFN_RSSetScissorRects Real_RSSetScissorRects = nullptr;
 PFN_ResourceBarrier Real_ResourceBarrier = nullptr;
 PFN_OMSetRenderTargets Real_OMSetRenderTargets = nullptr;
 
-typedef HRESULT (WINAPI* PFN_D3D12CreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
-PFN_D3D12CreateDevice Real_D3D12CreateDevice = nullptr;
+
 
 struct CfgCallTargetInfo { ULONG_PTR Offset; ULONG_PTR Flags; };
 
@@ -2140,8 +2142,8 @@ void EnsureGlobalSwapchainHook()
             Log("hooks: EGSH dummy window %p", (void*)dummyWnd);
             ID3D12Device* ddev = nullptr;
             HRESULT dhr = E_FAIL;
-            if (Real_D3D12CreateDevice)
-                dhr = Real_D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+            if (Real_D3D12CreateDevice_Tramp)
+                dhr = Real_D3D12CreateDevice_Tramp(nullptr, D3D_FEATURE_LEVEL_11_0,
                                              __uuidof(ID3D12Device), (void**)&ddev);
             Log("hooks: EGSH fresh device hr=%08X dev=%p", (unsigned)dhr, (void*)ddev);
             IDXGISwapChain1* dummy = nullptr;
@@ -2833,7 +2835,7 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         ++s_createCalls;
         Log("hooks: D3D12CreateDevice called #%d (g_device=%p)", s_createCalls, (void*)g_device);
     }
-    HRESULT hr = Real_D3D12CreateDevice(adapter, minLevel, riid, ppDevice);
+    HRESULT hr = Real_D3D12CreateDevice_Tramp(adapter, minLevel, riid, ppDevice);
     if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
         if (!g_adapter && adapter) {
             adapter->QueryInterface(__uuidof(IDXGIAdapter), (void**)&g_adapter);
@@ -2973,7 +2975,7 @@ void HooksInstallCreateDeviceDetour()
         Log("hooks: MinHook initialize failed - ScaleNG inactive");
         return;
     }
-    MH_STATUS st = MH_CreateHook(pCreateDevice, &Hook_D3D12CreateDevice, (void**)&Real_D3D12CreateDevice);
+    MH_STATUS st = MH_CreateHook(pCreateDevice, &Hook_D3D12CreateDevice, (void**)&Real_D3D12CreateDevice_Tramp);
     if (st != MH_OK) {
         Log("hooks: D3D12CreateDevice hook failed (%d) - ScaleNG inactive", (int)st);
         return;

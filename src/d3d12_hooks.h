@@ -25,3 +25,7 @@ void HooksGetDescriptorHeaps(UINT* count, ID3D12DescriptorHeap** heaps);
 
 void HooksRestoreDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT count,
                                  ID3D12DescriptorHeap* const* heaps);
+
+// Shared trampoline for genuine D3D12CreateDevice (bypasses our detour)
+typedef HRESULT(WINAPI* PFN_ScaleNG_CreateDevice)(void*, unsigned, const IID&, void**);
+extern PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp;
