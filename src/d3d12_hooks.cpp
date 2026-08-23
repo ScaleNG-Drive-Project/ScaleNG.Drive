@@ -281,25 +281,11 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
                 recent, g_quietUntilFrame);
         }
     }
-    ID3D12Resource* old = *slot;
+    // STRICTLY WEAK: never hold refs on engine-owned resources. BeamNG's
+    // lifecycle is refcount-exact - any extra ref (at observation OR at
+    // creation) desyncs its teardown bookkeeping and corrupts its object
+    // graph. Staleness stamps + bridge SEH handle freed pointers safely.
     *slot = res;
-    // Transfer our creation-ref (if any) into the slot; otherwise weak adopt.
-    bool took = false;
-    if (res) {
-        for (int i = 0; i < g_createdN; ++i) {
-            if (g_createdRefs[i] == res) {
-                g_createdRefs[i] = g_createdRefs[--g_createdN];
-                took = true;
-                break;
-            }
-        }
-        if (took) Owned_Add(res);
-    }
-    if (old && Owned_Remove(old)) {
-        // We own old's ref: park for fence-safe release (or drop if flooded).
-        if (g_graveN < 4) g_grave[g_graveN++] = old;
-        else old->Release();
-    }
 }
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
 // is backgrounded and only renders the menu), patching the viewport to the render
@@ -688,9 +674,6 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
         // fully constructed and the engine holds its own ref, so ours is safe.
         // (AddRef-on-observation later is illegal and corrupted teardown.)
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1)
-            CreatedRef_Put(res);
-        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
             desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
             // Display-sized UNORM color target - adopt as scene color. The size
@@ -819,11 +802,6 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
         desc->Texture2D.MipLevels == 1) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
         // Creation-time ref for depth-family targets (same safety rationale).
-        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
-            rd.Width == g_displayW && rd.Height == g_displayH &&
-            (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
-             desc->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || desc->Format == DXGI_FORMAT_D32_FLOAT))
-            CreatedRef_Put(res);
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
             rd.Width == g_displayW && rd.Height == g_displayH &&
             (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
