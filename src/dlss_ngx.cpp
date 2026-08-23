@@ -279,6 +279,21 @@ static int SafeNgxInit(PFN_NVSDK_NGX_D3D12_Init f, unsigned appId,
     }
 }
 
+// SEH wrapper for NGX CreateFeature - same rationale as SafeNgxInit.
+static int SafeNgxCreateFeature(PFN_NVSDK_NGX_D3D12_CreateFeature f,
+    ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Feature feature,
+    NVSDK_NGX_Parameter* params, void** outFeature, unsigned* outCode)
+{
+    if (!f) return -1;
+    __try {
+        NVSDK_NGX_Result r = f(cmdList, feature, params, outFeature);
+        return (int)r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outCode = (unsigned)GetExceptionCode();
+        return -2;
+    }
+}
+
 bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
 {
     if (!cmdList)
@@ -383,7 +398,15 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
 
-    NVSDK_NGX_Result r = pCreateFeature(cmdList, NVSDK_NGX_Feature_SuperSampling, m_parameters, &m_feature);
+    unsigned cfSeh = 0;
+    int cr = SafeNgxCreateFeature(pCreateFeature, cmdList, NVSDK_NGX_Feature_SuperSampling,
+                                  m_parameters, (void**)&m_feature, &cfSeh);
+    if (cr == -2) {
+        Log("DLSS: CreateFeature FAULTED (SEH 0x%08X)", cfSeh);
+        s_lastFailTick = GetTickCount();
+        return false;
+    }
+    NVSDK_NGX_Result r = (NVSDK_NGX_Result)cr;
     if (!NVSDK_NGX_SUCCEEDED(r) || !m_feature) {
         Log("DLSS: CreateFeature failed, result=%d", r);
         s_lastFailTick = GetTickCount();
@@ -445,7 +468,20 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     ID3D12DescriptorHeap* savedHeaps[2] = { nullptr, nullptr };
     HooksGetDescriptorHeaps(&savedCount, savedHeaps);
 
-    NVSDK_NGX_Result r = pEvaluateFeature(params.commandList, m_feature, m_parameters, nullptr);
+    unsigned evSeh = 0;
+    int evr;
+    __try {
+        NVSDK_NGX_Result rv = pEvaluateFeature(params.commandList, m_feature, m_parameters, nullptr);
+        evr = (int)rv;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        evSeh = (unsigned)GetExceptionCode();
+        evr = -2;
+    }
+    if (evr == -2) {
+        Log("DLSS: EvaluateFeature FAULTED (SEH 0x%08X)", evSeh);
+        return false;
+    }
+    NVSDK_NGX_Result r = (NVSDK_NGX_Result)evr;
     if (!NVSDK_NGX_SUCCEEDED(r)) {
         Log("DLSS: EvaluateFeature failed, result=%d", r);
         return false;
