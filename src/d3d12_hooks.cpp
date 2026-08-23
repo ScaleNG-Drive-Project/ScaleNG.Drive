@@ -3121,6 +3121,14 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         // to the GAME's device.
         return Real_D3D12CreateDevice_Tramp(adapter, minLevel, riid, ppDevice);
     }
+    // Once the GAME's device is captured, later creators are INTERNAL
+    // libraries (the NGX core calls D3D12CreateDevice during Init). Those
+    // must be passthrough too - capturing NGX's internal device as
+    // g_device poisoned every game-device assumption and cascaded into
+    // DEVICE_REMOVED after each successful pInit.
+    if (g_device) {
+        return Real_D3D12CreateDevice_Tramp(adapter, minLevel, riid, ppDevice);
+    }
     if (s_createCalls < 5) {
         ++s_createCalls;
         Log("hooks: D3D12CreateDevice called #%d (g_device=%p)", s_createCalls, (void*)g_device);
