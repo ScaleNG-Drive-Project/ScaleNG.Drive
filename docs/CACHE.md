@@ -8,7 +8,9 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler → **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
-## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)
+## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)
+- **PHASE B1 RESULT + fix34 DEPLOYED (hash 561DC1F4..., awaiting user run): DELAYED INIT + LOADING PHASE PROTECTION.** Root cause of loading crashes: our creation burst fires DURING volatile loading phase. **Fix: require 300 stable gameplay frames before kicking init thread.** During those frames, TryDeferredInject returns immediately — zero wrapper-device interaction beyond passive tracking.
+
 ## Status (last updated: 2026-08-22 20:0x)
 - **PHASE correctness-fix33 DEPLOYED (hash 81D2546B... ASI, git ecdc860, awaiting user run): THREAD SAFETY + STRUCTURAL FIXES per correctness.md Immediate Priority Queue.** (93) InitializeASI atomic InterlockedCompareExchange; (96) KickInitThread InterlockedCompareExchange; (97) g_injResourcesReady atomic volatile long; bridge device on explicit NVIDIA adapter; game-side fence consolidated to single g_gameFence global; hardcoded dims replaced with dynamic; duplicate evalOkCount removed. KEY QUESTION: does CreateFeature succeed on bridgeDev? nvngx.log telemetry live for diagnosis.
 ## Status (last updated: 2026-08-22 19:0x)

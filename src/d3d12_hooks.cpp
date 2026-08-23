@@ -1380,6 +1380,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         s_wasActive = true;
     }
 
+    // Delayed init: require 300 stable gameplay frames after load completes.
+    // This ensures the volatile loading phase is completely over before we
+    // create ANY D3D12 objects (the creation burst caused all crashes).
+    static unsigned int s_stableFrames = 0;
+    ++s_stableFrames;
+    if (!g_injResourcesReady && s_stableFrames < 300)
+        return;
+
     // Hotkeys (edge-triggered on keydown): F9 = toggle overlay, F10 = toggle DLAA.
     if (GetAsyncKeyState(VK_F9) & 1) {
         g_showHud = !g_showHud;
@@ -1467,16 +1475,22 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     g_injStep = "gated";
     bool doDlss = g_dlaaMode && !g_dlaaHalted && g_upscaler && g_upscaler->IsReady() && g_dlssOutValid;
     if (doDlss) {
-        // Freshness: depth re-discovered per frame is the liveness signal. MV
-        // RTVs are created rarely after startup, so their stamp naturally ages;
-        // relying on it here skipped DLAA forever. Freed resources are caught
-        // by the SEH-guarded GetDesc below instead.
-        unsigned int fc = g_frameCounter;
-        if (fc < g_depthStamp || fc - g_depthStamp > 120) {
-            static int s_freshSkips = 0;
-            if (++s_freshSkips <= 5)
-                Log("hooks: DLAA skipped - stale depth (age %u frames)", fc - g_depthStamp);
+        // STALENESS INVALIDATION: if depth/MV stamps are too old, the tracked
+        // pointers likely reference freed engine resources. Null them out so
+        // the bridge flow never touches them. Re-discovery will repopulate.
+        unsigned int fc2 = g_frameCounter;
+        bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 120);
+        bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 120);
+        if (depthStale || mvStale) {
+            static int s_staleLogs = 0;
+            if (++s_staleLogs <= 5)
+                Log("hooks: DLAA invalidated stale inputs (depth age %u, mv age %u)",
+                    depthStale ? fc2 - g_depthStamp : 0,
+                    mvStale ? fc2 - g_mvStamp : 0);
             doDlss = false;
+            // Null the stale pointers so the null guard catches them next frame
+            if (depthStale) { g_depthResource = nullptr; g_depthValid = false; }
+            if (mvStale) { g_mvResource = nullptr; g_mvValid = false; }
         }
     }
     if (doDlss && g_dlssOut) {
@@ -1536,7 +1550,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             doDlss = false;
             static int s_nullSkip = 0;
             if (++s_nullSkip <= 5)
-                Log("hooks: DLAA skipped - null bridge/resource ptr");
+                Log("hooks: DLAA skipped - null ptr: brC=%p brD=%p brM=%p brO=%p dep=%p mv=%p",
+                    (void*)g_gameColor, (void*)g_gameDepth, (void*)g_gameMv, (void*)g_gameOut,
+                    (void*)g_depthResource, (void*)g_mvResource);
             bb->Release(); return;
         } else {
             // ---- BRIDGE FLOW (game queue -> our device -> game queue) ----
