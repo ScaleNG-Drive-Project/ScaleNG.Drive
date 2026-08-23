@@ -222,6 +222,7 @@ volatile unsigned g_quietUntilFrame = 0;
 // gameplay evidence exists (camera CB + MV + depth all seen).
 volatile LONG g_loadPhase = 1;
 volatile unsigned g_lastSceneChangeFrame = 0;
+volatile unsigned g_lastDiscoveryChangeFrame = 0; // any tracked input swap
 bool g_frameStarted = false;
 bool g_patchViewport = false;
 bool g_patchAppliedThisFrame = false;
@@ -277,6 +278,8 @@ void StoreTracked_Weak(ID3D12Resource** slot, ID3D12Resource* res)
 void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
+    bool mvSlot = (slot == (ID3D12Resource**)&g_mvResource) || (slot == (ID3D12Resource**)&g_mvResourceAlt);
+    bool depSlot = (slot == (ID3D12Resource**)&g_depthResource);
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
     if (sceneSlot && *slot && res) {
         // Routine double-buffer ping-pong (engine binds A,B,A,B...) must NOT
@@ -285,6 +288,14 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
                                      ? &g_sceneColorAlt : &g_sceneColor;
         if (*other == res) return StoreTracked_Weak(slot, res); // pure reassignment
         g_lastSceneChangeFrame = g_frameCounter;
+        g_lastDiscoveryChangeFrame = g_frameCounter;
+    } else if (mvSlot) {
+        ID3D12Resource** oMv = (slot == (ID3D12Resource**)&g_mvResource)
+                                    ? &g_mvResourceAlt : &g_mvResource;
+        if (*oMv == res) return StoreTracked_Weak(slot, res);
+        g_lastDiscoveryChangeFrame = g_frameCounter;
+    } else if (depSlot) {
+        g_lastDiscoveryChangeFrame = g_frameCounter;
         static unsigned s_changeFrames[8] = {};
         static int s_changeHead = 0;
         s_changeFrames[s_changeHead] = g_frameCounter;
@@ -1574,8 +1585,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // frames AND no active quarantine before we inject. Prevents slipping
         // into gaps between churn re-arms while the graph is still rebuilding.
         if ((int)(g_frameCounter - g_lastSceneChangeFrame) <= 90 ||
+            (int)(g_frameCounter - g_lastDiscoveryChangeFrame) <= 90 ||
             (int)(g_frameCounter - g_quietUntilFrame) < 0) {
-            doDlss = false; // render graph not settled yet
+            doDlss = false; // inputs not settled yet
         }
         unsigned int fc2 = g_frameCounter;
         bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
