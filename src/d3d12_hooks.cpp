@@ -228,15 +228,44 @@ int g_graveN = 0;
 // between our frames (use-after-free was the mv-barrier TDR source). The
 // previous occupant is parked in the graveyard and released after the next
 // injection fence proves the GPU is done with it.
+// Created-table: refs taken INSIDE creation hooks (object provably alive,
+// engine holds its own ref alongside ours). Adoption later TRANSFERS that
+// ref into the tracked slot. Observing an unknown resource adopts it as a
+// WEAK pointer - AddRef-on-observation is illegal (the object may be mid-
+// destruction; resurrecting it corrupted the engine's object graph and
+// caused deterministic teardown AVs).
+ID3D12Resource* g_createdRefs[256] = {};
+int g_createdN = 0;
+// Slots currently owning a transferred ref (graveyard/replace decisions).
+ID3D12Resource* g_owned[16] = {};
+int g_ownedN = 0;
+
+static bool Owned_Remove(ID3D12Resource* res)
+{
+    for (int i = 0; i < g_ownedN; ++i)
+        if (g_owned[i] == res) { g_owned[i] = g_owned[--g_ownedN]; return true; }
+    return false;
+}
+static void Owned_Add(ID3D12Resource* res)
+{
+    if (g_ownedN < 16) g_owned[g_ownedN++] = res;
+}
+
+void CreatedRef_Put(ID3D12Resource* res)
+{
+    if (!res) return;
+    for (int i = 0; i < g_createdN; ++i)
+        if (g_createdRefs[i] == res) return; // already held
+    if (g_createdN >= 256) return;           // table full: stay weak
+    res->AddRef();
+    g_createdRefs[g_createdN++] = res;
+}
+
 void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
     if (sceneSlot && *slot && res) {
-        // Transition detection by CHURN RATE, not novelty: the engine
-        // legitimately creates new display-sized UNORM targets during play
-        // (post chain, bloom). Only MANY rapid scene-slot replacements mark a
-        // render-graph rebuild worth quarantining over.
         static unsigned s_changeFrames[8] = {};
         static int s_changeHead = 0;
         s_changeFrames[s_changeHead] = g_frameCounter;
@@ -252,12 +281,25 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
                 recent, g_quietUntilFrame);
         }
     }
-    if (*slot) {
-        if (g_graveN < 4) g_grave[g_graveN++] = *slot;
-        else (*slot)->Release();
-    }
+    ID3D12Resource* old = *slot;
     *slot = res;
-    if (res) res->AddRef();
+    // Transfer our creation-ref (if any) into the slot; otherwise weak adopt.
+    bool took = false;
+    if (res) {
+        for (int i = 0; i < g_createdN; ++i) {
+            if (g_createdRefs[i] == res) {
+                g_createdRefs[i] = g_createdRefs[--g_createdN];
+                took = true;
+                break;
+            }
+        }
+        if (took) Owned_Add(res);
+    }
+    if (old && Owned_Remove(old)) {
+        // We own old's ref: park for fence-safe release (or drop if flooded).
+        if (g_graveN < 4) g_grave[g_graveN++] = old;
+        else old->Release();
+    }
 }
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
 // is backgrounded and only renders the menu), patching the viewport to the render
@@ -642,6 +684,12 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
 {
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
+        // Hold a creation-ref on any interesting target NOW - the object is
+        // fully constructed and the engine holds its own ref, so ours is safe.
+        // (AddRef-on-observation later is illegal and corrupted teardown.)
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1)
+            CreatedRef_Put(res);
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
             desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
@@ -770,6 +818,12 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
         desc->Texture2D.MipLevels == 1) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
+        // Creation-time ref for depth-family targets (same safety rationale).
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
+            rd.Width == g_displayW && rd.Height == g_displayH &&
+            (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
+             desc->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || desc->Format == DXGI_FORMAT_D32_FLOAT))
+            CreatedRef_Put(res);
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
             rd.Width == g_displayW && rd.Height == g_displayH &&
             (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
