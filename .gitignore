@@ -24,3 +24,6 @@ Desktop.ini
 
 # Gameplay recordings
 *.mp4
+
+# Project logs (tracked for backup)
+!logs/
