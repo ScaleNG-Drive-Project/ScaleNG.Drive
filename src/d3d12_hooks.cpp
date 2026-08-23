@@ -1482,34 +1482,54 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             bb->Release(); return;
         } else {
             // ---- BRIDGE FLOW (game queue -> our device -> game queue) ----
-            g_injStep = "bridge-copy-in";
+            // Per-call instrumentation: g_injStep updated between EVERY D3D12
+            // call so the fault handler pinpoints the exact crash point.
+            g_injStep = "bridge:alloc-reset";
             g_injAlloc->Reset();
+            g_injStep = "bridge:list-reset";
             g_injList->Reset(g_injAlloc, nullptr);
+            g_injStep = "bridge:bb-barrier";
             Barrier(g_injList, bb, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g_injStep = "bridge:depth-barrier";
             Barrier(g_injList, g_depthResource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g_injStep = "bridge:mv-barrier";
             Barrier(g_injList, g_mvResource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (!g_gameColor || !g_gameDepth || !g_gameMv) {
+                Log("hooks: bridge SKIP - null shared resource (c=%p d=%p m=%p)",
+                    (void*)g_gameColor, (void*)g_gameDepth, (void*)g_gameMv);
+                bb->Release();
+                return;
+            }
+            g_injStep = "bridge:copy-color";
             D3D12_TEXTURE_COPY_LOCATION cd = {}; cd.pResource = g_gameColor;
             cd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; cd.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION cs = {}; cs.pResource = bb;
             cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; cs.SubresourceIndex = 0;
             Real_CopyTextureRegion(g_injList, &cd, 0, 0, 0, &cs, 0);
+            g_injStep = "bridge:copy-depth";
             D3D12_TEXTURE_COPY_LOCATION dd2 = {}; dd2.pResource = g_gameDepth;
             dd2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dd2.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION ds = {}; ds.pResource = g_depthResource;
             ds.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; ds.SubresourceIndex = 0;
             Real_CopyTextureRegion(g_injList, &dd2, 0, 0, 0, &ds, 0);
+            g_injStep = "bridge:copy-mv";
             D3D12_TEXTURE_COPY_LOCATION md2 = {}; md2.pResource = g_gameMv;
             md2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; md2.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION ms = {}; ms.pResource = g_mvResource;
             ms.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; ms.SubresourceIndex = 0;
             Real_CopyTextureRegion(g_injList, &md2, 0, 0, 0, &ms, 0);
+            g_injStep = "bridge:restore-bb";
             Barrier(g_injList, bb, D3D12_RESOURCE_STATE_PRESENT);
+            g_injStep = "bridge:restore-depth";
             Barrier(g_injList, g_depthResource, depthState);
+            g_injStep = "bridge:restore-mv";
             Barrier(g_injList, g_mvResource, mvState);
+            g_injStep = "bridge:close-ecl";
             g_injList->Close();
             ++g_bridgeVal;
             ID3D12CommandList* cl1[] = { g_injList };
             Real_ExecuteCommandLists(injQueue, 1, cl1);
+            g_injStep = "bridge:signal-v1";
             injQueue->Signal(g_bridgeFence, g_bridgeVal);
 
             // Our device: wait for inputs, evaluate DLAA.
