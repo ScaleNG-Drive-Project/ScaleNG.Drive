@@ -3061,6 +3061,27 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                         (unsigned int)rd.Width, (unsigned int)rd.Height);
                 }
             }
+            // MV TRACK-BY-BIND: the engine binds MV as an RTV every frame it
+            // renders it. Adopting here always holds the CURRENT texture -
+            // immune to the rotation that caused repeated stale-MV faults.
+            if (g_boundRtvResource && g_loadPhase == 0 &&
+                g_boundRtvResource != g_mvResource && g_boundRtvResource != g_mvResourceAlt) {
+                auto ri = g_rtvMap.find(pRenderTargets[0].ptr);
+                if (ri != g_rtvMap.end() && ri->second == g_boundRtvResource) {
+                    D3D12_RESOURCE_DESC mrd = g_boundRtvResource->GetDesc();
+                    if (mrd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        mrd.MipLevels == 1 && mrd.SampleDesc.Count == 1 &&
+                        (unsigned)mrd.Width == g_displayW && mrd.Height == g_displayH &&
+                        mrd.Format == DXGI_FORMAT_R16G16_FLOAT) {
+                        bool first = !g_mvValid;
+                        StoreTracked(&g_mvResource, g_boundRtvResource);
+                        g_mvValid = true;
+                        g_mvStamp = g_frameCounter;
+                        if (first) g_mvFirstValidFrame = g_frameCounter;
+                        g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                }
+            }
             // The engine re-creates its scene target from time to time but keeps
             // reusing the same CPU descriptor slot. Refresh the tracked scene
             // color to the CURRENT resource bound at that slot, otherwise we
