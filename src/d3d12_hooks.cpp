@@ -210,6 +210,11 @@ unsigned int g_renderH = 0;
 Jitter2D g_currJitter = { 0.0f, 0.0f };
 Jitter2D g_prevJitter = { 0.0f, 0.0f };
 unsigned int g_frameCounter = 0;
+// Renderer-transition quarantine: when the scene-color identity changes the
+// engine is rebuilding its render graph - resource identities churn and
+// adopting new candidates here races teardown (deterministic engine-side AV).
+// All adoption + DLAA freezes until this frame.
+volatile unsigned g_quietUntilFrame = 0;
 bool g_frameStarted = false;
 bool g_patchViewport = false;
 bool g_patchAppliedThisFrame = false;
@@ -226,6 +231,8 @@ int g_graveN = 0;
 void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
+    bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
+    if (sceneSlot && *slot && res) g_quietUntilFrame = g_frameCounter + 45; // render-graph rebuild marker
     if (*slot) {
         if (g_graveN < 4) g_grave[g_graveN++] = *slot;
         else (*slot)->Release();
@@ -1470,6 +1477,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // may be freed with heap memory reused, which passes null checks but
         // hands the driver garbage (TDR). Tight threshold trades rediscovery
         // cost for safety.
+        if ((int)(g_frameCounter - g_quietUntilFrame) < 0) {
+            doDlss = false; // render-graph rebuild in progress
+        }
         unsigned int fc2 = g_frameCounter;
         bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 3);
         bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 3);
@@ -2674,7 +2684,8 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                 }
             }
             // Depth candidate heuristic (copies NOT involving the scene color or MV).
-            if (!isSceneSrc && !isMvDst && dst->pResource != g_dlssOut) {
+            bool quietNow = ((int)(g_frameCounter - g_quietUntilFrame) < 0);
+            if (!quietNow && !isSceneSrc && !isMvDst && dst->pResource != g_dlssOut) {
                 StoreTracked(&g_depthResource, dst->pResource);
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
