@@ -2607,6 +2607,45 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
         if (desc) g_bbFormat = desc->Format;
         Log("hooks: CreateSwapChainForHwnd returned %p (hwnd %p, format %d, hr=%08X)",
             (void*)sc, (void*)hwnd, (int)g_bbFormat, (unsigned)hr);
+        // ADAPTER IDENTITY via the swapchain itself: QI on the RAW swapchain
+        // (not the wrapped game device) always works and names the physical
+        // adapter that owns PRESENT - the ground truth for hybrid triage.
+        {
+            IDXGIDevice* sdev = nullptr;
+            if (SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice), (void**)&sdev))) {
+                IDXGIAdapter* sad = nullptr;
+                if (SUCCEEDED(sdev->GetAdapter(&sad))) {
+                    DXGI_ADAPTER_DESC sdsc = {};
+                    if (SUCCEEDED(sad->GetDesc(&sdsc))) {
+                        Log("hooks: SWAPCHAIN adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
+                            sdsc.VendorId, sdsc.Description,
+                            (unsigned)sdsc.AdapterLuid.HighPart, (unsigned)sdsc.AdapterLuid.LowPart);
+                    }
+                    sad->Release();
+                }
+                sdev->Release();
+            } else {
+                Log("hooks: SWAPCHAIN GetDevice failed - cannot name present adapter");
+            }
+            // And the device the ENGINE passed in (may be their wrapper):
+            if (device) {
+                IDXGIDevice* pdev = nullptr;
+                if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&pdev))) {
+                    IDXGIAdapter* pad = nullptr;
+                    if (SUCCEEDED(pdev->GetAdapter(&pad))) {
+                        DXGI_ADAPTER_DESC pdesc = {};
+                        if (SUCCEEDED(pad->GetDesc(&pdesc))) {
+                            Log("hooks: SWAPCHAIN-REQUEST device adapter VendorId=0x%04X '%ls'",
+                                pdesc.VendorId, pdesc.Description);
+                        }
+                        pad->Release();
+                    }
+                    pdev->Release();
+                } else {
+                    Log("hooks: swapchain request-device QI failed (wrapped) - using swapchain side only");
+                }
+            }
+        }
         __try {
             bool rd = IsReadablePtr(sc, sizeof(void*));
             if (rd) {
