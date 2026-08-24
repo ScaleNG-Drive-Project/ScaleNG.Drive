@@ -322,6 +322,20 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     if (s_lastFailTick && GetTickCount() - s_lastFailTick < 1000)
         return false;
 
+    // Item #4 (correctness.md): a device-removed adapter is a hard precondition
+    // failure - never let NGX discover it internally. Observed: clean-device
+    // creation returned 0x887A0001 and the whole attempt was wasted.
+    {
+        HRESULT drr = m_device->GetDeviceRemovedReason();
+        if (FAILED(drr)) {
+            static int s_drrLogs = 0;
+            if (++s_drrLogs <= 3)
+                Log("DLSS: skip CreateFeature - device removed reason 0x%08X", (unsigned)drr);
+            s_lastFailTick = GetTickCount();
+            return false;
+        }
+    }
+
 
     // SEH around pInit: NGX's D3D12_Init faults at driver level when called
     // on a secondary device while the game's primary device is active.
