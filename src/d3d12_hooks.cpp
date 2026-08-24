@@ -387,7 +387,7 @@ void StoreTracked_Weak(ID3D12Resource** slot, ID3D12Resource* res)
 // Thread-safety lock for g_copySrcCount (see comment at definition site below).
 static SRWLOCK g_copyMapLock = SRWLOCK_INIT;
 
-void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
+void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
     bool mvSlot = (slot == (ID3D12Resource**)&g_mvResource) || (slot == (ID3D12Resource**)&g_mvResourceAlt);
