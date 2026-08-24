@@ -3466,6 +3466,39 @@ unsigned HooksGetQuietFrames() {
     return g_lastNewChainFrame ? (g_frameCounter - g_lastNewChainFrame) : 0;
 }
 
+// CPU-side microscope: VEH logs EVERY first-chance AV with module+offset as
+// it happens. Rotation-burst deaths show no SEH catch and no device-removed,
+// so they may be AVs outside our try regions - this names them live.
+static LONG CALLBACK SngVectoredHandler(PEXCEPTION_POINTERS ep)
+{
+    if (ep && ep->ExceptionRecord &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        static volatile long s_vehLogs = 0;
+        if (InterlockedCompareExchange(&s_vehLogs, 0, 0) < 20 &&
+            !InterlockedIncrement(&s_vehLogs)) {
+            HMODULE mod = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)ep->ExceptionRecord->ExceptionAddress, &mod);
+            char mName[MAX_PATH] = "?";
+            if (mod) GetModuleFileNameA(mod, mName, MAX_PATH);
+            const char* base = strrchr(mName, '\\'); base = base ? base + 1 : mName;
+            Log("VEH: AV at %s+0x%p addr=0x%p flags=%u",
+                base,
+                (void*)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)mod),
+                ep->ExceptionRecord->ExceptionInformation[1],
+                (unsigned)ep->ExceptionRecord->ExceptionInformation[0]);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void HooksInstallVEH()
+{
+    AddVectoredExceptionHandler(1, SngVectoredHandler);
+    Log("VEH: installed (first-chance AV logger)");
+}
+
 // Dump Device Removed Extended Data from the bridge device: auto-breadcrumb
 // command history + page-fault VA for whatever op killed the adapter.
 void HooksDumpDRED(const char* why)

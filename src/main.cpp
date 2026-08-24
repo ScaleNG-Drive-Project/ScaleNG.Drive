@@ -191,6 +191,8 @@ extern "C" __declspec(dllexport) void InitializeASI()
         Log("init: setting config");
         HooksSetConfig(g_config);
         Log("init: installing D3D12CreateDevice detour");
+        Log("init: installing VEH");
+        HooksInstallVEH();
         HooksInstallCreateDeviceDetour();
         Log("ScaleNG.asi initialization complete");
     } __except (SehFilter(GetExceptionCode(), GetExceptionInformation())) {
