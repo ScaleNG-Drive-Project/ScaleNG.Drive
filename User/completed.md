@@ -260,3 +260,8 @@
 - [x] **#27** MV-absent capability handling - fix74: once-per-session 'MV capability ABSENT' warning; DLAA idles until MV RTV binds. No fabricated evaluation.
 - [x] **#33** Ownership model documented honestly - VERIFIED ALREADY DONE: StoreTracked comments (lines ~262, ~341) state STRICTLY WEAK + rationale + safety stack since fix53.
 - Note: binary fingerprint (#6 of reviewer plan) done in fix72 (build date/time in first log line).
+## P0 progress (fix75, commit af5c1e0)
+- [x] **P0#1** InitializeASI instrumented: tid/pid/asiBase/stateAddr logged with init line.
+- [x] **P0#2 (partial)** state enum formalized 0=UNINIT/1=INITIALIZING/2=INITIALIZED/3=FAILED; atomic 0->1 guard pre-existed; FAILED now recorded on SEH.
+- [x] **P0#4** module base logged - duplicate-copy detection enabled (compare bases across log lines).
+- Queued next: P0#3 per-hook idempotency states; P1 device generations/classification.
