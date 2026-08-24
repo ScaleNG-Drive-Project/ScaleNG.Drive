@@ -338,8 +338,10 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
         HRESULT drr = m_device->GetDeviceRemovedReason();
         if (FAILED(drr)) {
             static int s_drrLogs = 0;
-            if (++s_drrLogs <= 3)
+            if (++s_drrLogs <= 3) {
                 Log("DLSS: skip CreateFeature - device removed reason 0x%08X", (unsigned)drr);
+                HooksDumpDRED("createfeature");
+            }
             s_lastFailTick = GetTickCount();
             return false;
         }

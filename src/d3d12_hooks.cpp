@@ -1790,8 +1790,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             HRESULT drr = g_device->GetDeviceRemovedReason();
             if (FAILED(drr)) {
                 static int s_flowDrrLogs = 0;
-                if (++s_flowDrrLogs <= 3)
+                if (++s_flowDrrLogs <= 3) {
                     Log("hooks: DLAA flow skipped - device removed 0x%08X", (unsigned)drr);
+                    HooksDumpDRED("flow-gate");
+                }
                 doDlss = false;
             }
         }
@@ -3462,6 +3464,37 @@ unsigned HooksGetQuietFrames() {
     // loading screen before any display-sized copy exists, which made the
     // 600f gate pass instantly and let nvngx load mid-churn.)
     return g_lastNewChainFrame ? (g_frameCounter - g_lastNewChainFrame) : 0;
+}
+
+// Dump Device Removed Extended Data from the bridge device: auto-breadcrumb
+// command history + page-fault VA for whatever op killed the adapter.
+void HooksDumpDRED(const char* why)
+{
+    if (!g_bridgeDev) return;
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (FAILED(g_bridgeDev->QueryInterface(IID_PPV_ARGS(&dred)))) {
+        Log("DRED[%s]: not available on bridge device", why);
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)) && bc.pHeadBreadcrumbNode) {
+        int dumped = 0;
+        for (auto n = bc.pHeadBreadcrumbNode; n && dumped < 8; n = n->pNext, ++dumped) {
+            unsigned lastOp = n->BreadcrumbCount ? (unsigned)n->pCommandHistory[n->BreadcrumbCount - 1] : 0;
+            Log("DRED[%s]: list '%s' ops=%u lastOp=%u context=%u",
+                why,
+                n->pCommandListName ? n->pCommandListName : (n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?"),
+                (unsigned)n->BreadcrumbCount, lastOp,
+                n->BreadcrumbCount ? (unsigned)n->pLastStatus : 0xFFFFFFFFu);
+        }
+    } else {
+        Log("DRED[%s]: no breadcrumb nodes recorded", why);
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
+        Log("DRED[%s]: PAGE FAULT VA=0x%llX", why, (unsigned long long)pf.FaultingVA);
+    }
+    dred->Release();
 }
 
 void HooksInstallCreateDeviceDetour()

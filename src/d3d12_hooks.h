@@ -18,6 +18,7 @@ struct ScaleNgConfig {
 };
 
 unsigned HooksGetQuietFrames();
+void HooksDumpDRED(const char* why);
 void HooksSetConfig(const ScaleNgConfig& config);
 
 void HooksInstallCreateDeviceDetour();
