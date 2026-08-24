@@ -1909,7 +1909,19 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             ep.mvScaleX = (float)g_displayW;
             ep.mvScaleY = (float)g_displayH;
             ep.sharpness = g_cfg.sharpness;
-            bool evalOk = g_upscaler->Evaluate(ep);
+            // REVIEWER #16 ISOLATION: SCALENG_DIAG_BRIDGE=1 runs copies-only
+            // (in+out, full fence protocol) and skips NGX Evaluate. If hangs
+            // persist in this mode -> bridge/copies are the killer. If stable
+            // -> NGX eval is. One variable, evidence-driven.
+            static bool s_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
+            bool evalOk = true;
+            if (s_diagBridge) {
+                static int s_diagLogs = 0;
+                if (++s_diagLogs <= 10)
+                    Log("DIAG#16: bridge copies done - Evaluate SKIPPED (isolation mode)");
+            } else {
+                evalOk = g_upscaler->Evaluate(ep);
+            }
             for (int i = 0; i < 3; ++i) { bi[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON; bi[i].Transition.StateBefore = bi[i].Transition.StateAfter == D3D12_RESOURCE_STATE_COMMON ? D3D12_RESOURCE_STATE_COMMON : bi[i].Transition.StateAfter; }
             for (int i = 0; i < 3; ++i) {
                 bi[i].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
