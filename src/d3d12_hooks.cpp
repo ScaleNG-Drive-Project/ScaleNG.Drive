@@ -1644,13 +1644,16 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     if (!g_bbCached && !g_swapchain) return;
     // POLITE PATH: use RTV-captured backbuffer when available - never probe
     // the engine's guarded wrapper via GetBuffer (software-AV storm class).
+    bool usedCachedBb = false;
     if (g_bbCached) {
         bb = g_bbCached;
+        usedCachedBb = true;
         g_injStep = "bb-cached";
         D3D12_RESOURCE_DESC bbd = bb->GetDesc();
         if ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)
             AdoptDisplaySize((unsigned int)bbd.Width, (unsigned int)bbd.Height);
     }
+    if (!usedCachedBb) {
     // Blacklist: a swapchain that faulted repeatedly is skipped BY IDENTITY.
     // Nulling g_swapchain alone just re-adopts the same poisoned object.
     {
@@ -1701,6 +1704,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     D3D12_RESOURCE_DESC bbd = bb->GetDesc();
     if ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)
         AdoptDisplaySize((unsigned int)bbd.Width, (unsigned int)bbd.Height);
+    } // end legacy probe (only when nothing cached)
 
     g_injStep = "adopted";
     auto it = g_resourceStates.find(bb);
