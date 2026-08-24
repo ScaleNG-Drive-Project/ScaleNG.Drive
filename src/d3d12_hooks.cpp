@@ -1905,6 +1905,17 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                 Log("hooks: bridge FAULTED at %s - invalidating all inputs", g_injStep);
                 StoreTracked(&g_depthResource, nullptr); g_depthValid = false; g_depthStamp = 0;
                 StoreTracked(&g_mvResource, nullptr); g_mvValid = false; g_mvStamp = 0;
+                // One-strike rule (P5 crash handling): an in-engine AV means the
+                // engine cmd list may be left inconsistent by the faulting call.
+                // Retrying next frame re-enters the same hazard; every observed
+                // hard crash followed a recovered fault within seconds. Retire
+                // DLAA for this session - stability outranks coverage.
+                static long s_faultStrikes = 0;
+                if (InterlockedIncrement(&s_faultStrikes) >= 2) {
+                    g_dlaaHalted = true;
+                    Log("hooks: DLAA HALTED - %ld bridge faults this session (one-strike rule)",
+                        s_faultStrikes);
+                }
             }
 
         }
