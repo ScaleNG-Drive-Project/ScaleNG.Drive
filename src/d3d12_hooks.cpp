@@ -660,6 +660,8 @@ ID3D12Resource* SceneColorBound()
 void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES after)
 {
     if (!list || !res) return;
+    // SAFETY: skip barrier ops if bridge not ready or DLAA disabled
+    if (!g_bridgeReady || !g_dlaaMode) return;
     D3D12_RESOURCE_STATES before;
     bool tracked = false;
     { BookGuard _bg; auto it = g_resourceStates.find(res);
@@ -3221,18 +3223,16 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
                         const D3D12_BOX* srcBox)
 {
-    // SEH helper kept out-of-line so CopyTexBody can own C++ objects.
-    struct Local {
-        static bool AltIsPairHalf(ID3D12Resource* alt) {
-            __try {
-                D3D12_RESOURCE_DESC ad = alt->GetDesc();
-                return ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return false;
-            }
-        }
-    };
-    bool inject = false;
+    static void CopyTexBody(ID3D12GraphicsCommandList* list,
+                        const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY,
+                        UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
+                        const D3D12_BOX* srcBox)
+{
+    // SAFETY: skip ALL analysis if bridge not ready or DLAA disabled
+    // Prevents GetDesc/Barrier calls on engine resources during unstable startup
+    if (!g_bridgeReady || !g_dlaaMode) {
+        goto Forward;
+    }
     bool injectBefore = false;
     if (dst && src && src->pResource != dst->pResource &&
         src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
@@ -3423,6 +3423,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
         Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, src, srcBox);
     if (inject && !injectBefore)
         DoInjection(list);
+Forward:
 }
 
 void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
@@ -3506,6 +3507,10 @@ void Hook_RSSetScissorRects(ID3D12GraphicsCommandList* list, UINT numRects,
 void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
                           const D3D12_RESOURCE_BARRIER* pBarriers)
 {
+    // SAFETY: skip all barrier tracking if bridge not ready or DLAA disabled
+    if (!g_bridgeReady || !g_dlaaMode) {
+        return Real_ResourceBarrier(list, numBarriers, pBarriers);
+    }
     if (pBarriers && numBarriers > 0) {
         for (UINT i = 0; i < numBarriers; ++i) {
             if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
@@ -3555,6 +3560,11 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                              BOOL RTsSingleHandleToDescriptorRange,
                              const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencilDescriptor)
 {
+    // SAFETY: skip all analysis if bridge not ready or DLAA disabled
+    if (!g_bridgeReady || !g_dlaaMode) {
+        return Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
+                                       RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
+    }
     if (numRenderTargets >= 1 && pRenderTargets) {
         g_boundRtv = pRenderTargets[0];
         g_boundRtvValid = true;
