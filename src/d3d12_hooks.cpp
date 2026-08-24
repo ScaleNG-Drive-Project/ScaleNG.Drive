@@ -1640,6 +1640,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 
     ID3D12Resource* bb = nullptr;
     IDXGISwapChain3* sc3 = nullptr;
+    // Nothing to fetch from and nothing cached -> nothing to do here.
+    if (!g_bbCached && !g_swapchain) return;
     // POLITE PATH: use RTV-captured backbuffer when available - never probe
     // the engine's guarded wrapper via GetBuffer (software-AV storm class).
     if (g_bbCached) {
@@ -1676,15 +1678,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         if (InterlockedIncrement(&g_bbFetchFails) >= 3) {
             // Blacklist THIS object so self-heal doesn't re-adopt poison.
             void* bad = (void*)g_swapchain;
+            g_swapchain = nullptr;
+            g_bbFetchFails = 0;
             if (bad) {
                 for (int bi = 0; bi < 4; ++bi) {
                     if (g_badSc[bi] == bad) break;
                     if (!g_badSc[bi]) { InterlockedExchangePointer(&g_badSc[bi], bad); break; }
                 }
+                Log("hooks: swapchain %p blacklisted after repeated fetch faults - self-heal armed", bad);
             }
-            g_swapchain = nullptr;
-            g_bbFetchFails = 0;
-            Log("hooks: swapchain %p blacklisted after repeated fetch faults - self-heal armed", bad);
         }
     }
     g_injStep = "bb-fetched";
