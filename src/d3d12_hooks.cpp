@@ -2615,8 +2615,14 @@ void EnsureGlobalSwapchainHook()
                         else
                             dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
                         Log("hooks: EGSH fresh ForHwnd hr=%08X sc=%p", (unsigned)dhr, (void*)dummy);
-                        if (SUCCEEDED(dhr) && dummy && IsReadablePtr(dummy, sizeof(void*)) && !Real_Present)
-                            InstallSwapchainHooks((IDXGISwapChain*)dummy);
+                        // NEVER InstallSwapchainHooks on the dummy: it is a
+                        // REAL DXGI swapchain whose vt[8] is GetBuffer, not
+                        // Present (the wrapped game swapchain differs!). The
+                        // old '!Real_Present' condition let this fire and we
+                        // hooked GetBuffer as Present process-wide -> every
+                        // GetBuffer became an injection attempt (freeze class,
+                        // 14k guarded faults). Engine's own swapchain gets
+                        // hooked via the factory-slot15 path instead.
                         if (dummy) { dummy->Release(); dummy = nullptr; }
                         f4->Release();
                     }
