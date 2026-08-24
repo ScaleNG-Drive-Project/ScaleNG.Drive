@@ -2881,6 +2881,17 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                            (g_sceneColorAlt && src->pResource == g_sceneColorAlt));
         if (g_displayW > 0 && !g_injectedThisFrame &&
             (unsigned long)w == g_displayW && (unsigned long)h == g_displayH) {
+            // Evidence instrumentation (reviewer #21 style): the engine rotates
+            // its scene target ACROSS FORMATS (28->34 observed pre-crash).
+            // A display-sized src we do NOT track means rotation happened and
+            // our bridge color (fixed fmt) is now stale. Log once per format.
+            static unsigned s_lastUntrackedFmt = 0;
+            if (!isSceneSrc && sd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                sd.Format != s_lastUntrackedFmt) {
+                s_lastUntrackedFmt = sd.Format;
+                Log("hooks: UNTRACKED display-sized copy src fmt %u %ux%u - scene rotated off bridge fmt?",
+                    (unsigned int)sd.Format, (unsigned int)sd.Width, (unsigned int)sd.Height);
+            }
             // Post-reload fallback: if the scene color was never discovered
             // (plugin re-init after the game created its render targets), the
             // engine still copies the scene color at full-res every frame.
