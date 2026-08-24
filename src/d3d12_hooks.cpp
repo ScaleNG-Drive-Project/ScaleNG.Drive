@@ -387,6 +387,18 @@ void StoreTracked_Weak(ID3D12Resource** slot, ID3D12Resource* res)
 // Thread-safety lock for g_copySrcCount (see comment at definition site below).
 static SRWLOCK g_copyMapLock = SRWLOCK_INIT;
 
+// BOOKKEEPING LOCK: g_resourceStates/g_rtvMap are touched from engine ECL
+// threads (creation/barrier/OMRT/copy hooks) AND the Present thread.
+// Recursive critical section - safe for overlapping coarse scopes.
+static CRITICAL_SECTION g_bookCS;
+static INIT_ONCE g_bookInit = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK InitBookCS(PINIT_ONCE, PVOID, PVOID*)
+{ InitializeCriticalSection(&g_bookCS); return TRUE; }
+struct BookGuard {
+    BookGuard() { InitOnceExecuteOnce(&g_bookInit, InitBookCS, nullptr, nullptr); EnterCriticalSection(&g_bookCS); }
+    ~BookGuard() { LeaveCriticalSection(&g_bookCS); }
+};
+
 void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
@@ -648,13 +660,12 @@ ID3D12Resource* SceneColorBound()
 void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES after)
 {
     if (!list || !res) return;
-    auto it = g_resourceStates.find(res);
-    if (it == g_resourceStates.end()) {
-        Log("hooks: skip barrier for untracked resource %p", (void*)res);
-        return;
-    }
-    D3D12_RESOURCE_STATES before = it->second;
-    if (before == after) return;
+    D3D12_RESOURCE_STATES before;
+    bool tracked = false;
+    { BookGuard _bg; auto it = g_resourceStates.find(res);
+      if (it == g_resourceStates.end()) return; // untracked
+      tracked = true; before = it->second; }
+    if (!tracked || before == after) return;
     D3D12_RESOURCE_BARRIER b = {};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = res;
@@ -662,7 +673,7 @@ void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURC
     b.Transition.StateAfter = after;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     Real_ResourceBarrier(list, 1, &b);
-    it->second = after;
+    { BookGuard _bg; g_resourceStates[res] = after; }
     // Rate-limited: this fires per-transition inside the flow; unlogged it
     // was ~400 lines/sec and the synchronous log I/O contributed to freezes.
     static volatile long s_barrierLogs = 0;
@@ -923,8 +934,12 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
             // Display-sized UNORM color target - adopt as scene color. The size
             // is NOT hardcoded (the engine may render at e.g. 1920x1001).
-            g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            g_rtvMap[handle.ptr] = res;
+            { BookGuard _bg;
+                { BookGuard _bg;
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
+                }
+            }
             if (!g_sceneColorValid) {
                 StoreTracked(&g_sceneColor, res);
                 g_sceneColorRtv = handle;
@@ -948,8 +963,10 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             if (desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
                 g_displayW = (unsigned int)rd.Width;
                 g_displayH = (unsigned int)rd.Height;
-                g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                g_rtvMap[handle.ptr] = res;
+                { BookGuard _bg;
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
+                }
                 if (!g_sceneColorValid) {
                     StoreTracked(&g_sceneColor, res);
                     g_sceneColorRtv = handle;
@@ -968,8 +985,10 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             } else if (desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
-                g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                g_rtvMap[handle.ptr] = res;
+                { BookGuard _bg;
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
+                }
                 if (!g_mvValid) {
                     if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
             StoreTracked(&g_mvResource, res);
@@ -991,8 +1010,12 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
                    desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
-            g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            g_rtvMap[handle.ptr] = res;
+            { BookGuard _bg;
+                { BookGuard _bg;
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
+                }
+            }
             if (!g_mvValid) {
                 if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
             StoreTracked(&g_mvResource, res);
@@ -1014,7 +1037,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Format == DXGI_FORMAT_R16G16_FLOAT && rd.MipLevels == 1 &&
                    rd.Width > 0 && rd.Height > 0) {
-            g_rtvMap[handle.ptr] = res;
+            { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
             static int s_otherMvRtvs = 0;
             if (s_otherMvRtvs < 10) {
                 ++s_otherMvRtvs;
@@ -1027,7 +1050,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             // View re-created at any time: keep the handle map fresh so
             // OMSetRenderTargets can resolve the scene color even if the
             // resource itself was discovered earlier.
-            g_rtvMap[handle.ptr] = res;
+            { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
             if (res == g_sceneColor) {
                 g_sceneColorRtv = handle;
                 Log("hooks: scene color RTV handle refreshed (map) %p", (void*)res);
@@ -1037,7 +1060,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             }
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    rd.MipLevels == 1 && rd.Width > 0 && rd.Height > 0) {
-            g_rtvMap[handle.ptr] = res;
+            { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
         }
     }
     if (Real_CreateRenderTargetView)
@@ -3196,12 +3219,22 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
     }
 }
 
-void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
-                            const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY,
-                            UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
-                            const D3D12_BOX* srcBox)
+static void CopyTexBody(ID3D12GraphicsCommandList* list,
+                        const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY,
+                        UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
+                        const D3D12_BOX* srcBox)
 {
-    __try {
+    // SEH helper kept out-of-line so CopyTexBody can own C++ objects.
+    struct Local {
+        static bool AltIsPairHalf(ID3D12Resource* alt) {
+            __try {
+                D3D12_RESOURCE_DESC ad = alt->GetDesc();
+                return ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+    };
     bool inject = false;
     bool injectBefore = false;
     if (dst && src && src->pResource != dst->pResource &&
@@ -3264,12 +3297,8 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                     if (g_sceneColorAlt) {
                         // Weak pointer: may be freed since adoption. A fault
                         // here means dead ALT - clear it for replacement.
-                        __try {
-                            D3D12_RESOURCE_DESC ad = g_sceneColorAlt->GetDesc();
-                            altIsPairHalf = (ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
-                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        if (!Local::AltIsPairHalf(g_sceneColorAlt))
                             g_sceneColorAlt = nullptr;
-                        }
                     }
                     if (!srcIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, src->pResource);
@@ -3357,7 +3386,8 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                     g_depthRealFmt = dd.Format;
                     g_depthMsaa = dd.SampleDesc.Count != 1;
                 }
-                auto it = g_resourceStates.find(dst->pResource);
+                BookGuard _bgCopy;
+        auto it = g_resourceStates.find(dst->pResource);
                 if (it == g_resourceStates.end())
                     g_resourceStates[dst->pResource] = D3D12_RESOURCE_STATE_COPY_DEST;
                 static int s_depthCandidates = 0;
@@ -3396,6 +3426,15 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
         Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, src, srcBox);
     if (inject && !injectBefore)
         DoInjection(list);
+}
+
+void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
+                            const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY,
+                            UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
+                            const D3D12_BOX* srcBox)
+{
+    __try {
+        CopyTexBody(list, dst, dstX, dstY, dstZ, src, srcBox);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("hooks: CopyTextureRegion guarded (code %08X)", (unsigned)GetExceptionCode());
         if (Real_CopyTextureRegion)
@@ -3475,7 +3514,7 @@ void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
             if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
                 ID3D12Resource* res = pBarriers[i].Transition.pResource;
                 if (res) {
-                    g_resourceStates[res] = pBarriers[i].Transition.StateAfter;
+                    { BookGuard _bgRb; g_resourceStates[res] = pBarriers[i].Transition.StateAfter; }
                     // LIVENESS: the engine transitions depth/MV every frame it
                     // uses them. Refresh stamps so the staleness gate (which
                     // protects against freed resources) only trips on real
@@ -3523,6 +3562,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
         g_boundRtv = pRenderTargets[0];
         g_boundRtvValid = true;
         g_boundRtvResource = nullptr;
+        BookGuard _bgOmrt;
         auto it = g_rtvMap.find(pRenderTargets[0].ptr);
         if (it != g_rtvMap.end()) {
             g_boundRtvResource = it->second;
@@ -3549,7 +3589,8 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
             // immune to the rotation that caused repeated stale-MV faults.
             if (g_boundRtvResource && g_loadPhase == 0 &&
                 g_boundRtvResource != g_mvResource && g_boundRtvResource != g_mvResourceAlt) {
-                auto ri = g_rtvMap.find(pRenderTargets[0].ptr);
+                BookGuard _bgOmrt2;
+            auto ri = g_rtvMap.find(pRenderTargets[0].ptr);
                 if (ri != g_rtvMap.end() && ri->second == g_boundRtvResource) {
                     D3D12_RESOURCE_DESC mrd = g_boundRtvResource->GetDesc();
                     if (mrd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
