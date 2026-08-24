@@ -1745,6 +1745,13 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                 Log("hooks: DLAA skipped - null ptr: brC=%p brD=%p brM=%p brO=%p dep=%p mv=%p",
                     (void*)g_gameColor, (void*)g_gameDepth, (void*)g_gameMv, (void*)g_gameOut,
                     (void*)g_depthResource, (void*)g_mvResource);
+            // Item #27: MV absence is a capability state, not an error. Report
+            // once per session; temporal path stays disabled until MV appears.
+            static bool s_mvCapAbsentLogged = false;
+            if (!s_mvCapAbsentLogged && !g_mvResource && g_settledOnce && s_nullSkip > 5) {
+                s_mvCapAbsentLogged = true;
+                Log("DLSS: MV capability ABSENT this configuration - DLAA idle until an MV RTV binds");
+            }
             bb->Release(); return;
         } else {
             // Single outer SEH: stale engine resources pass null checks but
