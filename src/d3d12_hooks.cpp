@@ -1679,7 +1679,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // so tight staleness caps invalidated them every single frame.
         // Trust the veteran gate + weak pointers + bridge SEH instead.
         bool depthStale = g_depthValid && (fc2 < g_depthStamp || fc2 - g_depthStamp > 20000);
-        bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 240);
+        // MV textures here are TRANSIENT (created, rendered briefly, freed).
+        // Using one older than ~5 frames = use-after-free = mv-barrier fault
+        // (proven: re-adopted-from-registry texture faulted again in 1.1s).
+        bool mvStale = g_mvValid && (fc2 < g_mvStamp || fc2 - g_mvStamp > 5);
         if (depthStale || mvStale) {
             static int s_staleLogs = 0;
             if (++s_staleLogs <= 5)
