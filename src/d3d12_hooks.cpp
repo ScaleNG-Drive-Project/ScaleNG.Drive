@@ -1631,9 +1631,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         }
     }
     g_injStep = "bb-fetched";
-    // Success resets the dead-swapchain circuit breaker.
+    if (!bb) return; // faulted calls land here WITHOUT resetting the breaker
+    // Success resets the dead-swapchain circuit breaker - only on REAL fetch.
     g_bbFetchFails = 0;
-    if (!bb) return;
 
     // The backbuffer IS the true display surface: adopt its dimensions so the
     // DLAA feature (render==display) always matches what we feed it. Without
