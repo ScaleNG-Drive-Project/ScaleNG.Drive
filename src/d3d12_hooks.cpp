@@ -3223,18 +3223,12 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
                         const D3D12_BOX* srcBox)
 {
-    static void CopyTexBody(ID3D12GraphicsCommandList* list,
-                        const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY,
-                        UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
-                        const D3D12_BOX* srcBox)
-{
     // SAFETY: skip ALL analysis if bridge not ready or DLAA disabled
     // Prevents GetDesc/Barrier calls on engine resources during unstable startup
     if (!g_bridgeReady || !g_dlaaMode) {
         goto Forward;
     }
-    bool injectBefore = false;
-    if (dst && src && src->pResource != dst->pResource &&
+    bool inject = false;
         src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         dst->SubresourceIndex == 0 && src->SubresourceIndex == 0 &&
