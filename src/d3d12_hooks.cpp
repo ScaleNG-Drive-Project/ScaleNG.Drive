@@ -143,6 +143,23 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         HRESULT bdevHr;
         if (!mk || FAILED(bdevHr = mk(brAdapter, 0xb000, __uuidof(ID3D12Device), (void**)&g_bridgeDev))) {
         s_creatingBridge = false;
+        // Log BRIDGE adapter identity alongside the game's (hybrid triage).
+        {
+            IDXGIDevice* bdxgi = nullptr;
+            if (SUCCEEDED(g_bridgeDev->QueryInterface(__uuidof(IDXGIDevice), (void**)&bdxgi))) {
+                IDXGIAdapter* bad = nullptr;
+                if (SUCCEEDED(bdxgi->GetAdapter(&bad))) {
+                    DXGI_ADAPTER_DESC bdesc = {};
+                    if (SUCCEEDED(bad->GetDesc(&bdesc))) {
+                        Log("bridge: BRIDGE device adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
+                            bdesc.VendorId, bdesc.Description,
+                            (unsigned)bdesc.AdapterLuid.HighPart, (unsigned)bdesc.AdapterLuid.LowPart);
+                    }
+                    bad->Release();
+                }
+                bdxgi->Release();
+            }
+        }
         // ROOT-CAUSE TOOL: force DRED auto-breadcrumbs + page-fault reporting
         // so any device removal names its exact faulting operation instead of
         // leaving us inferring from log correlation.
@@ -3380,7 +3397,23 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
             HRESULT qhr = newDev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev);
             Log("hooks: device %p created (QI IDXGIDevice hr=0x%08X)",
                 (void*)newDev, (unsigned)qhr);
-            if (dxgidev) dxgidev->Release();
+            if (dxgidev) {
+                // ADAPTER IDENTITY (hybrid-laptop triage): which physical GPU
+                // owns the GAME device? If AMD iGPU while our bridge sits on
+                // the NVIDIA dGPU, every shared-resource transfer crosses
+                // adapters - prime suspect for un-TDR'd DEVICE_REMOVED.
+                IDXGIAdapter* ad = nullptr;
+                if (SUCCEEDED(dxgidev->GetAdapter(&ad))) {
+                    DXGI_ADAPTER_DESC adesc = {};
+                    if (SUCCEEDED(ad->GetDesc(&adesc))) {
+                        Log("hooks: GAME device adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
+                            adesc.VendorId, adesc.Description,
+                            (unsigned)adesc.AdapterLuid.HighPart, (unsigned)adesc.AdapterLuid.LowPart);
+                    }
+                    ad->Release();
+                }
+                dxgidev->Release();
+            }
         }
         bool reinstallHooks = (g_device != newDev);
         g_device = newDev;
