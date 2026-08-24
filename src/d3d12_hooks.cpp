@@ -399,7 +399,7 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
         // Only PERSISTENT composite sources are real scene changes - transient
         // post targets on recycled descriptors swap constantly during play.
         int persistNow = 0;
-        { auto ci = g_copySrcCount.find((void*)res); if (ci != g_copySrcCount.end()) persistNow = ci->second; }
+        { AcquireSRWLockShared(&g_copyMapLock); auto ci = g_copySrcCount.find((void*)res); if (ci != g_copySrcCount.end()) persistNow = ci->second; ReleaseSRWLockShared(&g_copyMapLock); }
         if (persistNow < 40) { *slot = res; return; }
         g_lastSceneChangeFrame = g_frameCounter;
         g_lastDiscoveryChangeFrame = g_frameCounter;
@@ -442,6 +442,11 @@ static unsigned g_lastNewChainFrame = 0;
 // Backbuffer-fetch circuit breaker: consecutive guarded faults on the cached
 // swapchain mean it is stale; null it and let Present self-heal re-adopt.
 static volatile long g_bbFetchFails = 0;
+// THREAD SAFETY: Hook_CopyTextureRegion / OMSetRenderTargets run on the
+// ENGINE'S SUBMISSION THREADS. The std::map below was mutated unsynchronized
+// - concurrent inserts corrupt the heap and crash ANYWHERE later (driver,
+// engine, us). Every access takes this lock.
+static SRWLOCK g_copyMapLock = SRWLOCK_INIT;
 // Swapchains that repeatedly faulted during backbuffer fetch - never touch
 // these objects again (engine-guarded wrappers raise on our probes).
 void* g_badSc[4] = { nullptr, nullptr, nullptr, nullptr };
@@ -3203,7 +3208,10 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
         srcBox && dstX == 0 && dstY == 0) {
         long w = srcBox->right - srcBox->left;
         long h = srcBox->bottom - srcBox->top;
-        if (++g_copySrcCount[(void*)src->pResource] == 1)
+        AcquireSRWLockExclusive(&g_copyMapLock);
+        bool newNode = (++g_copySrcCount[(void*)src->pResource] == 1);
+        ReleaseSRWLockExclusive(&g_copyMapLock);
+        if (newNode)
             g_lastNewChainFrame = g_frameCounter; // new node entered the chain
         bool isMvDst = (dst->pResource == g_mvResource || dst->pResource == g_mvResourceAlt);
         bool isSceneSrc = (src->pResource == g_sceneColor ||
@@ -3562,7 +3570,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
             // has fed the full-res composite copy repeatedly - transient post/
             // bloom targets bound at recycled descriptors would otherwise churn
             // the identity every frame and keep the churn-quarantine armed.
-            int persist = 0; { auto ci = g_copySrcCount.find((void*)g_boundRtvResource); if (ci != g_copySrcCount.end()) persist = ci->second; }
+            int persist = 0; { AcquireSRWLockShared(&g_copyMapLock); auto ci = g_copySrcCount.find((void*)g_boundRtvResource); if (ci != g_copySrcCount.end()) persist = ci->second; ReleaseSRWLockShared(&g_copyMapLock); }
             if (g_sceneColorValid && persist >= 40 && g_boundRtvResource &&
                 g_boundRtv.ptr == g_sceneColorRtv.ptr &&
                 g_boundRtvResource != g_sceneColor) {
@@ -3574,7 +3582,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                     rd.Width >= 1000 && rd.Height >= 500)
                     AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
             }
-            int persistA = 0; { auto ci = g_copySrcCount.find((void*)g_boundRtvResource); if (ci != g_copySrcCount.end()) persistA = ci->second; }
+            int persistA = 0; { AcquireSRWLockShared(&g_copyMapLock); auto ci = g_copySrcCount.find((void*)g_boundRtvResource); if (ci != g_copySrcCount.end()) persistA = ci->second; ReleaseSRWLockShared(&g_copyMapLock); }
             if (g_sceneColorAlt && persistA >= 40 && g_boundRtvResource &&
                 g_boundRtv.ptr == g_sceneColorRtvAlt.ptr &&
                 g_boundRtvResource != g_sceneColorAlt) {
