@@ -217,11 +217,14 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         Log("bridge: mkShared %ux%u fmt=%u flags=%X - committed...", (unsigned)w, (unsigned)h,
             (unsigned)f, (unsigned)d.Flags);
-        if (FAILED(g_bridgeDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &d,
-                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(ours)))) {
-            Log("bridge: mkShared CreateCommittedResource FAILED");
-            return false;
-        }
+            HRESULT chr = g_bridgeDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &d,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(ours));
+            if (FAILED(chr)) {
+                HRESULT drr = g_bridgeDev->GetDeviceRemovedReason();
+                Log("bridge: mkShared CreateCommittedResource FAILED hr=0x%08X (devRemoved=0x%08X)",
+                    (unsigned)chr, (unsigned)drr);
+                return false;
+            }
         Log("bridge: mkShared resource ok %p - CreateSharedHandle...", (void*)*ours);
         if (FAILED(g_bridgeDev->CreateSharedHandle(*ours, nullptr, GENERIC_ALL, nullptr, hout))) {
             Log("bridge: mkShared CreateSharedHandle FAILED");
