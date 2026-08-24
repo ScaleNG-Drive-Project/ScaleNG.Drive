@@ -151,11 +151,28 @@ static int SehFilter(unsigned int code, _EXCEPTION_POINTERS* ep)
 
 extern "C" __declspec(dllexport) void InitializeASI()
 {
+    // CROSS-COPY GUARD: UAL chains can map our ASI more than once - each copy
+    // has private statics, so a per-copy Interlocked guard allowed THREE
+    // concurrent full inits (triple hooks/bridge devices -> nvwgf2umx AV).
+    // A named file-mapping holds the state machine across all copies.
+    HANDLE hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                     0, 64, L"Local\\ScaleNG_InitState");
+    long* pShared = hMap ? (long*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 64) : nullptr;
+    if (pShared ? InterlockedCompareExchange(pShared, 1, 0) != 0 : true) {
+        if (pShared) UnmapViewOfFile(pShared);
+        if (hMap) CloseHandle(hMap);
+        return;
+    }
     // STRICTLY once-only: UAL/loader calls this multiple times. Without this
     // guard, each call re-runs full init (log restart, hook re-install, etc).
     // Atomic once-only guard: thread-safe even if UAL calls from multiple threads
     static volatile long s_asiState = 0; // 0=UNINITIALIZED 1=INITIALIZING 2=INITIALIZED 3=FAILED
-    if (InterlockedCompareExchange(&s_asiState, 1, 0) != 0) return;
+    if (InterlockedCompareExchange(&s_asiState, 1, 0) != 0) {
+        if (pShared) InterlockedExchange(pShared, 2);
+        if (pShared) UnmapViewOfFile(pShared);
+        if (hMap) CloseHandle(hMap);
+        return;
+    }
     LogInit();
     // P0 item 1/4: identity telemetry - thread, process, module base. A second
     // distinct base in the log proves a duplicate ASI copy is loaded.
@@ -200,4 +217,7 @@ extern "C" __declspec(dllexport) void InitializeASI()
         // distinguish "already done" from "died midway".
         InterlockedExchange(&s_asiState, 3);
     }
+    if (pShared) InterlockedExchange(pShared, 2); // INITIALIZED (or FAILED via SehFilter path)
+    if (pShared) UnmapViewOfFile(pShared);
+    if (hMap) CloseHandle(hMap);
 }
