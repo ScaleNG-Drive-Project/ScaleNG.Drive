@@ -17,6 +17,7 @@ struct ScaleNgConfig {
     wchar_t dlssDllPath[MAX_PATH] = {};
 };
 
+unsigned HooksGetQuietFrames();
 void HooksSetConfig(const ScaleNgConfig& config);
 
 void HooksInstallCreateDeviceDetour();
