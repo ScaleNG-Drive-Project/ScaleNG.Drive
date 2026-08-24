@@ -1605,8 +1605,17 @@ volatile long g_injResourcesReady = 0; // atomic: 0=not ready, 1=ready
 
 static DWORD WINAPI InitThreadProc(LPVOID)
 {
+    // ISOLATION (reviewer #16 pattern): SCALENG_NO_INITRES=1 skips wrapped-
+    // device resource creation on this background thread - prime suspect for
+    // the nvwgf2umx freeze class (every freeze fires immediately after
+    // 'present-injection resources created' from this thread).
+    static const bool s_noInitRes = GetEnvironmentVariableA("SCALENG_NO_INITRES", nullptr, 0) > 0;
     for (;;) {
         WaitForSingleObject(g_initThreadEv, INFINITE);
+        if (s_noInitRes) {
+            Log("hooks: init thread - EnsureInjectionResources SKIPPED (isolation mode)");
+            return 0;
+        }
         if (!InterlockedCompareExchange(&g_injResourcesReady, 0, 0)) {
             EnsureInjectionResources();
             // HUD REMOVED from init: its creation surface (d3dcompiler,
