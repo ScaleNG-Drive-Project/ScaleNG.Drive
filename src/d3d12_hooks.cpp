@@ -3071,7 +3071,10 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                         // NOTE: no EnsureUpscalerInit here - this runs on the
                         // engine ECL thread; NGX init races the Present thread
                         // (double-init corrupted NVIDIA global state).
-                        if (g_dlaaMode)
+                        // ISOLATION (reviewer #16 pattern): SCALENG_NO_JITTER=1
+                        // disables the CB patch entirely - single-variable test
+                        // for whether jitter writing triggers nvwgf2umx AVs.
+                        if (g_dlaaMode && !GetEnvironmentVariableA("SCALENG_NO_JITTER", nullptr, 0))
                             ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
                                                 g_currJitter, g_prevJitter);
                         std::memcpy(g_lastPatchedCameraCb, cb, kCameraCbSize);
