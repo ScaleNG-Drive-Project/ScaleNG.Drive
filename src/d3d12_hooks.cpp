@@ -388,6 +388,9 @@ static unsigned long long g_mvLastRtvKey = 0;
 // Rolling last-full-res-copy source - correlated with Present to name the
 // terminal scene node (the texture that feeds Present = DLAA input target).
 static unsigned g_lastNewChainFrame = 0;
+// Backbuffer-fetch circuit breaker: consecutive guarded faults on the cached
+// swapchain mean it is stale; null it and let Present self-heal re-adopt.
+static volatile long g_bbFetchFails = 0;
 // Reviewer #16 isolation: copies-only bridge mode (no NGX eval).
 static const bool g_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
 
@@ -597,7 +600,12 @@ void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURC
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     Real_ResourceBarrier(list, 1, &b);
     it->second = after;
-    Log("hooks: barrier %p %u -> %u", (void*)res, (unsigned int)before, (unsigned int)after);
+    // Rate-limited: this fires per-transition inside the flow; unlogged it
+    // was ~400 lines/sec and the synchronous log I/O contributed to freezes.
+    static volatile long s_barrierLogs = 0;
+    long n = InterlockedIncrement(&s_barrierLogs);
+    if (n <= 25 || (n % 2000) == 0)
+        Log("hooks: barrier %p %u -> %u (#%ld)", (void*)res, (unsigned int)before, (unsigned int)after, n);
 }
 
 void CreateDlssOut()
@@ -1612,8 +1620,19 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         Log("hooks: backbuffer fetch guarded (code %08X)", (unsigned)GetExceptionCode());
         if (sc3) sc3->Release();
         bb = nullptr;
+        // Dead-swapchain circuit breaker: three consecutive faults means the
+        // cached g_swapchain is stale (engine re-init/rotation). Null it so
+        // Hook_Present's self-heal re-adopts the REAL swapchain instead of
+        // retrying into the same AV every frame (freeze class).
+        if (InterlockedIncrement(&g_bbFetchFails) >= 3) {
+            g_swapchain = nullptr;
+            g_bbFetchFails = 0;
+            Log("hooks: g_swapchain marked dead after repeated fetch faults - self-heal armed");
+        }
     }
     g_injStep = "bb-fetched";
+    // Success resets the dead-swapchain circuit breaker.
+    g_bbFetchFails = 0;
     if (!bb) return;
 
     // The backbuffer IS the true display surface: adopt its dimensions so the
