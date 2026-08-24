@@ -110,7 +110,11 @@ unsigned int g_lastCamPatchFrame = 0;
 ID3D12Fence* g_gameFence = nullptr; // game-device view of bridge shared fence
 static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* gameDev)
 {
-    
+    // Zero dims = display not yet adopted (hysteresis needs ~15 stable frames).
+    // Creating 0-sized shared textures is E_INVALIDARG - retry later instead.
+    if (W == 0 || H == 0) return false;
+    if (fmt == DXGI_FORMAT_UNKNOWN) return false;
+
     if (g_bridgeReady && g_brW == W && g_brH == H && g_brFmt == fmt)
         return true;
 
@@ -213,7 +217,8 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         d.Width = w; d.Height = h; d.DepthOrArraySize = 1; d.MipLevels = 1;
         d.Format = f; d.SampleDesc.Count = 1;
-        d.Flags = fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        d.Flags = fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
+                    | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         Log("bridge: mkShared %ux%u fmt=%u flags=%X - committed...", (unsigned)w, (unsigned)h,
             (unsigned)f, (unsigned)d.Flags);
