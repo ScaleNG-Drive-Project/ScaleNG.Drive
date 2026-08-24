@@ -1735,6 +1735,13 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         AdoptDisplaySize((unsigned int)bbd.Width, (unsigned int)bbd.Height);
     } // end legacy probe (only when nothing cached)
 
+    // STEP MARKERS: the repeating fault at 'adopted' jumps into non-module
+    // memory (MinHook trampoline pool of another copy?). These name the exact
+    // call that transfers control there.
+    static int s_stepLogs = 0;
+    bool doStepLog = s_stepLogs < 15;
+    if (doStepLog) { ++s_stepLogs; Log("step: adopted bb=%p display=%ux%u fmt=%u", (void*)bb, g_displayW, g_displayH, g_bbFormat); }
+
     g_injStep = "adopted";
     auto it = g_resourceStates.find(bb);
     if (it == g_resourceStates.end()) {
@@ -1760,6 +1767,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // Bridge device + shared textures: SAFE during load (every stable run
     // built it there; late builds hit DEVICE_REMOVED under render load).
     if (g_dlaaMode) {
+        if (doStepLog) Log("step: calling EnsureBridge");
         if (!EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device)) {
             static int s_brFail = 0;
             if (++s_brFail <= 3) Log("hooks: bridge unavailable - DLAA disabled this session");
