@@ -391,6 +391,9 @@ static unsigned g_lastNewChainFrame = 0;
 // Backbuffer-fetch circuit breaker: consecutive guarded faults on the cached
 // swapchain mean it is stale; null it and let Present self-heal re-adopt.
 static volatile long g_bbFetchFails = 0;
+// Swapchains that repeatedly faulted during backbuffer fetch - never touch
+// these objects again (engine-guarded wrappers raise on our probes).
+void* g_badSc[4] = { nullptr, nullptr, nullptr, nullptr };
 // Reviewer #16 isolation: copies-only bridge mode (no NGX eval).
 static const bool g_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
 
@@ -1619,6 +1622,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 
     ID3D12Resource* bb = nullptr;
     IDXGISwapChain3* sc3 = nullptr;
+    // Blacklist: a swapchain that faulted repeatedly is skipped BY IDENTITY.
+    // Nulling g_swapchain alone just re-adopts the same poisoned object.
+    {
+        void* cur = (void*)g_swapchain;
+        for (int bi = 0; bi < 4; ++bi) {
+            extern void* g_badSc[4]; // defined below near g_bbFetchFails
+            if (g_badSc[bi] && g_badSc[bi] == cur) return;
+        }
+    }
     __try {
         if (SUCCEEDED(g_swapchain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
             UINT idx = sc3->GetCurrentBackBufferIndex();
@@ -1635,9 +1647,17 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Hook_Present's self-heal re-adopts the REAL swapchain instead of
         // retrying into the same AV every frame (freeze class).
         if (InterlockedIncrement(&g_bbFetchFails) >= 3) {
+            // Blacklist THIS object so self-heal doesn't re-adopt poison.
+            void* bad = (void*)g_swapchain;
+            if (bad) {
+                for (int bi = 0; bi < 4; ++bi) {
+                    if (g_badSc[bi] == bad) break;
+                    if (!g_badSc[bi]) { InterlockedExchangePointer(&g_badSc[bi], bad); break; }
+                }
+            }
             g_swapchain = nullptr;
             g_bbFetchFails = 0;
-            Log("hooks: g_swapchain marked dead after repeated fetch faults - self-heal armed");
+            Log("hooks: swapchain %p blacklisted after repeated fetch faults - self-heal armed", bad);
         }
     }
     g_injStep = "bb-fetched";
