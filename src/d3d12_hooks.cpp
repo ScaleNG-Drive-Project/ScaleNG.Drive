@@ -2610,7 +2610,12 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
         // ADAPTER IDENTITY via the swapchain itself: QI on the RAW swapchain
         // (not the wrapped game device) always works and names the physical
         // adapter that owns PRESENT - the ground truth for hybrid triage.
-        {
+        // GUARDED: EGSH's dummy path can return S_OK with a garbage out-param
+        // (observed sc=CCCCCC..), so validate + SEH before any deref.
+        __try {
+            if (!IsReadablePtr(sc, sizeof(void*))) {
+                Log("hooks: SWAPCHAIN ptr not readable - skipping adapter identity");
+            } else {
             IDXGIDevice* sdev = nullptr;
             if (SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice), (void**)&sdev))) {
                 IDXGIAdapter* sad = nullptr;
@@ -2627,24 +2632,10 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
             } else {
                 Log("hooks: SWAPCHAIN GetDevice failed - cannot name present adapter");
             }
-            // And the device the ENGINE passed in (may be their wrapper):
-            if (device) {
-                IDXGIDevice* pdev = nullptr;
-                if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&pdev))) {
-                    IDXGIAdapter* pad = nullptr;
-                    if (SUCCEEDED(pdev->GetAdapter(&pad))) {
-                        DXGI_ADAPTER_DESC pdesc = {};
-                        if (SUCCEEDED(pad->GetDesc(&pdesc))) {
-                            Log("hooks: SWAPCHAIN-REQUEST device adapter VendorId=0x%04X '%ls'",
-                                pdesc.VendorId, pdesc.Description);
-                        }
-                        pad->Release();
-                    }
-                    pdev->Release();
-                } else {
-                    Log("hooks: swapchain request-device QI failed (wrapped) - using swapchain side only");
-                }
             }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("hooks: SWAPCHAIN adapter identity guarded (code %08X)", (unsigned)GetExceptionCode());
         }
         __try {
             bool rd = IsReadablePtr(sc, sizeof(void*));
