@@ -2881,6 +2881,7 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                            (g_sceneColorAlt && src->pResource == g_sceneColorAlt));
         if (g_displayW > 0 && !g_injectedThisFrame &&
             (unsigned long)w == g_displayW && (unsigned long)h == g_displayH) {
+            D3D12_RESOURCE_DESC sd = src->pResource->GetDesc();
             // Evidence instrumentation (reviewer #21 style): the engine rotates
             // its scene target ACROSS FORMATS (28->34 observed pre-crash).
             // A display-sized src we do NOT track means rotation happened and
