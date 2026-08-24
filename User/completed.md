@@ -265,3 +265,6 @@
 - [x] **P0#2 (partial)** state enum formalized 0=UNINIT/1=INITIALIZING/2=INITIALIZED/3=FAILED; atomic 0->1 guard pre-existed; FAILED now recorded on SEH.
 - [x] **P0#4** module base logged - duplicate-copy detection enabled (compare bases across log lines).
 - Queued next: P0#3 per-hook idempotency states; P1 device generations/classification.
+## P0 complete (fix80, commit 33b58c8)
+- [x] **P0#3** Hook-install idempotency: CreateDevice detour now carries s_installState (0/1/2); re-invocation logs and returns; failure paths record FAILED. Double-patch structurally impossible.
+- **P0 (1,2,3,4) ALL DONE.** Next per plan: P1 device generations/classification (5-8), then P2 transactional bridge (11) + fence-safe teardown (12).
