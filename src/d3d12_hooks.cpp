@@ -344,6 +344,11 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     // graph. Staleness stamps + bridge SEH handle freed pointers safely.
     *slot = res;
 }
+// Last-seen MV RTV descriptor key. After an invalidation the engine does NOT
+// recreate its MV texture (same map/spawn - fixed content), so creation-based
+// adoption never refires and MV stays 'absent' all session. This key lets us
+// re-adopt the same texture from g_rtvMap once discovery is live again.
+static unsigned long long g_mvLastRtvKey = 0;
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
 // is backgrounded and only renders the menu), patching the viewport to the render
 // size forever leaves the frame stretched/black and has been observed alongside
@@ -806,6 +811,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             StoreTracked(&g_mvResource, res);
                     g_mvValid = true;
                     g_mvStamp = g_frameCounter;
+                    g_mvLastRtvKey = handle.ptr;
                     Log("hooks: motion vector RTV %p (%ux%u R16G16_FLOAT)", (void*)res, g_mvW, g_mvH);
                 } else if (res == g_mvResource || res == g_mvResourceAlt) {
                     if (res == g_mvResource) {
@@ -830,6 +836,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_mvStamp = g_frameCounter;
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
+                g_mvLastRtvKey = handle.ptr;
                 Log("hooks: motion vector RTV %p (1920x1001 R16G16_FLOAT)", (void*)res);
             } else if (res == g_mvResource || res == g_mvResourceAlt) {
                 if (res == g_mvResource)
@@ -1740,6 +1747,20 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         if (!g_bridgeReady || !g_gameColor || !g_gameDepth || !g_gameMv || !g_gameOut
             || !g_depthResource || !g_mvResource) {
             doDlss = false;
+            // MV RE-ADOPTION from registry: invalidation dropped a texture the
+            // engine will never recreate (fixed map/spawn). If its descriptor
+            // key is still mapped, adopt it back - bridge SEH covers frees.
+            if (!g_mvResource && g_mvLastRtvKey) {
+                auto ri = g_rtvMap.find(g_mvLastRtvKey);
+                if (ri != g_rtvMap.end() && ri->second) {
+                    StoreTracked(&g_mvResource, ri->second);
+                    g_mvValid = true;
+                    g_mvStamp = g_frameCounter;
+                    if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
+                    g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
+                }
+            }
             static int s_nullSkip = 0;
             if (++s_nullSkip <= 5)
                 Log("hooks: DLAA skipped - null ptr: brC=%p brD=%p brM=%p brO=%p dep=%p mv=%p",
