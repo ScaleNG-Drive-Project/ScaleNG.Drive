@@ -352,6 +352,8 @@ static unsigned long long g_mvLastRtvKey = 0;
 // Rolling last-full-res-copy source - correlated with Present to name the
 // terminal scene node (the texture that feeds Present = DLAA input target).
 static unsigned g_lastNewChainFrame = 0;
+// Reviewer #16 isolation: copies-only bridge mode (no NGX eval).
+static const bool g_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
 static void* g_topoLastSrc = nullptr;
 static unsigned g_topoLastFmt = 0;
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
@@ -1909,13 +1911,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             ep.mvScaleX = (float)g_displayW;
             ep.mvScaleY = (float)g_displayH;
             ep.sharpness = g_cfg.sharpness;
-            // REVIEWER #16 ISOLATION: SCALENG_DIAG_BRIDGE=1 runs copies-only
-            // (in+out, full fence protocol) and skips NGX Evaluate. If hangs
-            // persist in this mode -> bridge/copies are the killer. If stable
-            // -> NGX eval is. One variable, evidence-driven.
-            static bool s_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
             bool evalOk = true;
-            if (s_diagBridge) {
+            if (g_diagBridge) {
                 static int s_diagLogs = 0;
                 if (++s_diagLogs <= 10)
                     Log("DIAG#16: bridge copies done - Evaluate SKIPPED (isolation mode)");
