@@ -646,6 +646,10 @@ void CreateDlssOut()
 void AdoptDisplaySize(unsigned int w, unsigned int h)
 {
     if (w == 0 || h == 0) return;
+    // MIN-DISPLAY FLOOR: UI/menu targets (768x400 etc.) must never define
+    // display size - bridge shared textures built at their dims then collide
+    // with the real scene inside nvwgf2umx (driver AV, WER-confirmed).
+    if (w < 1000 || h < 700) return;
 
     // Proper hysteresis: track a candidate separately from accepted globals.
     // Only commit after 15 consecutive identical observations. This prevents
