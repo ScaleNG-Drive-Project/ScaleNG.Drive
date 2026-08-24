@@ -1636,15 +1636,13 @@ volatile long g_injResourcesReady = 0; // atomic: 0=not ready, 1=ready
 
 static DWORD WINAPI InitThreadProc(LPVOID)
 {
-    // ISOLATION (reviewer #16 pattern): SCALENG_NO_INITRES=1 skips wrapped-
-    // device resource creation on this background thread - prime suspect for
-    // the nvwgf2umx freeze class (every freeze fires immediately after
-    // 'present-injection resources created' from this thread).
-    static const bool s_noInitRes = GetEnvironmentVariableA("SCALENG_NO_INITRES", nullptr, 0) > 0;
+    // SAFETY DEFAULT: injection resource creation on init thread DISABLED by default.
+    // Enable with SCALENG_ENABLE_INITRES=1 if explicitly needed.
+    static const bool s_noInitRes = GetEnvironmentVariableA("SCALENG_ENABLE_INITRES", nullptr, 0) == 0;
     for (;;) {
         WaitForSingleObject(g_initThreadEv, INFINITE);
         if (s_noInitRes) {
-            Log("hooks: init thread - EnsureInjectionResources SKIPPED (isolation mode)");
+            Log("hooks: init thread - EnsureInjectionResources SKIPPED (safe default)");
             return 0;
         }
         if (!InterlockedCompareExchange(&g_injResourcesReady, 0, 0)) {
@@ -3111,10 +3109,9 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                         // NOTE: no EnsureUpscalerInit here - this runs on the
                         // engine ECL thread; NGX init races the Present thread
                         // (double-init corrupted NVIDIA global state).
-                        // ISOLATION (reviewer #16 pattern): SCALENG_NO_JITTER=1
-                        // disables the CB patch entirely - single-variable test
-                        // for whether jitter writing triggers nvwgf2umx AVs.
-                        if (g_dlaaMode && !GetEnvironmentVariableA("SCALENG_NO_JITTER", nullptr, 0))
+                        // SAFETY DEFAULT: camera CB patch DISABLED by default.
+                        // Enable with SCALENG_ENABLE_JITTER=1 if explicitly needed.
+                        if (g_dlaaMode && GetEnvironmentVariableA("SCALENG_ENABLE_JITTER", nullptr, 0) > 0)
                             ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
                                                 g_currJitter, g_prevJitter);
                         std::memcpy(g_lastPatchedCameraCb, cb, kCameraCbSize);
