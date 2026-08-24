@@ -1843,12 +1843,12 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         // Never hand NGX mismatched sizes even if something above failed to
         // re-create the feature/output - 0xBAD00005 storms destabilize drivers.
         D3D12_RESOURCE_DESC od = g_dlssOut->GetDesc();
-        if (od.Width != bbd.Width || od.Height != bbd.Height) {
+        if (od.Width != g_displayW || od.Height != g_displayH) {
             static int s_dimSkips = 0;
             if (++s_dimSkips <= 5)
                 Log("hooks: DLAA skipped - output %ux%u != backbuffer %ux%u",
                     (unsigned)od.Width, (unsigned)od.Height,
-                    (unsigned)bbd.Width, (unsigned)bbd.Height);
+                    (unsigned)g_displayW, (unsigned)g_displayH);
             doDlss = false;
         }
     }
