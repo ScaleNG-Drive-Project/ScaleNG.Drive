@@ -354,7 +354,12 @@ static unsigned long long g_mvLastRtvKey = 0;
 static unsigned g_lastNewChainFrame = 0;
 // Reviewer #16 isolation: copies-only bridge mode (no NGX eval).
 static const bool g_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
-unsigned HooksGetQuietFrames() { return g_frameCounter - g_lastNewChainFrame; }
+unsigned HooksGetQuietFrames() {
+    // Chain never observed yet => NOT quiet. (frameCounter grows through the
+    // loading screen before any display-sized copy exists, which made the
+    // 600f gate pass instantly and let nvngx load mid-churn.)
+    return g_lastNewChainFrame ? (g_frameCounter - g_lastNewChainFrame) : 0;
+}
 static void* g_topoLastSrc = nullptr;
 static unsigned g_topoLastFmt = 0;
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
