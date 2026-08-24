@@ -2108,13 +2108,6 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
-            // Terminal-node correlation: what the copy chain last wrote,
-            // sampled at Present. The recurring ptr here IS the DLAA input.
-            static unsigned s_presFeedCount = 0;
-            if (++s_presFeedCount % 60 == 1 && g_topoLastSrc) {
-                Log("present-feed: last full-res src %p fmt %u",
-                    g_topoLastSrc, g_topoLastFmt);
-            }
             if (!g_inPresent) {
                 g_inPresent = true;
                 if (s_candFired[candIdx]) {
@@ -2193,6 +2186,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
 {
     if (sc) {
         __try {
+            // Terminal-node correlation (unconditional entry): what the copy
+            // chain last wrote, sampled at Present. The recurring ptr here IS
+            // the DLAA input target.
+            static unsigned s_presFeedCount = 0;
+            if (++s_presFeedCount % 60 == 1 && g_topoLastSrc) {
+                Log("present-feed: last full-res src %p fmt %u",
+                    g_topoLastSrc, g_topoLastFmt);
+            }
             if (sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
