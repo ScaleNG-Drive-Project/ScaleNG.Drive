@@ -220,16 +220,42 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         d.Flags = fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
                     | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        Log("bridge: mkShared %ux%u fmt=%u flags=%X - committed...", (unsigned)w, (unsigned)h,
-            (unsigned)f, (unsigned)d.Flags);
-            HRESULT chr = g_bridgeDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &d,
+        Log("bridge: mkShared %ux%u fmt=%u baseFlags=%X - probing combinations...", (unsigned)w, (unsigned)h,
+            (unsigned)f, (unsigned)fl);
+        // ARGUMENT-SPACE PROBE: E_INVALIDARG without naming which constraint.
+        // Try descending permissiveness; each attempt logged with its hr so
+        // the exact failing requirement identifies itself.
+        struct Combo { D3D12_RESOURCE_FLAGS rf; D3D12_HEAP_FLAGS hf; const char* name; };
+        const Combo combos[] = {
+            { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+              D3D12_HEAP_FLAG_SHARED, "SHARED+CROSS+SIMUL" },
+            { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+              D3D12_HEAP_FLAG_SHARED, "SHARED+SIMUL" },
+            { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+              D3D12_HEAP_FLAG_NONE, "NOSHARE+SIMUL" },
+        };
+        HRESULT lastHr = E_FAIL;
+        bool made = false;
+        for (const auto& c : combos) {
+            d.Flags = c.rf;
+            HRESULT chr = g_bridgeDev->CreateCommittedResource(&hp, c.hf, &d,
                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(ours));
-            if (FAILED(chr)) {
+            Log("bridge: mkShared try %-18s heapFlag=%llX resFlags=%X hr=0x%08X",
+                c.name, (unsigned long long)c.hf, (unsigned)c.rf, (unsigned)chr);
+            if (SUCCEEDED(chr)) {
+                lastHr = chr; made = true;
                 HRESULT drr = g_bridgeDev->GetDeviceRemovedReason();
-                Log("bridge: mkShared CreateCommittedResource FAILED hr=0x%08X (devRemoved=0x%08X)",
-                    (unsigned)chr, (unsigned)drr);
-                return false;
+                Log("bridge: mkShared SUCCESS via %s (devRemoved=0x%08X)", c.name, (unsigned)drr);
+                break;
             }
+            lastHr = chr;
+        }
+        if (!made) {
+            HRESULT drr = g_bridgeDev->GetDeviceRemovedReason();
+            Log("bridge: mkShared ALL combos failed (last hr=0x%08X, devRemoved=0x%08X)",
+                (unsigned)lastHr, (unsigned)drr);
+            return false;
+        }
         Log("bridge: mkShared resource ok %p - CreateSharedHandle...", (void*)*ours);
         if (FAILED(g_bridgeDev->CreateSharedHandle(*ours, nullptr, GENERIC_ALL, nullptr, hout))) {
             Log("bridge: mkShared CreateSharedHandle FAILED");
