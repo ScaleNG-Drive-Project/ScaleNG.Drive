@@ -227,10 +227,10 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         // the exact failing requirement identifies itself.
         struct Combo { D3D12_RESOURCE_FLAGS rf; D3D12_HEAP_FLAGS hf; const char* name; };
         const Combo combos[] = {
-            { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
-              D3D12_HEAP_FLAG_SHARED, "SHARED+CROSS+SIMUL" },
             { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
               D3D12_HEAP_FLAG_SHARED, "SHARED+SIMUL" },
+            { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+              D3D12_HEAP_FLAG_SHARED, "SHARED+CROSS+SIMUL" },
             { fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
               D3D12_HEAP_FLAG_NONE, "NOSHARE+SIMUL" },
         };
@@ -3239,8 +3239,14 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                     // it unless it already IS a pair half.
                     bool altIsPairHalf = false;
                     if (g_sceneColorAlt) {
-                        D3D12_RESOURCE_DESC ad = g_sceneColorAlt->GetDesc();
-                        altIsPairHalf = (ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                        // Weak pointer: may be freed since adoption. A fault
+                        // here means dead ALT - clear it for replacement.
+                        __try {
+                            D3D12_RESOURCE_DESC ad = g_sceneColorAlt->GetDesc();
+                            altIsPairHalf = (ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            g_sceneColorAlt = nullptr;
+                        }
                     }
                     if (!srcIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, src->pResource);
