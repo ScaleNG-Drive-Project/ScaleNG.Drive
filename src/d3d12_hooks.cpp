@@ -142,7 +142,26 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         }
         HRESULT bdevHr;
         if (!mk || FAILED(bdevHr = mk(brAdapter, 0xb000, __uuidof(ID3D12Device), (void**)&g_bridgeDev))) {
-            s_creatingBridge = false;
+        s_creatingBridge = false;
+        // ROOT-CAUSE TOOL: force DRED auto-breadcrumbs + page-fault reporting
+        // so any device removal names its exact faulting operation instead of
+        // leaving us inferring from log correlation.
+        {
+            typedef HRESULT(WINAPI* PFN_D12Dbg)(const IID&, void**);
+            PFN_D12Dbg getDbg = (PFN_D12Dbg)(void*)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12GetDebugInterface");
+            if (getDbg) {
+                void* dredSet = nullptr;
+                if (SUCCEEDED(getDbg(__uuidof(ID3D12DeviceRemovedExtendedDataSettings), &dredSet))) {
+                    auto* ds = (ID3D12DeviceRemovedExtendedDataSettings*)dredSet;
+                    ds->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    ds->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    ds->Release();
+                    Log("bridge: DRED breadcrumbs+pagefault FORCED ON");
+                } else {
+                    Log("bridge: DRED settings unavailable (older runtime?)");
+                }
+            }
+        }
             Log("bridge: clean device create failed");
             return false;
         }
