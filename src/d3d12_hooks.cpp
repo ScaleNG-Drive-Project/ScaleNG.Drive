@@ -394,6 +394,7 @@ static volatile long g_bbFetchFails = 0;
 // Swapchains that repeatedly faulted during backbuffer fetch - never touch
 // these objects again (engine-guarded wrappers raise on our probes).
 void* g_badSc[4] = { nullptr, nullptr, nullptr, nullptr };
+ID3D12Resource* g_bbCached = nullptr; // captured from RTV creation - no GetBuffer probes needed
 // Reviewer #16 isolation: copies-only bridge mode (no NGX eval).
 static const bool g_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", nullptr, 0) > 0;
 
@@ -834,6 +835,23 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
     }
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
+        // BACKBUFFER CAPTURE (polite): flip-model swapchain buffers carry
+        // ALLOW_RENDER_TARGET + DISPLAY_SWAP? and are RTV'd right after swap
+        // creation. Capture display-sized candidates here so the injection
+        // path NEVER has to call GetBuffer on the engine's guarded wrapper.
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            rd.MipLevels == 1 && rd.SampleDesc.Count == 1 &&
+            (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            rd.Width >= 500 && rd.Height >= 300 &&
+            (!g_bbCached || res != g_bbCached)) {
+            bool isBbLike = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) == 0;
+            if (isBbLike && (!g_bbCached || g_bbFetchFails > 0)) {
+                StoreTracked(&g_bbCached, res);
+                Log("hooks: backbuffer candidate cached from RTV creation %p (%ux%u fmt %u flags %X)",
+                    (void*)res, (unsigned)rd.Width, (unsigned)rd.Height,
+                    (unsigned)rd.Format, (unsigned)rd.Flags);
+            }
+        }
         // Hold a creation-ref on any interesting target NOW - the object is
         // fully constructed and the engine holds its own ref, so ours is safe.
         // (AddRef-on-observation later is illegal and corrupted teardown.)
@@ -1622,6 +1640,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 
     ID3D12Resource* bb = nullptr;
     IDXGISwapChain3* sc3 = nullptr;
+    // POLITE PATH: use RTV-captured backbuffer when available - never probe
+    // the engine's guarded wrapper via GetBuffer (software-AV storm class).
+    if (g_bbCached) {
+        bb = g_bbCached;
+        g_injStep = "bb-cached";
+        D3D12_RESOURCE_DESC bbd = bb->GetDesc();
+        if ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)
+            AdoptDisplaySize((unsigned int)bbd.Width, (unsigned int)bbd.Height);
+    }
     // Blacklist: a swapchain that faulted repeatedly is skipped BY IDENTITY.
     // Nulling g_swapchain alone just re-adopts the same poisoned object.
     {
