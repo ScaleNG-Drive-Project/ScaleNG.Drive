@@ -2573,9 +2573,19 @@ void EnsureGlobalSwapchainHook()
                         sd.SampleDesc.Count = 1;
                         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
                         sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-                        dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
+                        // BYPASS OUR HOOK: f4 shares the static dxgi vtable, so
+                        // the virtual call would re-enter Hook_CreateSwapChain-
+                        // ForHwnd (self-re-entrancy) - observed returning
+                        // S_OK with an uninitialized 0xCC out-param, which
+                        // then poisoned the game's real swapchain handling.
+                        // The trampoline IS the original function.
+                        if (Real_CreateSwapChainForHwnd)
+                            dhr = Real_CreateSwapChainForHwnd((IDXGIFactory2*)f4, dq,
+                                dummyWnd, &sd, nullptr, &dummy);
+                        else
+                            dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
                         Log("hooks: EGSH fresh ForHwnd hr=%08X sc=%p", (unsigned)dhr, (void*)dummy);
-                        if (SUCCEEDED(dhr) && dummy && !Real_Present)
+                        if (SUCCEEDED(dhr) && dummy && IsReadablePtr(dummy, sizeof(void*)) && !Real_Present)
                             InstallSwapchainHooks((IDXGISwapChain*)dummy);
                         if (dummy) { dummy->Release(); dummy = nullptr; }
                         f4->Release();
