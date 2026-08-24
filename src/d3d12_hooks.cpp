@@ -3324,6 +3324,14 @@ void HooksRestoreDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT count,
 
 void HooksInstallCreateDeviceDetour()
 {
+    // P0#3 idempotency: raw byte patch must NEVER be applied twice (double
+    // patch = corrupted prologue = instant crash on first device creation).
+    static long s_installState = 0; // 0=NOT_INSTALLED 1=INSTALLED 2=FAILED
+    if (InterlockedCompareExchange(&s_installState, 0, 0) != 0) {
+        Log("hooks: CreateDevice detour already state=%ld - skipping re-install",
+            s_installState);
+        return;
+    }
     if (!g_cfgSet) {
         Log("hooks: install called before config - ignoring");
         return;
@@ -3331,11 +3339,13 @@ void HooksInstallCreateDeviceDetour()
     HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
     if (!d3d12) {
         Log("hooks: d3d12.dll not loaded yet - ScaleNG inactive");
+        InterlockedExchange(&s_installState, 2);
         return;
     }
     void* pCreateDevice = (void*)GetProcAddress(d3d12, "D3D12CreateDevice");
     if (!pCreateDevice) {
         Log("hooks: D3D12CreateDevice export not found - ScaleNG inactive");
+        InterlockedExchange(&s_installState, 2);
         return;
     }
     unsigned char pre[16] = {};
@@ -3345,17 +3355,21 @@ void HooksInstallCreateDeviceDetour()
         pre[8], pre[9], pre[10], pre[11], pre[12], pre[13], pre[14], pre[15]);
     if (MH_Initialize() != MH_OK) {
         Log("hooks: MinHook initialize failed - ScaleNG inactive");
+        InterlockedExchange(&s_installState, 2);
         return;
     }
     MH_STATUS st = MH_CreateHook(pCreateDevice, &Hook_D3D12CreateDevice, (void**)&Real_D3D12CreateDevice_Tramp);
     if (st != MH_OK) {
         Log("hooks: D3D12CreateDevice hook failed (%d) - ScaleNG inactive", (int)st);
+        InterlockedExchange(&s_installState, 2);
         return;
     }
     if (MH_EnableHook(pCreateDevice) != MH_OK) {
         Log("hooks: D3D12CreateDevice enable failed - ScaleNG inactive");
+        InterlockedExchange(&s_installState, 2);
         return;
     }
+    InterlockedExchange(&s_installState, 1);
     Log("hooks: D3D12CreateDevice detour installed");
 
     // DXGI factory detours to capture the swapchain for Present-time injection.
