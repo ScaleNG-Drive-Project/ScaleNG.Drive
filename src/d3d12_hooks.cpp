@@ -1747,6 +1747,18 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     D3D12_RESOURCE_STATES mvState = mit != g_resourceStates.end() ? mit->second : D3D12_RESOURCE_STATE_COMMON;
 
     if (doDlss) {
+        // P2#10: device health gates EVERYTHING - an adapter killed during
+        // load must not enter the bridge flow at all (barriers on a removed
+        // device = instant hard crash, observed 18:48).
+        if (doDlss && g_device) {
+            HRESULT drr = g_device->GetDeviceRemovedReason();
+            if (FAILED(drr)) {
+                static int s_flowDrrLogs = 0;
+                if (++s_flowDrrLogs <= 3)
+                    Log("hooks: DLAA flow skipped - device removed 0x%08X", (unsigned)drr);
+                doDlss = false;
+            }
+        }
         if (!g_bridgeReady || !g_gameColor || !g_gameDepth || !g_gameMv || !g_gameOut
             || !g_depthResource || !g_mvResource) {
             doDlss = false;
