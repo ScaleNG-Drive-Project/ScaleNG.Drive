@@ -384,7 +384,10 @@ void StoreTracked_Weak(ID3D12Resource** slot, ID3D12Resource* res)
     *slot = res;
 }
 
-void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
+// Thread-safety lock for g_copySrcCount (see comment at definition site below).
+static SRWLOCK g_copyMapLock = SRWLOCK_INIT;
+
+void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 {
     if (*slot == res) return;
     bool mvSlot = (slot == (ID3D12Resource**)&g_mvResource) || (slot == (ID3D12Resource**)&g_mvResourceAlt);
@@ -446,7 +449,7 @@ static volatile long g_bbFetchFails = 0;
 // ENGINE'S SUBMISSION THREADS. The std::map below was mutated unsynchronized
 // - concurrent inserts corrupt the heap and crash ANYWHERE later (driver,
 // engine, us). Every access takes this lock.
-static SRWLOCK g_copyMapLock = SRWLOCK_INIT;
+
 // Swapchains that repeatedly faulted during backbuffer fetch - never touch
 // these objects again (engine-guarded wrappers raise on our probes).
 void* g_badSc[4] = { nullptr, nullptr, nullptr, nullptr };
