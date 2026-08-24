@@ -154,9 +154,19 @@ extern "C" __declspec(dllexport) void InitializeASI()
     // STRICTLY once-only: UAL/loader calls this multiple times. Without this
     // guard, each call re-runs full init (log restart, hook re-install, etc).
     // Atomic once-only guard: thread-safe even if UAL calls from multiple threads
-    static volatile long s_asiState = 0; // 0=uninit 1=initializing 2=initialized
+    static volatile long s_asiState = 0; // 0=UNINITIALIZED 1=INITIALIZING 2=INITIALIZED 3=FAILED
     if (InterlockedCompareExchange(&s_asiState, 1, 0) != 0) return;
     LogInit();
+    // P0 item 1/4: identity telemetry - thread, process, module base. A second
+    // distinct base in the log proves a duplicate ASI copy is loaded.
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&InitializeASI), &self);
+        Log("init: tid=%lu pid=%lu asiBase=%p stateAddr=%p",
+            GetCurrentThreadId(), GetCurrentProcessId(), (void*)self, (void*)&s_asiState);
+    }
     RawLog("init: entered InitializeASI\n");
     __try {
         // Enable NGX core logging so the driver writes the real reject reason
@@ -184,5 +194,8 @@ extern "C" __declspec(dllexport) void InitializeASI()
         HooksInstallCreateDeviceDetour();
         Log("ScaleNG.asi initialization complete");
     } __except (SehFilter(GetExceptionCode(), GetExceptionInformation())) {
+        // P0 item 2: record the FAILED terminal state so a later call can
+        // distinguish "already done" from "died midway".
+        InterlockedExchange(&s_asiState, 3);
     }
 }
