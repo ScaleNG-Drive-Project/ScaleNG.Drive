@@ -50,6 +50,7 @@ set "RSP=%TEMP%\ScaleNG_build.rsp"
     echo "%SRC%vendor\minhook\src\trampoline.c"
     echo "%SRC%vendor\minhook\src\hde\hde64.c"
     echo user32.lib
+    echo /link /MAP:"%OUT%\ScaleNG.map" /MAPINFO:EXPORTS
     echo /Fe:"%OUT%\ScaleNG.dll"
 ) > "%RSP%"
 

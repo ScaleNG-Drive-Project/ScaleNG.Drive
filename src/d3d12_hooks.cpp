@@ -451,6 +451,12 @@ std::map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_resourceStates;
 
 UINT g_setHeapCount = 0;
 ID3D12DescriptorHeap* g_setHeaps[2] = { nullptr, nullptr };
+// Heap-state snapshot lock: engine threads WRITE this state on every
+// SetDescriptorHeaps while the Present-thread flow READS it to save/restore.
+// Unsynced tearing during rotation churn handed the restore path freed heap
+// pointers - the convicted killer of the 6s-class crashes (WER offsets
+// 0x9d5d..0x9e3d, all inside Hook_SetDescriptorHeaps).
+static SRWLOCK g_heapStateLock = SRWLOCK_INIT;
 
 typedef void (STDMETHODCALLTYPE* PFN_CreateRenderTargetView)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 typedef void (STDMETHODCALLTYPE* PFN_CreateShaderResourceView)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
@@ -3213,9 +3219,23 @@ void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
 void Hook_SetDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT numHeaps,
                              ID3D12DescriptorHeap* const* heaps)
 {
-    g_setHeapCount = numHeaps > 2 ? 2 : numHeaps;
-    for (UINT i = 0; i < g_setHeapCount; ++i)
-        g_setHeaps[i] = heaps[i];
+    __try {
+        if (heaps && numHeaps >= 1) {
+            UINT n = numHeaps > 2 ? 2 : numHeaps;
+            AcquireSRWLockExclusive(&g_heapStateLock);
+            g_setHeapCount = n;
+            for (UINT i = 0; i < n; ++i)
+                g_setHeaps[i] = heaps[i];
+            ReleaseSRWLockExclusive(&g_heapStateLock);
+        } else {
+            AcquireSRWLockExclusive(&g_heapStateLock);
+            g_setHeapCount = 0;
+            ReleaseSRWLockExclusive(&g_heapStateLock);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("hooks: SetDescriptorHeaps hook faulted (numHeaps=%u heaps=%p) - state skipped",
+            numHeaps, (void*)heaps);
+    }
     Real_SetDescriptorHeaps(list, numHeaps, heaps);
 }
 
@@ -3442,11 +3462,13 @@ void HooksSetConfig(const ScaleNgConfig& config)
 void HooksGetDescriptorHeaps(UINT* count, ID3D12DescriptorHeap** heaps)
 {
     if (!count) return;
+    AcquireSRWLockShared(&g_heapStateLock);
     *count = g_setHeapCount;
     if (heaps) {
         for (UINT i = 0; i < g_setHeapCount; ++i)
             heaps[i] = g_setHeaps[i];
     }
+    ReleaseSRWLockShared(&g_heapStateLock);
 }
 
 void HooksRestoreDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT count,
