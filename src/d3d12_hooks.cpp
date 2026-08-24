@@ -661,8 +661,18 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
     g_displayW = w;
     g_displayH = h;
     if (g_dlaaMode) {
-        g_renderW = w;
-        g_renderH = h;
+        // VISIBILITY MODE: honoring 'scale' inside DLAA renders the feature
+        // below display res and lets NGX upscale - an unmistakable visual.
+        // (DLAA purity is one keystroke away: set scale=1.0.)
+        if (g_cfg.renderScale > 0.05f && g_cfg.renderScale < 0.999f) {
+            g_renderW = (unsigned int)((float)w * g_cfg.renderScale);
+            g_renderH = (unsigned int)((float)h * g_cfg.renderScale);
+            Log("hooks: VISIBILITY MODE - render %ux%u -> display %ux%u (scale %.2f)",
+                g_renderW, g_renderH, w, h, g_cfg.renderScale);
+        } else {
+            g_renderW = w;
+            g_renderH = h;
+        }
     } else if (g_cfg.renderScale > 0.0f && g_cfg.renderScale < 1.0f) {
         g_renderW = (unsigned int)((float)g_displayW * g_cfg.renderScale);
         g_renderH = (unsigned int)((float)g_displayH * g_cfg.renderScale);
