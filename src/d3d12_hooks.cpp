@@ -1705,8 +1705,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         usedCachedBb = true;
         g_injStep = "bb-cached";
         D3D12_RESOURCE_DESC bbd = bb->GetDesc();
-        if ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)
-            AdoptDisplaySize((unsigned int)bbd.Width, (unsigned int)bbd.Height);
+        // TRUSTED SOURCE: RTV-captured backbuffer assigns display directly -
+        // going through AdoptDisplaySize's hysteresis lets competing callers
+        // reset the candidate forever, leaving display stuck at 0x0.
+        if ((unsigned int)bbd.Width >= 1000 && bbd.Height >= 700 &&
+            ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)) {
+            g_displayW = (unsigned int)bbd.Width;
+            g_displayH = (unsigned int)bbd.Height;
+            Log("hooks: display committed from cached backbuffer %ux%u", g_displayW, g_displayH);
+        }
     }
     if (!usedCachedBb) {
     // Blacklist: a swapchain that faulted repeatedly is skipped BY IDENTITY.
