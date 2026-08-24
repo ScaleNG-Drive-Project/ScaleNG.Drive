@@ -351,6 +351,7 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 static unsigned long long g_mvLastRtvKey = 0;
 // Rolling last-full-res-copy source - correlated with Present to name the
 // terminal scene node (the texture that feeds Present = DLAA input target).
+static unsigned g_lastNewChainFrame = 0;
 static void* g_topoLastSrc = nullptr;
 static unsigned g_topoLastFmt = 0;
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
@@ -1763,6 +1764,17 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                 doDlss = false;
             }
         }
+        // TOPOLOGY-QUIET GATE: a new display-sized node entering the copy
+        // chain means the render graph is still forming (load churn). The
+        // 6-7s crash class died mid-flow on textures that were being born/
+        // freed around us. Flow only after the chain has been stable 120f.
+        if (doDlss && g_frameCounter < g_lastNewChainFrame + 120) {
+            static int s_quietLogs = 0;
+            if (++s_quietLogs <= 3)
+                Log("hooks: DLAA flow held - chain churned %u frames ago",
+                    g_frameCounter - g_lastNewChainFrame);
+            doDlss = false;
+        }
         if (!g_bridgeReady || !g_gameColor || !g_gameDepth || !g_gameMv || !g_gameOut
             || !g_depthResource || !g_mvResource) {
             doDlss = false;
@@ -2887,7 +2899,8 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
         srcBox && dstX == 0 && dstY == 0) {
         long w = srcBox->right - srcBox->left;
         long h = srcBox->bottom - srcBox->top;
-        ++g_copySrcCount[(void*)src->pResource];
+        if (++g_copySrcCount[(void*)src->pResource] == 1)
+            g_lastNewChainFrame = g_frameCounter; // new node entered the chain
         bool isMvDst = (dst->pResource == g_mvResource || dst->pResource == g_mvResourceAlt);
         bool isSceneSrc = (src->pResource == g_sceneColor ||
                            (g_sceneColorAlt && src->pResource == g_sceneColorAlt));
