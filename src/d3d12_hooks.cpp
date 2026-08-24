@@ -349,6 +349,10 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 // adoption never refires and MV stays 'absent' all session. This key lets us
 // re-adopt the same texture from g_rtvMap once discovery is live again.
 static unsigned long long g_mvLastRtvKey = 0;
+// Rolling last-full-res-copy source - correlated with Present to name the
+// terminal scene node (the texture that feeds Present = DLAA input target).
+static void* g_topoLastSrc = nullptr;
+static unsigned g_topoLastFmt = 0;
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
 // is backgrounded and only renders the menu), patching the viewport to the render
 // size forever leaves the frame stretched/black and has been observed alongside
@@ -2100,9 +2104,16 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
                     }
                 }
             }
-if (sc != g_swapchain) {
+            if (sc != g_swapchain) {
                 g_swapchain = sc;
-                Log("hooks: present1 on real swapchain %p (format %d, GetDesc skipped - trapped)", (void*)sc, (int)g_bbFormat);
+                Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
+            }
+            // Terminal-node correlation: what the copy chain last wrote,
+            // sampled at Present. The recurring ptr here IS the DLAA input.
+            static unsigned s_presFeedCount = 0;
+            if (++s_presFeedCount % 60 == 1 && g_topoLastSrc) {
+                Log("present-feed: last full-res src %p fmt %u",
+                    g_topoLastSrc, g_topoLastFmt);
             }
             if (!g_inPresent) {
                 g_inPresent = true;
@@ -2902,6 +2913,8 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                         (unsigned)dd.Format, (void*)src->pResource, (void*)dst->pResource);
                 }
             }
+            g_topoLastSrc = src->pResource;
+            g_topoLastFmt = (unsigned)sd.Format;
             if (!isSceneSrc && sd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
                 sd.Format != s_lastUntrackedFmt) {
                 s_lastUntrackedFmt = sd.Format;
