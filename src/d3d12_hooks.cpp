@@ -2791,10 +2791,12 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
             Log("hooks: swapchain result %p guarded (code %08X)", (void*)sc, (unsigned)GetExceptionCode());
         }
         if (!svt) return hr;
-        if (InstallSwapchainHooks(sc)) {
+        if (InstallSwapchainHooks(sc))
             g_swapchain = sc;
-            // PRESENT-ADAPTER PROBE (once per session, guarded): the physical
-            // GPU behind the REAL swapchain - settles hybrid vs single.
+        // PRESENT-ADAPTER PROBE (once per session, guarded) - UNCONDITIONAL:
+        // it must fire even when InstallSwapchainHooks rejects the object,
+        // because hybrid-vs-single is the open architectural question.
+        {
             static long s_presAdapterProbed = 0;
             if (InterlockedCompareExchange(&s_presAdapterProbed, 1, 0) == 0) {
                 __try {
