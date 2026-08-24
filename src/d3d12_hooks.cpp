@@ -3477,22 +3477,18 @@ void HooksDumpDRED(const char* why)
         return;
     }
     D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
-    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)) && bc.pHeadBreadcrumbNode) {
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)) && bc.pHeadAutoBreadcrumbNode) {
         int dumped = 0;
-        for (auto n = bc.pHeadBreadcrumbNode; n && dumped < 8; n = n->pNext, ++dumped) {
+        for (auto n = bc.pHeadAutoBreadcrumbNode; n && dumped < 8; n = n->pNext, ++dumped) {
             unsigned lastOp = n->BreadcrumbCount ? (unsigned)n->pCommandHistory[n->BreadcrumbCount - 1] : 0;
-            Log("DRED[%s]: list '%s' ops=%u lastOp=%u context=%u",
+            Log("DRED[%s]: list '%ls' ops=%u lastOp=%u",
                 why,
-                n->pCommandListName ? n->pCommandListName : (n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?"),
-                (unsigned)n->BreadcrumbCount, lastOp,
-                n->BreadcrumbCount ? (unsigned)n->pLastStatus : 0xFFFFFFFFu);
+                n->pCommandListDebugNameW ? n->pCommandListDebugNameW
+                    : (n->pCommandListName ? n->pCommandListName : L"?"),
+                (unsigned)n->BreadcrumbCount, lastOp);
         }
     } else {
         Log("DRED[%s]: no breadcrumb nodes recorded", why);
-    }
-    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
-    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
-        Log("DRED[%s]: PAGE FAULT VA=0x%llX", why, (unsigned long long)pf.FaultingVA);
     }
     dred->Release();
 }
