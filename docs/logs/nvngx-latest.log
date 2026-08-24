@@ -1,0 +1,4 @@
+[2026-08-23 17:14:45] [NGXCheckArchitectureSupport:229] Found matching adapter with NVAPI physical GPU handle: 0x100 and LUID: { 0x0, 0xdbf9 }
+[2026-08-23 17:14:45] [NGXGetPathUsingQAI:475] Checking for path to NGX using QueryAdapterInfo
+[2026-08-23 17:14:45] [NGXGetPathUsingQAI:512] Path to driverStore found using QAI: C:\Windows\System32\DriverStore\FileRepository\nvlti.inf_amd64_af02d12a5c2283af
+[2026-08-23 17:14:45] [NGXIsUpdaterEnabledBase:621] OTA disabled by environment. Using embedded snippet only

@@ -1,6 +1,6 @@
 # ScaleNG.Drive — Full Project Documentation
 
-**Goal:** A from-scratch DLSS/FSR upscaler integration for BeamNG.drive (DX12, v0.39) as an ASI plugin, loaded through OptiScaler's built-in ASI loader. Personal use first; public release only at v2+.
+**Goal:** A from-scratch DLSS/FSR upscaler integration for BeamNG.drive (DX12, v0.39) as an ASI plugin, loaded through **UAL (Universal ASI Loader)**. Personal use first; public release only at v2+.
 
 **Constraints (user):** upscaling only — no frame generation; user has no coding background (agent writes code, user tests); NVIDIA RTX GPU; Visual Studio 2022 Community installed; no code is written until the user explicitly approves.
 
@@ -8,7 +8,7 @@
 
 ## 1. Why this project exists
 
-BeamNG.drive renders natively (no internal render-scale option), so DLSS/FSR cannot be enabled through the game. OptiScaler provides frame gen for unsupported games but cannot inject DLSS upscaling without the game cooperating. This plugin re-implements what the game lacks: internal render scale + DLSS upscale, injected via D3D12 API hooks.
+BeamNG.drive renders natively (no internal render-scale option), so DLSS/FSR cannot be enabled through the game. UAL (Universal ASI Loader) provides ASI plugin loading for unsupported games. This plugin re-implements what the game lacks: internal render scale + DLSS upscale, injected via D3D12 API hooks.
 
 ## 2. The verification work (what was found, and why it matters)
 
@@ -112,7 +112,7 @@ Pipeline position: DLSS runs **after the main scene (10911 RTV→SRV transition)
 
 ## 5. ASI plugin (current state: full DLSS integration implemented, in-game verification pending)
 
-- Loaded by OptiScaler's ASI loader. Deploy: `dxgi.dll` (OptiScaler) into BeamNG `Bin64`, `plugins` folder beside it, `LoadAsiPlugins=1`.
+- Loaded by UAL's ASI loader. Deploy: `ual.dll` (UAL) into BeamNG `Bin64`, `plugins` folder beside it, `UAL is installed`.
 - Exports `InitializeASI` (void) and `PatchResult` (bool).
 - Writes a timestamped log to `ScaleNG.log` beside the module.
 - Source in `src\` (main.cpp, camera_cb, d3d12_hooks, dlss_ngx, log.h, upscaler.h, build.bat, vendor\minhook + vendor\nvngx). Built with `src\build.bat` → `dist\ScaleNG.asi` + `dist\ScaleNG.ini`.
@@ -123,12 +123,12 @@ Pipeline position: DLSS runs **after the main scene (10911 RTV→SRV transition)
 ### `src/main.cpp` — ASI entry point
 - Loads `ScaleNG.ini` (next to the module), sets render scale / sharpness / perfQuality / mvJittered / autoExposure / appId, resolves `nvngx_dlss.dll` path next to the module.
 - `InitializeASI()` — LogInit, config load, installs hooks (`HooksInstallCreateDeviceDetour`).
-- `PatchResult()` — returns `false` (no OptiScaler patching requested).
+- `PatchResult()` — returns `false` (no UAL patching requested).
 - `DllMain` — no-op.
 
 ### `src/d3d12_hooks.h/.cpp` — hook core
-- MinHook setup; D3D12CreateDevice detour (chains through OptiScaler's Detours hook; inert+log on failure); device/queue/command-list vtable hooks (cmdlist slots 15/16/21/22/26/28/46, device 17/18/20, queue 10); resource discovery (scene color RTV, motion-vector RTV, depth candidates); frame state machine (frame-start on exposure pass, injection after velocity copy-back); camera CB + velocity CB patching on the upload ring; DLSS injection recording per frame.
-- Hooks deliberately avoid OptiScaler's slots (D3D12CreateDevice + device slots 8/16/19/21/23/25).
+- MinHook setup; D3D12CreateDevice detour (chains through UAL's Detours hook; inert+log on failure); device/queue/command-list vtable hooks (cmdlist slots 15/16/21/22/26/28/46, device 17/18/20, queue 10); resource discovery (scene color RTV, motion-vector RTV, depth candidates); frame state machine (frame-start on exposure pass, injection after velocity copy-back); camera CB + velocity CB patching on the upload ring; DLSS injection recording per frame.
+- Hooks deliberately avoid UAL's slots (D3D12CreateDevice + device slots 8/16/19/21/23/25).
 
 ### `src/camera_cb.h/.cpp` — camera constant buffer handling
 - Validation, jitter patch (`f[8]+=jx·f[11], f[9]+=jy·f[11]` on worldToScreenPos0@352/viewProj@496/prev@1184/@1248; `f[4]+=jx·f[7], f[5]+=jy·f[7]` on cameraToScreen@432), matrix inverse for velocity CB.
@@ -156,7 +156,7 @@ Pipeline position: DLSS runs **after the main scene (10911 RTV→SRV transition)
 
 ## 7. Design notes
 
-NVIDIA DLSS (render-scale upscaling only) for BeamNG.drive v0.39 DX12, injected as an ASI plugin through OptiScaler's ASI loader. Built and verified against the PIX GPU capture export, the shader bytecode (dxc -dumpbin) and the Windows SDK d3d12.h.
+NVIDIA DLSS (render-scale upscaling only) for BeamNG.drive v0.39 DX12, injected as an ASI plugin through UAL's ASI loader. Built and verified against the PIX GPU capture export, the shader bytecode (dxc -dumpbin) and the Windows SDK d3d12.h.
 
 ### 7.1 Verification results (from the implementation session)
 
@@ -250,9 +250,9 @@ created lazily on first injection, initial COMMON, kept in UAV when idle. Matche
 D3D12 has NO GetDescriptorHeaps API (verified against the SDK header - the method
 does not exist on any interface). Instead we hook SetDescriptorHeaps (cmdlist slot
 28) as a pass-through recorder and restore the engine's last-bound heaps after
-EvaluateFeature (NGX binds its own heaps). Note: CACHE.md lists OptiScaler's owned
+EvaluateFeature (NGX binds its own heaps). Note: CACHE.md lists UAL's owned
 hooks as D3D12CreateDevice + device slots 8/16/19/21/23/25 only; cmdlist slot 28 is
-not in that set. If OptiScaler ever also hooks slot 28, MinHook chains through it
+not in that set. If UAL ever also hooks slot 28, MinHook chains through it
 (both hooks run in sequence). Not restoring the engine's heaps would risk the next
 engine pass drawing with NGX's heap bound - worse failure mode.
 
@@ -278,7 +278,7 @@ engine pass drawing with NGX's heap bound - worse failure mode.
 copy whose dst is not the MV resource, the scene color or dlssOut is the depth
 candidate (this is the engine's per-frame 3051->10888 depth copy). A fallback
 candidate comes from full-res single-mip float SRV creation (device slot 18,
-allowed - not in OptiScaler's set).
+allowed - not in UAL's set).
 
 **7.2.10 Scene color and MV discovery**
 Device slot 20 (CreateRenderTargetView, allowed): the first full-res
@@ -287,11 +287,11 @@ patch only applies when that exact handle is bound via OMSetRenderTargets, and t
 post-injection exposure/bloom passes into 10911 therefore run UN-patched at full res);
 the first full-res R16G16_FLOAT RTV = the motion-vector resource (1920x992).
 
-**7.2.11 Coexistence with OptiScaler**
-OptiScaler (Detours) owns D3D12CreateDevice and device slots 8/16/19/21/23/25
+**7.2.11 Coexistence with UAL**
+UAL (Detours) owns D3D12CreateDevice and device slots 8/16/19/21/23/25
 (CACHE.md). We use only device 17/18/20, queue 10 and cmdlist 15/16/21/22/26/28/46.
 Our D3D12CreateDevice detour (MinHook) is installed on the ORIGINAL export; if
-OptiScaler's Detours hook is present, MinHook relocates the JMP and chains through it.
+UAL's Detours hook is present, MinHook relocates the JMP and chains through it.
 If installation fails at any point the plugin logs it and stays inert.
 
 **7.2.12 Fail-safe philosophy**
@@ -308,7 +308,7 @@ run (visual = engine default at full res).
 - Multi-camera/mirror setups write several camera CB variants per frame; all
   validated copies are patched uniformly (live-coefficient formulas), but a mirrored
   view under DLSS can show edge ghosting (jitter+reprojection on a mirrored camera).
-- If OptiScaler updates its hook set to include cmdlist slot 28, heap-restore still
+- If UAL updates its hook set to include cmdlist slot 28, heap-restore still
   works through MinHook chaining (both hooks pass through).
 - The game must run windowed at 1920x1080 for DLSS 1920x992 output to be displayed
   1:1 (the engine presents 1920x992 in a 1080p window).
@@ -322,9 +322,9 @@ Steps to check the plugin works, in order. Run the game windowed at 1920x1080 wi
 ### 8.1 Install
 
 1. Copy `dist\ScaleNG.asi` and `dist\ScaleNG.ini` into the game's `plugins\`
-   folder (the one OptiScaler's ASI loader scans; see next step).
-2. OptiScaler config: copy `User\OptiScaler.ini` from this repo next to the game's
-   `dxgi.dll` (Bin64). It already has `LoadAsiPlugins=true`, `Path=plugins`,
+   folder (the one UAL's ASI loader scans; see next step).
+2. UAL config: copy `User\UAL.ini` from this repo next to the game's
+   `ual.dll` (Bin64). It already has `LoadAsiPlugins=true`, `Path=plugins`,
    `EnableDlssInputs=false` (keeps NVNGX calls in ScaleNG's hands — see §7.2.11),
    menu enabled (Insert), file logging on (Info).
 2. Put a `nvngx_dlss.dll` (NVIDIA DLSS SDK) into the same `plugins\` folder. If the
@@ -377,9 +377,9 @@ copy the log and report it - the plugin stayed inert by design (no visual damage
 
 | Symptom | Cause / action |
 |---|---|
-| No ScaleNG.log | ASI not loaded - check OptiScaler `LoadAsiPlugins=1`, plugin folder, file name `ScaleNG.asi`. |
+| No ScaleNG.log | ASI not loaded - check UAL `UAL is installed`, plugin folder, file name `ScaleNG.asi`. |
 | Log stops at "detour installed" | No D3D12 device was created through the export while the hook was up (rare) - or MinHook failed (log says inactive). Check the last lines. |
-| `D3D12CreateDevice hook failed` | MinHook could not chain OptiScaler's hook. Report it - nothing else helps, the plugin refuses to run (safe). |
+| `D3D12CreateDevice hook failed` | MinHook could not chain UAL's hook. Report it - nothing else helps, the plugin refuses to run (safe). |
 | `DLSS: loaded` missing | `nvngx_dlss.dll` not found in plugins and no System32 nvngx.dll. Supply the DLL. |
 | `camera CB copy not validated` every frame | Validation is stricter than the engine's actual values - capture the log for analysis. |
 | `DLSS: CreateFeature failed, result=N` | NGX rejects the configuration - check the log for the result code. |
