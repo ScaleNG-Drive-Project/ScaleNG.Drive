@@ -215,12 +215,22 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
         d.Format = f; d.SampleDesc.Count = 1;
         d.Flags = fl | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        Log("bridge: mkShared %ux%u fmt=%u flags=%X - committed...", (unsigned)w, (unsigned)h,
+            (unsigned)f, (unsigned)d.Flags);
         if (FAILED(g_bridgeDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &d,
-                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(ours))))
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(ours)))) {
+            Log("bridge: mkShared CreateCommittedResource FAILED");
             return false;
-        if (FAILED(g_bridgeDev->CreateSharedHandle(*ours, nullptr, GENERIC_ALL, nullptr, hout)))
+        }
+        Log("bridge: mkShared resource ok %p - CreateSharedHandle...", (void*)*ours);
+        if (FAILED(g_bridgeDev->CreateSharedHandle(*ours, nullptr, GENERIC_ALL, nullptr, hout))) {
+            Log("bridge: mkShared CreateSharedHandle FAILED");
             return false;
-        return SUCCEEDED(gameDev->OpenSharedHandle(*hout, IID_PPV_ARGS(theirs)));
+        }
+        Log("bridge: mkShared handle ok - OpenSharedHandle on game device...");
+        HRESULT ohr = gameDev->OpenSharedHandle(*hout, IID_PPV_ARGS(theirs));
+        Log("bridge: mkShared OpenSharedHandle hr=0x%08X", (unsigned)ohr);
+        return SUCCEEDED(ohr);
     };
 
     bool ok = true;
