@@ -646,6 +646,15 @@ void EnsureUpscalerInit()
     // attempted; a later call will retry once it exists.
     extern ID3D12Device* g_bridgeDev;
     if (!g_bridgeDev) return;
+    // FULL NGX SEQUENCING (fix89 extension): nvngx/NVAPI *loading* also races
+    // load churn. The 00:00 run died with nvngx loaded at +5s pre-CreateFeature.
+    // No NVIDIA driver contact until the copy chain has been quiet 600 frames.
+    if (HooksGetQuietFrames() < 600) {
+        static int s_seqLogs = 0;
+        if (++s_seqLogs <= 5)
+            Log("hooks: NGX init deferred - chain quiet %uf/600f", HooksGetQuietFrames());
+        return; // not attempted; retried by later callers
+    }
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
         Log("hooks: upscaler creation failed");
