@@ -2887,6 +2887,21 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
             // A display-sized src we do NOT track means rotation happened and
             // our bridge color (fixed fmt) is now stale. Log once per format.
             static unsigned s_lastUntrackedFmt = 0;
+            // Topology mapping (one-shot, 20s window): log copy PAIRS to find
+            // the terminal scene node that actually reaches Present.
+            static ULONGLONG s_topoStart = 0;
+            static int s_topoLogs = 0;
+            if (s_topoLogs < 400) {
+                ULONGLONG tnow = GetTickCount64();
+                if (!s_topoStart) s_topoStart = tnow;
+                if (tnow - s_topoStart < 20000) {
+                    s_topoLogs++;
+                    D3D12_RESOURCE_DESC dd = dst->pResource ? dst->pResource->GetDesc() : sd;
+                    Log("topo: %ux%u f%u -> f%u (src %p dst %p)",
+                        (unsigned)sd.Width, (unsigned)sd.Height, (unsigned)sd.Format,
+                        (unsigned)dd.Format, (void*)src->pResource, (void*)dst->pResource);
+                }
+            }
             if (!isSceneSrc && sd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
                 sd.Format != s_lastUntrackedFmt) {
                 s_lastUntrackedFmt = sd.Format;
