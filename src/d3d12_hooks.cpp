@@ -2581,7 +2581,8 @@ void EnsureGlobalSwapchainHook()
                         // The trampoline IS the original function.
                         if (Real_CreateSwapChainForHwnd)
                             dhr = Real_CreateSwapChainForHwnd((IDXGIFactory2*)f4, dq,
-                                dummyWnd, &sd, nullptr, &dummy);
+                                dummyWnd, &sd, nullptr, nullptr,
+                                __uuidof(IDXGISwapChain1), (void**)&dummy);
                         else
                             dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
                         Log("hooks: EGSH fresh ForHwnd hr=%08X sc=%p", (unsigned)dhr, (void*)dummy);
