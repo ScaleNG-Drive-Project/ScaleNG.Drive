@@ -240,7 +240,14 @@ static bool EnsureBridge(unsigned W, unsigned H, DXGI_FORMAT fmt, ID3D12Device* 
     g_brDepthFmt = depthFmt; g_brDepthFmtSet = true;
     ok &= mkShared(&g_brMv, &g_hMv, &g_gameMv, W, H, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ok &= mkShared(&g_brOut, &g_hOut, &g_gameOut, W, H, fmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    if (!ok) { Log("bridge: shared resource creation failed"); return false; }
+    if (!ok) {
+        // Identify WHICH shared resource failed and why (cross-adapter
+        // OpenSharedHandle/CreateSharedHandle failures look exactly like this).
+        Log("bridge: shared resource creation failed (brColor=%p hColor=%p gameColor=%p brDepth=%p brMv=%p brOut=%p)",
+            (void*)g_brColor, (void*)g_hColor, (void*)g_gameColor,
+            (void*)g_brDepth, (void*)g_brMv, (void*)g_brOut);
+        return false;
+    }
 
     g_brW = W; g_brH = H; g_brFmt = fmt;
     g_bridgeReady = true;
@@ -2766,8 +2773,33 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
             Log("hooks: swapchain result %p guarded (code %08X)", (void*)sc, (unsigned)GetExceptionCode());
         }
         if (!svt) return hr;
-        if (InstallSwapchainHooks(sc))
+        if (InstallSwapchainHooks(sc)) {
             g_swapchain = sc;
+            // PRESENT-ADAPTER PROBE (once per session, guarded): the physical
+            // GPU behind the REAL swapchain - settles hybrid vs single.
+            static long s_presAdapterProbed = 0;
+            if (InterlockedCompareExchange(&s_presAdapterProbed, 1, 0) == 0) {
+                __try {
+                    IDXGIDevice* pdxgi = nullptr;
+                    if (SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice), (void**)&pdxgi))) {
+                        IDXGIAdapter* pad = nullptr;
+                        if (SUCCEEDED(pdxgi->GetAdapter(&pad))) {
+                            DXGI_ADAPTER_DESC pdesc = {};
+                            if (SUCCEEDED(pad->GetDesc(&pdesc)))
+                                Log("hooks: PRESENT adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
+                                    pdesc.VendorId, pdesc.Description,
+                                    (unsigned)pdesc.AdapterLuid.HighPart, (unsigned)pdesc.AdapterLuid.LowPart);
+                            pad->Release();
+                        }
+                        pdxgi->Release();
+                    } else {
+                        Log("hooks: PRESENT swapchain GetDevice failed");
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    Log("hooks: PRESENT adapter probe guarded");
+                }
+            }
+        }
         // Function-level hooks: the game may present through OptiScaler's
         // hijacked vtable which forwards to dxgi's Present function directly -
         // hook the function targets so presents are seen regardless of table.
