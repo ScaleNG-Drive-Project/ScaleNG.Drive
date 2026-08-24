@@ -1,6 +1,6 @@
  ScaleNG
 
- Timestamp is 6a8bf787 (Mon Aug 24 00:49:27 2026)
+ Timestamp is 6a8bfb37 (Mon Aug 24 01:05:11 2026)
 
  Preferred load address is 0000000180000000
 
@@ -782,7 +782,7 @@
  0002:000004d4       ??_C@_01LFCBOECM@?4@       00000001800294d4     main.obj
  0002:000004d8       ??_C@_02PBFOLPKM@?$FN?5@   00000001800294d8     main.obj
  0002:000004dc       ??_C@_03PKPBNCAL@?o?$LL?$LP@ 00000001800294dc     main.obj
- 0002:000004e0       ??_C@_08IOJAMHGC@00?349?324@ 00000001800294e0     main.obj
+ 0002:000004e0       ??_C@_08DEPCOPEG@01?305?307@ 00000001800294e0     main.obj
  0002:000004f0       ??_C@_0M@IACMCKP@Aug?524?52026@ 00000001800294f0     main.obj
  0002:00000500       ??_C@_0DK@NHNMMLBJ@ScaleNG?4asi?5log?5started?5?9?5build?5@ 0000000180029500     main.obj
  0002:0000053c       ??_C@_11LOCGONAA@@         000000018002953c     main.obj
@@ -3565,7 +3565,7 @@
  0003:00003414       ?candW@?1??AdoptDisplaySize@?A0x4dff0dd2@@YAXII@Z@4IA 000000018003d414     d3d12_hooks.obj
  0003:00003418       ?candH@?1??AdoptDisplaySize@?A0x4dff0dd2@@YAXII@Z@4IA 000000018003d418     d3d12_hooks.obj
  0003:0000341c       ?candStable@?1??AdoptDisplaySize@?A0x4dff0dd2@@YAXII@Z@4HA 000000018003d41c     d3d12_hooks.obj
- 0003:00003420       ?s_seqLogs@?8??EnsureUpscalerInit@?A0x4dff0dd2@@YAXXZ@4HA 000000018003d420     d3d12_hooks.obj
+ 0003:00003420       ?s_seqLogs@?4??EnsureUpscalerInit@?A0x4dff0dd2@@YAXXZ@4HA 000000018003d420     d3d12_hooks.obj
  0003:00003424       ?s_evalFailLogs@?P@??DoInjection@?A0x4dff0dd2@@YAXPEAUID3D12GraphicsCommandList@@@Z@4HA 000000018003d424     d3d12_hooks.obj
  0003:00003428       ?s_otherMvRtvs@?FH@??Hook_CreateRenderTargetView@?A0x4dff0dd2@@YAXPEAUID3D12Device@@PEAUID3D12Resource@@PEBUD3D12_RENDER_TARGET_VIEW_DESC@@UD3D12_CPU_DESCRIPTOR_HANDLE@@@Z@4HA 000000018003d428     d3d12_hooks.obj
  0003:0000342c       ?s_execCalls@?1??Hook_ExecuteCommandLists@?A0x4dff0dd2@@YAXPEAUID3D12CommandQueue@@IPEBQEAUID3D12CommandList@@@Z@4HA 000000018003d42c     d3d12_hooks.obj
