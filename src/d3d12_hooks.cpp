@@ -2916,6 +2916,30 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
             }
             g_topoLastSrc = src->pResource;
             g_topoLastFmt = (unsigned)sd.Format;
+            // TERMINAL PAIR ADOPTION: f10->f10 display-sized copies are the
+            // final ping-pong stage whose output feeds Present (proven by
+            // present-feed correlation). Track BOTH halves so the alternating
+            // last-written node is always a known, stamped resource.
+            if (!isSceneSrc &&
+                sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                dst->pResource && dst->pResource != src->pResource) {
+                D3D12_RESOURCE_DESC dd2 = dst->pResource->GetDesc();
+                if (dd2.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                    (unsigned)dd2.Width == g_displayW && dd2.Height == g_displayH &&
+                    (unsigned)sd.Width == g_displayW && sd.Height == g_displayH) {
+                    if (src->pResource != g_sceneColor && src->pResource != g_sceneColorAlt &&
+                        !g_sceneColorAlt) {
+                        StoreTracked(&g_sceneColorAlt, src->pResource);
+                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        Log("hooks: terminal pair node adopted as ALT %p (f10)", (void*)src->pResource);
+                    } else if (dst->pResource != g_sceneColor && dst->pResource != g_sceneColorAlt &&
+                        !g_sceneColorAlt) {
+                        StoreTracked(&g_sceneColorAlt, dst->pResource);
+                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        Log("hooks: terminal pair node adopted as ALT %p (f10 dst)", (void*)dst->pResource);
+                    }
+                }
+            }
             if (!isSceneSrc && sd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
                 sd.Format != s_lastUntrackedFmt) {
                 s_lastUntrackedFmt = sd.Format;
