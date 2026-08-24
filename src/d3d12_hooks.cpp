@@ -2927,16 +2927,32 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
                 if (dd2.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
                     (unsigned)dd2.Width == g_displayW && dd2.Height == g_displayH &&
                     (unsigned)sd.Width == g_displayW && sd.Height == g_displayH) {
-                    if (src->pResource != g_sceneColor && src->pResource != g_sceneColorAlt &&
-                        !g_sceneColorAlt) {
+                    bool srcIsTracked = (src->pResource == g_sceneColor || src->pResource == g_sceneColorAlt);
+                    bool dstIsTracked = (dst->pResource == g_sceneColor || dst->pResource == g_sceneColorAlt);
+                    // ALT slot may hold a stale non-pair texture from earlier
+                    // adoptions; a genuine f10 pair node has priority. Replace
+                    // it unless it already IS a pair half.
+                    bool altIsPairHalf = false;
+                    if (g_sceneColorAlt) {
+                        D3D12_RESOURCE_DESC ad = g_sceneColorAlt->GetDesc();
+                        altIsPairHalf = (ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                    }
+                    if (!srcIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, src->pResource);
                         g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair node adopted as ALT %p (f10)", (void*)src->pResource);
-                    } else if (dst->pResource != g_sceneColor && dst->pResource != g_sceneColorAlt &&
-                        !g_sceneColorAlt) {
+                    } else if (!dstIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, dst->pResource);
                         g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair node adopted as ALT %p (f10 dst)", (void*)dst->pResource);
+                    } else if (!altIsPairHalf && g_sceneColorAlt &&
+                               g_sceneColorAlt != src->pResource && g_sceneColorAlt != dst->pResource) {
+                        ID3D12Resource* oldAlt = g_sceneColorAlt;
+                        (void)oldAlt;
+                        ID3D12Resource* cand = srcIsTracked ? dst->pResource : src->pResource;
+                        StoreTracked(&g_sceneColorAlt, cand);
+                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        Log("hooks: terminal pair REPLACED non-pair ALT -> %p (f10)", (void*)cand);
                     }
                 }
             }
