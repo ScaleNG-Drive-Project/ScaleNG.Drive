@@ -35,7 +35,7 @@ if errorlevel 1 (
 set "RSP=%TEMP%\ScaleNG_build.rsp"
 
 (
-    echo /nologo /O2 /EHa /std:c++17 /LD /MT /D_CRT_SECURE_NO_WARNINGS
+    echo /nologo /O2 /EHa /std:c++17 /LD /MT /Zi /D_CRT_SECURE_NO_WARNINGS
     echo /Fo"%OBJDIR%/"
     echo /I"%SRC%"
     echo /I"%SRC%vendor\minhook\include"
@@ -50,7 +50,7 @@ set "RSP=%TEMP%\ScaleNG_build.rsp"
     echo "%SRC%vendor\minhook\src\trampoline.c"
     echo "%SRC%vendor\minhook\src\hde\hde64.c"
     echo user32.lib
-    echo /link /MAP:"%OUT%\ScaleNG.map" /MAPINFO:EXPORTS
+    echo /link /MAP:"%OUT%\ScaleNG.map" /MAPINFO:EXPORTS /MAPINFO:LINES /DEBUG
     echo /Fe:"%OUT%\ScaleNG.dll"
 ) > "%RSP%"
 
