@@ -3481,10 +3481,10 @@ void HooksDumpDRED(const char* why)
         int dumped = 0;
         for (auto n = bc.pHeadAutoBreadcrumbNode; n && dumped < 8; n = n->pNext, ++dumped) {
             unsigned lastOp = n->BreadcrumbCount ? (unsigned)n->pCommandHistory[n->BreadcrumbCount - 1] : 0;
-            Log("DRED[%s]: list '%ls' ops=%u lastOp=%u",
+            Log("DRED[%s]: list '%ls' q '%ls' ops=%u lastOp=%u",
                 why,
-                n->pCommandListDebugNameW ? n->pCommandListDebugNameW
-                    : (n->pCommandListName ? n->pCommandListName : L"?"),
+                n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"?",
+                n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?",
                 (unsigned)n->BreadcrumbCount, lastOp);
         }
     } else {
