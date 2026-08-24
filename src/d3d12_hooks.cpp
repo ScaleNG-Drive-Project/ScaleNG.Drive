@@ -1731,7 +1731,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // Bridge device + shared textures: SAFE during load (every stable run
     // built it there; late builds hit DEVICE_REMOVED under render load).
     if (g_dlaaMode) {
-        if (!EnsureBridge((unsigned int)bbd.Width, (unsigned int)bbd.Height, bbd.Format, g_device)) {
+        if (!EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device)) {
             static int s_brFail = 0;
             if (++s_brFail <= 3) Log("hooks: bridge unavailable - DLAA disabled this session");
         }
