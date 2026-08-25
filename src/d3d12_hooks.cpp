@@ -1695,8 +1695,11 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // touching the backbuffer while the engine slams loading frames is how we
     // crashed inside map loads.
     unsigned int fc = g_frameCounter;
-    bool gameplayActive = g_lastCamPatchFrame != 0 &&
-        fc >= g_lastCamPatchFrame && (fc - g_lastCamPatchFrame) < 120;
+    // Gameplay detection: camera patch OR discovery-based (works with jitter off).
+    // If we have scene+MV discovered and display committed, we ARE in gameplay.
+    bool gameplayActive = (g_lastCamPatchFrame != 0 &&
+        fc >= g_lastCamPatchFrame && (fc - g_lastCamPatchFrame) < 120) ||
+        (g_sceneColorValid && g_displayW > 0);
     static bool s_wasActive = false;
     if (!gameplayActive) {
         if (s_wasActive)
