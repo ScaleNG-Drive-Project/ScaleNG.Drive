@@ -781,14 +781,9 @@ void EnsureUpscalerInit()
     // NOTE: must run BEFORE the atomic 'attempted' mark below - deferring is
     // not attempting, and the flag would otherwise block all retries forever
     // (seen live: exactly one defer line, then init never re-ran).
-    // SINGLE-DEVICE: reduced sequencing requirement since no second device.
-    // Still need some stability before NGX touches the driver.
-    if (HooksGetQuietFrames() < 120) {
-        static int s_seqLogs = 0;
-        if (++s_seqLogs <= 5)
-            Log("hooks: NGX init deferred - chain quiet %uf/120f", HooksGetQuietFrames());
-        return; // retried by later callers
-    }
+    // SINGLE-DEVICE: no quiet gate needed - no second device to protect against.
+    // NGX touches only the game's own device, same as any other D3D12 call.
+    // (Old 600f/120f gates were for cross-device bridge protection.)
     // Atomic: only one thread may attempt NGX init
     if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
     // SINGLE-DEVICE ARCHITECTURE: abandon bridge. Use game's device directly.

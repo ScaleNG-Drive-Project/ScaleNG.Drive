@@ -222,11 +222,12 @@ extern "C" __declspec(dllexport) void InitializeASI()
         // A deferred thread then runs a synthetic NGX smoke test on that device.
         {
             Log("init: spawning deferred NGX smoke test thread");
-            HANDLE hThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                        HANDLE hThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
                 Sleep(8000); // wait for game to create device and start rendering
                 Log("SMOKE: deferred test firing now");
                 extern void RunNgxSyntheticTest();
                 RunNgxSyntheticTest();
+                Log("SMOKE: test complete");
                 return 0;
             }, nullptr, 0, nullptr);
             if (hThread) CloseHandle(hThread);
