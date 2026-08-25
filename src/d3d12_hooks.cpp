@@ -4173,6 +4173,10 @@ void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHookImpl(); }
 
 void RunNgxSyntheticTest()
 {
+    // ONE-SHOT GUARD: only run once per session
+    static volatile long s_smokeRan = 0;
+    if (InterlockedCompareExchange(&s_smokeRan, 1, 0) != 0) return;
+
     Log("SMOKE: starting synthetic NGX test");
 
     if (!g_device) {

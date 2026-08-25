@@ -316,15 +316,10 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     if (!cmdList)
         return false;
 
-    // NGX INIT SEQUENCING: NVAPI/nvngx init racing the engine's load churn
-    // TDRs the adapter (smoking gun: deaths 2-7s after nvngx load across
-    // sessions). Init only after 10s of copy-chain stability.
-    if (HooksGetQuietFrames() < 600) {
-        static int s_seqLogs = 0;
-        if (++s_seqLogs <= 5)
-            Log("DLSS: CreateFeature deferred - chain quiet %uf/600f", HooksGetQuietFrames());
-        return false;
-    }
+    // NGX INIT SEQUENCING: removed for single-device architecture.
+    // Old gate was for cross-device bridge protection (concurrent submission
+    // crashed driver). Single-device NGX on game's own device is safe to run
+    // immediately - same device, same queue context as the rest of the engine.
     // Throttle: a failing CreateFeature burns GPU time and may leak internal
     // state. Retry at most once per second.
     static DWORD s_lastFailTick = 0;
