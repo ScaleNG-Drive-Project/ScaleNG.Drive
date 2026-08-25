@@ -1899,6 +1899,22 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 
     g_injStep = "gate";
     if (g_passiveMode) return;
+
+    // SELF-CONTAINED NGX PIPELINE: runs UNCONDITIONALLY.
+    // Gets everything from swapchain internally. No other hooks needed.
+    if (g_dlaaMode && g_swapchain && !g_ngxPipelineReady) {
+        Log("ngx-pipe: first Present - starting self-contained pipeline");
+    }
+    if (g_dlaaMode && g_swapchain) {
+        __try {
+            NgxSelfContainedPipeline(g_swapchain, nullptr, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static int s_ngxStorm = 0;
+            if (++s_ngxStorm <= 5)
+                Log("ngx-pipe: guarded fault");
+        }
+        return; // self-contained pipeline handles everything
+    }
     unsigned int fc = g_frameCounter;
     bool gameplayActive = (g_lastCamPatchFrame != 0 &&
         fc >= g_lastCamPatchFrame && (fc - g_lastCamPatchFrame) < 120) ||
