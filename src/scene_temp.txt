@@ -1,7 +1,0 @@
-ID3D12Resource* SceneColorBound()
-{
-    if (!g_sceneColorValid) return nullptr;
-    if (g_boundRtv.ptr == g_sceneColorRtv.ptr) return g_sceneColor;
-    if (g_sceneColorAlt && g_boundRtv.ptr == g_sceneColorRtvAlt.ptr) return g_sceneColorAlt;
-    return nullptr;
-}

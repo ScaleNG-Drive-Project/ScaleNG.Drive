@@ -1,8 +1,0 @@
-void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
-                          const D3D12_RESOURCE_BARRIER* pBarriers)
-{
-    // PASSTHROUGH MODE: disable all tracking for stability testing
-    if (true) {
-        return Real_ResourceBarrier(list, numBarriers, pBarriers);
-    }
-}
