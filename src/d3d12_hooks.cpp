@@ -786,38 +786,65 @@ void EnsureUpscalerInit()
     // (Old 600f/120f gates were for cross-device bridge protection.)
     // Atomic: only one thread may attempt NGX init
     if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
-    // SINGLE-DEVICE ARCHITECTURE: abandon bridge. Use game's device directly.
-    // The old assumption was that NGX needs IDXGIDevice (which the wrapper
-    // blocks). But we never actually TESTED NGX on the wrapped device - we
-    // assumed failure. Test it now.
-    if (!g_device) return;
-    Log("hooks: SINGLE-DEVICE - attempting NGX init on game device %p", (void*)g_device);
-    // Log adapter info if QI succeeds (diagnostic only, not a gate)
-    {
-        IDXGIDevice* dxgidev = nullptr;
-        HRESULT qhr = g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev);
-        Log("hooks: SINGLE-DEVICE QI(IDXGIDevice) hr=0x%08X", (unsigned)qhr);
-        if (SUCCEEDED(qhr)) {
-            IDXGIAdapter* ad = nullptr;
-            if (SUCCEEDED(dxgidev->GetAdapter(&ad))) {
-                DXGI_ADAPTER_DESC adesc = {};
-                if (SUCCEEDED(ad->GetDesc(&adesc)))
-                    Log("hooks: SINGLE-DEVICE adapter VendorId=0x%04X '%ls'",
-                        adesc.VendorId, adesc.Description);
-                ad->Release();
-            }
-            dxgidev->Release();
-        } else {
-            Log("hooks: SINGLE-DEVICE wrapper blocks IDXGIDevice - proceeding anyway");
-        }
+    // SINGLE-DEVICE: use the GAME's REAL device (unwrapped from BeamNG's wrapper)
+    if (!g_device) {
+        static int s_nodevLogs = 0;
+        if (++s_nodevLogs <= 3)
+            Log("hooks: NGX init deferred - no device captured yet");
+        return; // retried by later callers
     }
+
+    // DEVICE UNWRAP: scan wrapper object's memory for embedded real ID3D12Device.
+    // All ID3D12Device instances share one class vtable. If we find an embedded
+    // pointer whose target has that same vtable → that's the real device.
+    static ID3D12Device* s_realDev = nullptr;
+    if (!s_realDev) {
+        __try {
+            typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+            HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
+            auto mkTest = d3d12Mod ? (PFN_D3D12Create)GetProcAddress(d3d12Mod, "D3D12CreateDevice") : nullptr;
+            if (mkTest) {
+                ID3D12Device* testDev = nullptr;
+                if (SUCCEEDED(mkTest(nullptr, D3D_FEATURE_LEVEL_11_0,
+                    __uuidof(ID3D12Device), (void**)&testDev)) && testDev) {
+                    void* realVt = *(void**)testDev;
+                    Log("UNWRAP: real D3D12 vtable=%p", realVt);
+                    testDev->Release();
+
+                    // Scan wrapper memory
+                    void** mem = (void**)g_device;
+                    for (int off = 0; off < 64; ++off) {
+                        void* cand = mem[off];
+                        if (!cand || !IsReadablePtr(cand, sizeof(void*))) continue;
+                        void* cvt = *(void**)cand;
+                        if (cvt != realVt) continue;
+                        // Found! Verify alive
+                        auto cdev = (ID3D12Device*)cand;
+                        __try {
+                            if (SUCCEEDED(cdev->GetDeviceRemovedReason())) {
+                                s_realDev = cdev;
+                                Log("UNWRAP: FOUND REAL DEVICE at wrapper+0x%X ptr=%p",
+                                    off * 8, (void*)s_realDev);
+                                break;
+                            }
+                        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+
+    // Use unwrapped device for NGX if available, else fall back to wrapper
+    ID3D12Device* ngxDevice = s_realDev ? s_realDev : g_device;
+    Log("hooks: SINGLE-DEVICE - NGX init on %s device %p",
+        s_realDev ? "UNWRAPPED" : "wrapper", (void*)ngxDevice);
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
         Log("hooks: upscaler creation failed");
         return;
     }
     UpscalerInitParams ip = {};
-    ip.device = g_device;  // GAME'S DEVICE, not bridge
+    ip.device = ngxDevice;  // UNWRAPPED device if available
     ip.renderWidth = g_renderW;
     ip.renderHeight = g_renderH;
     ip.displayWidth = g_displayW;
@@ -4301,8 +4328,7 @@ void RunNgxSyntheticTest()
     bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(4, bars);
 
-    // Bind CBV/SRV/UAV descriptor heap — NGX DLSS internally issues compute
-    // dispatches that need descriptors. Without this, FAIL_PlatformError.
+    // Bind descriptor heaps — NGX DLSS compute shaders need CBV/SRV/UAV access
     {
         static ID3D12DescriptorHeap* ngxHeap = nullptr;
         if (!ngxHeap) {
@@ -4319,6 +4345,7 @@ void RunNgxSyntheticTest()
         }
     }
 
+    Log("SMOKE: calling Evaluate via wrapper...");
     UpscalerEvaluateParams ep = {};
     ep.commandList = list;
     ep.color = color;
@@ -4326,7 +4353,7 @@ void RunNgxSyntheticTest()
     ep.motionVectors = mv;
     ep.output = out;
     ep.jitterX = 0.0f; ep.jitterY = 0.0f;
-    ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
+    ep.mvScaleX = 1.0f; ep.mvScaleY = 1.0f;  // pixel-space MVs
     ep.sharpness = 0.0f;
     bool evalOk = g_upscaler->Evaluate(ep);
     Log("SMOKE: NGX Evaluate %s", evalOk ? "SUCCESS" : "FAILED");
@@ -4360,6 +4387,81 @@ void RunNgxSyntheticTest()
     if (list) list->Release();
     if (alloc) alloc->Release();
     if (queue) queue->Release();
+}
+
+// ============================================================================
+// DEVICE UNWRAPPER: extracts the real ID3D12Device* from inside BeamNG's
+// wrapper object by scanning for embedded objects sharing the known D3D12
+// vtable. All ID3D12Device instances share one class vtable, so any pointer
+// whose first 8 bytes match that vtable IS a real device.
+// ============================================================================
+
+static ID3D12Device* g_realDevice = nullptr; // unwrapped device (if found)
+
+static void UnwrapBeamNGDevice(ID3D12Device* wrapper)
+{
+    if (!wrapper || g_realDevice) return;
+
+    // Step 1: Create a temporary D3D12 device to discover the REAL vtable.
+    // We use the export directly to bypass all hooks/wrappers.
+    typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+    HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
+    if (!d3d12) { Log("UNWRAP: no d3d12.dll"); return; }
+    auto mkDev = (HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**))
+        GetProcAddress(d3d12, "D3D12CreateDevice");
+    if (!mkDev) { Log("UNWRAP: no D3D12CreateDevice export"); return; }
+
+    ID3D12Device* testDev = nullptr;
+    HRESULT hr = mkDev(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&testDev);
+    if (FAILED(hr) || !testDev) {
+        Log("UNWRAP: temp device create failed hr=0x%08X", (unsigned)hr);
+        return;
+    }
+
+    // Read the REAL ID3D12Device vtable address from our clean device
+    void* realVt = *(void**)testDev;
+    Log("UNWRAP: real ID3D12Device vtable = %p", realVt);
+    testDev->Release();
+
+    // Step 2: Scan the wrapper object's memory for pointers to objects
+    //         that share this vtable. The first match is the real device.
+    void** wrapperMem = (void**)wrapper;
+    constexpr int SCAN_DWORDS = 64; // scan first 512 bytes
+
+    for (int off = 0; off < SCAN_DWORDS; ++off) {
+        void* candidate = wrapperMem[off];
+        if (!candidate) continue;
+        if (!IsReadablePtr(candidate, sizeof(void*))) continue;
+
+        void* candVt = *(void**)candidate;
+        if (candVt != realVt) continue;
+
+        // Found an object with the real D3D12Device vtable!
+        // Verify it's alive by calling GetDeviceRemovedReason
+        auto candidate_dev = (ID3D12Device*)candidate;
+        __try {
+            HRESULT drr = candidate_dev->GetDeviceRemovedReason();
+            if (SUCCEEDED(drr)) {
+                g_realDevice = candidate_dev;
+                Log("UNWRAP: FOUND REAL DEVICE at wrapper+0x%X → %p",
+                    off * 8, (void*)g_realDevice);
+                return;
+            } else {
+                Log("UNWRAP: wrapper+%d has matching vtable but devRemoved=0x%08X",
+                    off * 8, (unsigned)drr);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("UNWRAP: wrapper+%d faulted on probe - skipping", off * 8);
+        }
+    }
+    Log("UNWRAP: no matching vtable found in %d dwords of wrapper object", SCAN_DWORDS);
+}
+
+ID3D12Device* GetRealDevice()
+{
+    if (g_realDevice) return g_realDevice;
+    if (g_device) UnwrapBeamNGDevice(g_device);
+    return g_realDevice ? g_realDevice : g_device;
 }
 
 void HooksSetConfig(const ScaleNgConfig& config)
