@@ -191,8 +191,10 @@ extern "C" __declspec(dllexport) void InitializeASI()
     __try {
         // Enable NGX core logging so the driver writes the real reject reason
         // for EvaluateFeature into C:\ProgramData\NVIDIA\NGX\models\nvngx.log.
+        // Enable NGX core logging + ALLOW model downloads.
+        // __NGX_DISABLE_UPDATER was preventing NGX from downloading its DLSS
+        // shader models -> NGXLoadFromPath failed x18 -> Evaluate PlatformError.
         SetEnvironmentVariableW(L"__NGX_LOG_LEVEL", L"3");
-        SetEnvironmentVariableW(L"__NGX_DISABLE_UPDATER", L"1");
         wchar_t exePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         Log("process: %ls", exePath);
