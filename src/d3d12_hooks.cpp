@@ -1705,18 +1705,183 @@ void TryDeferredInject(ID3D12CommandQueue* injQueue)
     InjectAtPresentImpl(injQueue);
 }
 
+// ============================================================================
+// SELF-CONTAINED NGX PIPELINE
+// Everything created lazily on first successful Present. No hooks needed
+// except Present itself. No bridge, no shared textures, no cross-device.
+// ============================================================================
+
+static ID3D12Resource* g_ngxColor = nullptr;     // our color input (copy of bb)
+static ID3D12Resource* g_ngxDepth = nullptr;     // our depth (zeros = autoexposure)
+static ID3D12Resource* g_ngxMv = nullptr;        // our MV (zeros = static frame)
+static ID3D12Resource* g_ngxOut = nullptr;       // NGX output
+static ID3D12CommandAllocator* g_ngxAlloc = nullptr;
+static ID3D12GraphicsCommandList* g_ngxList = nullptr;
+static bool g_ngxPipelineReady = false;
+static unsigned g_ngxFrameCount = 0;
+
+static void CreateNgxTextures(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt)
+{
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+
+    // Color: same format as backbuffer + UAV for NGX output
+    rd.Format = fmt;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_ngxColor));
+
+    // Depth: R32_FLOAT
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        nullptr, IID_PPV_ARGS(&g_ngxDepth));
+
+    // MV: R16G16_FLOAT
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        nullptr, IID_PPV_ARGS(&g_ngxMv));
+
+    // Output: same as color but UAV-only
+    rd.Format = fmt;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_ngxOut));
+
+    Log("ngx-pipe: textures created %ux%u (color=%p depth=%p mv=%p out=%p)",
+        w, h, (void*)g_ngxColor, (void*)g_ngxDepth, (void*)g_ngxMv, (void*)g_ngxOut);
+}
+
+static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandList* cmdList,
+                                      ID3D12CommandQueue* queue)
+{
+    if (!g_device || !g_swapchain) return;
+
+    // Get backbuffer
+    ID3D12Resource* bb = nullptr;
+    if (FAILED(g_swapchain->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return;
+
+    D3D12_RESOURCE_DESC bbd = bb->GetDesc();
+    UINT w = (UINT)bbd.Width, h = (UINT)bbd.Height;
+
+    // Lazy-create everything on first valid frame
+    if (!g_ngxPipelineReady) {
+        if (!g_upscaler) {
+            EnsureUpscalerInit();
+            if (!g_upscaler || !g_upscaler->IsReady()) { bb->Release(); return; }
+        }
+        CreateNgxTextures(g_device, w, h, bbd.Format);
+        g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_ngxAlloc));
+        g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_ngxAlloc, nullptr,
+                                    IID_PPV_ARGS(&g_ngxList));
+        g_ngxList->Close();
+        g_ngxPipelineReady = true;
+        Log("ngx-pipe: pipeline ready");
+    }
+
+    if (!g_ngxColor || !g_ngxDepth || !g_ngxMv || !g_ngxOut) { bb->Release(); return; }
+
+    ++g_ngxFrameCount;
+    if (g_ngxFrameCount < 30 || (g_ngxFrameCount % 300) == 0)
+        Log("ngx-pipe: frame %u evaluating", g_ngxFrameCount);
+
+    // Reset and record NGX work
+    g_ngxList->Reset(g_ngxAlloc, nullptr);
+
+    // Transition backbuffer → COPY_SOURCE
+    D3D12_RESOURCE_BARRIER bar = {};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = bb;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_ngxList->ResourceBarrier(1, &bar);
+
+    // Copy backbuffer → our color texture
+    D3D12_TEXTURE_COPY_LOCATION cdst = {}; cdst.pResource = g_ngxColor; cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION csrc = {}; csrc.pResource = bb; csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g_ngxList->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
+
+    // Transition backbuffer → PRESENT (restore)
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g_ngxList->ResourceBarrier(1, &bar);
+
+    // Barrier NGX inputs to readable states
+    D3D12_RESOURCE_BARRIER ib[3] = {};
+    for (int i = 0; i < 3; ++i) { ib[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; ib[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+    ib[0].Transition.pResource = g_ngxColor;
+    ib[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    ib[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ib[1].Transition.pResource = g_ngxDepth;
+    ib[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    ib[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ib[2].Transition.pResource = g_ngxMv;
+    ib[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    ib[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    g_ngxList->ResourceBarrier(3, ib);
+
+    // NGX Evaluate
+    UpscalerEvaluateParams ep = {};
+    ep.commandList = g_ngxList;
+    ep.color = g_ngxColor;
+    ep.depth = g_ngxDepth;
+    ep.motionVectors = g_ngxMv;
+    ep.output = g_ngxOut;
+    ep.jitterX = 0.0f; ep.jitterY = 0.0f;
+    ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
+    ep.sharpness = g_cfg.sharpness;
+    bool ok = g_upscaler->Evaluate(ep);
+    if (!ok && g_ngxFrameCount <= 5)
+        Log("ngx-pipe: Evaluate FAILED at frame %u", g_ngxFrameCount);
+
+    // Barrier output + color to COPY_SOURCE
+    D3D12_RESOURCE_BARRIER ob[2] = {};
+    for (int i = 0; i < 2; ++i) { ob[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; ob[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+    ob[0].Transition.pResource = g_ngxOut;
+    ob[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ob[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ob[1].Transition.pResource = bb;
+    ob[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    ob[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g_ngxList->ResourceBarrier(2, ob);
+
+    // Copy NGX output → backbuffer
+    D3D12_TEXTURE_COPY_LOCATION odst = {}; odst.pResource = bb; odst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION osrc = {}; osrc.pResource = g_ngxOut; osrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g_ngxList->CopyTextureRegion(&odst, 0, 0, 0, &osrc, nullptr);
+
+    // Restore backbuffer → PRESENT
+    D3D12_RESOURCE_BARRIER rbar = {};
+    rbar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    rbar.Transition.pResource = bb;
+    rbar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    rbar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    rbar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_ngxList->ResourceBarrier(1, &rbar);
+
+    g_ngxList->Close();
+
+    // Submit on game queue
+    ID3D12CommandList* cls[] = { g_ngxList };
+    queue->ExecuteCommandLists(1, cls);
+
+    bb->Release();
+}
+
+// ============================================================================
+
 void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 {
     if (injQueue) g_graphicsQueue = injQueue;
 
     g_injStep = "gate";
     if (g_passiveMode) return;
-    // All our present-time activity (HUD draw, NGX eval) is suppressed there -
-    // touching the backbuffer while the engine slams loading frames is how we
-    // crashed inside map loads.
     unsigned int fc = g_frameCounter;
-    // Gameplay detection: camera patch OR discovery-based (works with jitter off).
-    // If we have scene+MV discovered and display committed, we ARE in gameplay.
     bool gameplayActive = (g_lastCamPatchFrame != 0 &&
         fc >= g_lastCamPatchFrame && (fc - g_lastCamPatchFrame) < 120) ||
         (g_sceneColorValid && g_displayW > 0);
@@ -1730,6 +1895,32 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     if (!s_wasActive) {
         Log("hooks: gameplay active - resuming present-time activity");
         s_wasActive = true;
+    }
+
+    // SELF-CONTAINED NGX PIPELINE: bypasses ALL legacy architecture.
+    // No bridge, no shared resources, no cross-device anything.
+    // Just NGX on game device + backbuffer copy in/out.
+    if (g_dlaaMode && g_swapchain && g_graphicsQueue && g_device) {
+        __try {
+            // Get backbuffer for pipeline
+            IDXGISwapChain3* sc3 = nullptr;
+            if (SUCCEEDED(g_swapchain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
+                UINT idx = sc3->GetCurrentBackBufferIndex();
+                ID3D12Resource* bb = nullptr;
+                __try {
+                    if (SUCCEEDED(sc3->GetBuffer(idx, IID_PPV_ARGS(&bb))) && bb) {
+                        bb->Release(); // NgxSelfContainedPipeline re-fetches via GetBuffer(0)
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                sc3->Release();
+            }
+            NgxSelfContainedPipeline(g_swapchain, nullptr, g_graphicsQueue);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static int s_ngxStorm = 0;
+            if (++s_ngxStorm <= 5)
+                Log("ngx-pipe: guarded fault at frame %u", fc);
+        }
+        return; // self-contained pipeline handles everything
     }
 
     // Delayed init: require 300 stable gameplay frames after load completes.
