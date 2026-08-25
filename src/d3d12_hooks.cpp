@@ -4297,12 +4297,19 @@ void RunNgxSyntheticTest()
     ep.mvScaleX=(float)w; ep.mvScaleY=(float)h;
     ep.sharpness=0.0f;
     // CONTINUOUS EVALUATION: 100 iterations proving sustained NGX operation.
-    int pass = 0, fail = 0;
+    int pass = 0, fail = 0, evalFails = 0;
     ID3D12Fence* fence = nullptr;
     ngxDev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
     HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
 
     for (int iter = 0; iter < 100; ++iter) {
+        // Device health check EVERY iteration - abort immediately on removal
+        HRESULT drr = ngxDev->GetDeviceRemovedReason();
+        if (FAILED(drr)) {
+            Log("SMOKE: iter %d DEVICE REMOVED hr=0x%08X - aborting", iter, (unsigned)drr);
+            break;
+        }
+
         cl->Reset(al, nullptr);
 
         D3D12_RESOURCE_BARRIER bars[4] = {};
@@ -4342,6 +4349,20 @@ void RunNgxSyntheticTest()
 
         if (wr == WAIT_OBJECT_0) { ++pass; }
         else { ++fail; if (fail <= 3) Log("SMOKE: iter %d GPU TIMEOUT", iter); }
+
+        // Stop hammering if Evaluate is consistently failing - something is broken
+        if (!eok) {
+            ++evalFails;
+            if (evalFails >= 5) {
+                Log("SMOKE: iter %d - 5 consecutive EvaluateFeature failures, aborting", iter);
+                break;
+            }
+        } else {
+            evalFails = 0;
+        }
+
+        // Pace: don't starve the game's GPU work (prevents TDR during map load)
+        Sleep(16);
 
         if ((iter + 1) % 25 == 0)
             Log("SMOKE: %d/100 evaluates done (pass=%d fail=%d)", iter + 1, pass, fail);
