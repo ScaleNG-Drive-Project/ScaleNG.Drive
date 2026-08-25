@@ -217,12 +217,19 @@ extern "C" __declspec(dllexport) void InitializeASI()
         Log("init: installing VEH");
         HooksInstallVEH();
         HooksInstallCreateDeviceDetour();
-        // BOOTSTRAP: call EGSH directly from init so Present gets hooked
-        // without depending on ExecuteCommandLists hook (which is disabled).
+        // DEFERRED BOOTSTRAP: EGSH creates D3D12 objects which must NOT happen
+        // during DLL initialization (causes 0xC0000409 stack buffer overrun
+        // when NVIDIA driver init races CRT init). Spawn a thread that waits.
         {
-            Log("init: bootstrapping EGSH (direct call)");
-            extern void EnsureGlobalSwapchainHookEx();
-            EnsureGlobalSwapchainHookEx();
+            Log("init: spawning deferred EGSH thread");
+            HANDLE hThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                Sleep(5000); // wait for game to finish its own D3D12 init
+                Log("init: deferred EGSH firing now");
+                extern void EnsureGlobalSwapchainHookEx();
+                EnsureGlobalSwapchainHookEx();
+                return 0;
+            }, nullptr, 0, nullptr);
+            if (hThread) CloseHandle(hThread);
         }
         Log("ScaleNG.asi initialization complete");
     } __except (SehFilter(GetExceptionCode(), GetExceptionInformation())) {
