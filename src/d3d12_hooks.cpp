@@ -903,7 +903,9 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                                  const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                  D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
-    if (g_loadPhase) {
+    // PASSTHROUGH unless bridge ready + DLAA on (prevents artifacts from
+    // GetDesc/map-writes during menu/loading rendering)
+    if (!g_bridgeReady || !g_dlaaMode) {
         if (Real_CreateRenderTargetView) Real_CreateRenderTargetView(device, res, desc, handle);
         return;
     }
@@ -1071,7 +1073,8 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                    D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
-    if (g_loadPhase) {
+    // PASSTHROUGH unless bridge ready + DLAA on
+    if (!g_bridgeReady || !g_dlaaMode) {
         if (Real_CreateShaderResourceView) Real_CreateShaderResourceView(device, res, desc, handle);
         return;
     }
@@ -3448,6 +3451,11 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
 void Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
                          const D3D12_VIEWPORT* pViewports)
 {
+    // PASSTHROUGH unless bridge ready + DLAA on
+    if (!g_bridgeReady || !g_dlaaMode) {
+        Real_RSSetViewports(list, numViewports, pViewports);
+        return;
+    }
     ID3D12Resource* boundScene = SceneColorBound();
     static int s_vpDiag = 0;
     static int s_sceneVpDiag = 0;
@@ -3541,23 +3549,8 @@ void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
 void Hook_SetDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT numHeaps,
                              ID3D12DescriptorHeap* const* heaps)
 {
-    __try {
-        if (heaps && numHeaps >= 1) {
-            UINT n = numHeaps > 2 ? 2 : numHeaps;
-            AcquireSRWLockExclusive(&g_heapStateLock);
-            g_setHeapCount = n;
-            for (UINT i = 0; i < n; ++i)
-                g_setHeaps[i] = heaps[i];
-            ReleaseSRWLockExclusive(&g_heapStateLock);
-        } else {
-            AcquireSRWLockExclusive(&g_heapStateLock);
-            g_setHeapCount = 0;
-            ReleaseSRWLockExclusive(&g_heapStateLock);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("hooks: SetDescriptorHeaps hook faulted (numHeaps=%u heaps=%p) - state skipped",
-            numHeaps, (void*)heaps);
-    }
+    // PASSTHROUGH: heap save/restore causes solid-color artifacts when the
+    // saved state from one command list is restored onto another.
     Real_SetDescriptorHeaps(list, numHeaps, heaps);
 }
 
@@ -3766,30 +3759,21 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
 
 void InstallCommandListHooks(ID3D12GraphicsCommandList* list)
 {
-    Log("hooks: installing cmdlist hooks on %p", (void*)list);
-    void** vtbl = *(void***)list;
-    MH_CreateHook(vtbl[15], &Hook_CopyBufferRegion, (void**)&Real_CopyBufferRegion);
-    MH_CreateHook(vtbl[16], &Hook_CopyTextureRegion, (void**)&Real_CopyTextureRegion);
-    MH_CreateHook(vtbl[21], &Hook_RSSetViewports, (void**)&Real_RSSetViewports);
-    MH_CreateHook(vtbl[22], &Hook_RSSetScissorRects, (void**)&Real_RSSetScissorRects);
-    MH_CreateHook(vtbl[26], &Hook_ResourceBarrier, (void**)&Real_ResourceBarrier);
-    MH_CreateHook(vtbl[28], &Hook_SetDescriptorHeaps, (void**)&Real_SetDescriptorHeaps);
-    MH_CreateHook(vtbl[46], &Hook_OMSetRenderTargets, (void**)&Real_OMSetRenderTargets);
-    MH_EnableHook(vtbl[15]);
-    MH_EnableHook(vtbl[16]);
-    MH_EnableHook(vtbl[21]);
-    MH_EnableHook(vtbl[22]);
-    MH_EnableHook(vtbl[26]);
-    MH_EnableHook(vtbl[28]);
-    MH_EnableHook(vtbl[46]);
-    {
-        void* targets[7] = { (void*)Hook_CopyBufferRegion, (void*)Hook_CopyTextureRegion,
-                             (void*)Hook_RSSetViewports, (void*)Hook_RSSetScissorRects,
-                             (void*)Hook_ResourceBarrier, (void*)Hook_SetDescriptorHeaps,
-                             (void*)Hook_OMSetRenderTargets };
-        CfgMarkValid(targets, 7);
-    }
-    Log("hooks: command list slots 15/16/21/22/26/28/46 hooked");
+    // COMMAND-LIST HOOKS REMOVED: MinHook patches on hot ID3D12GraphicsCommandList
+    // methods (SetDescriptorHeaps, ResourceBarrier, CopyTextureRegion, etc.) cause
+    // solid-color rendering artifacts. These functions run thousands of times per
+    // frame inside nvwgf2umx.dll; the trampoline overhead + instruction relocation
+    // corrupts driver-internal state.
+    //
+    // Discovery now uses ONLY cold-path hooks:
+    //   - CreateRenderTargetView / CreateShaderResourceView (device vtable)
+    //   - OMSetRenderTargets (called via vtable from ECL, but tracked via
+    //     the depth-stencil descriptor parameter instead of hooking the list)
+    //   - ExecuteCommandLists (queue vtable) for frame trigger
+    //
+    // If per-list hooks become necessary in the future, use a different
+    // interception method (e.g., wrapping the command list interface).
+    Log("hooks: cmdlist hooks DISABLED (artifact fix - using device-level discovery only)");
 }
 
 } // namespace
