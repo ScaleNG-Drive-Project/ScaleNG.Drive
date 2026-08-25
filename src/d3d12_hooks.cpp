@@ -2436,24 +2436,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 
     // Bind CBV/SRV/UAV descriptor heap — NGX DLSS internally issues compute
     // dispatches that need descriptors. Without this, FAIL_PlatformError.
-    {
-        static ID3D12DescriptorHeap* ngxHeap = nullptr;
-        if (!ngxHeap) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            hd.NumDescriptors = 4096;
-            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            HRESULT hhr = g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ngxHeap));
-            Log("SMOKE: NGX descriptor heap hr=0x%08X", (unsigned)hhr);
-        }
-        if (ngxHeap) {
-            ID3D12DescriptorHeap* heaps[] = { ngxHeap };
-            list->SetDescriptorHeaps(1, heaps);
-            Log("SMOKE: descriptor heap bound");
-        }
-    }
 
     UpscalerEvaluateParams ep = {};
+            ep.commandList = g_bridgeList;
             ep.commandList = g_bridgeList;
             ep.color = g_brColor;
             ep.depth = g_brDepth;
@@ -4315,6 +4300,24 @@ void RunNgxSyntheticTest()
     bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(4, bars);
+
+    // Bind CBV/SRV/UAV descriptor heap — NGX DLSS internally issues compute
+    // dispatches that need descriptors. Without this, FAIL_PlatformError.
+    {
+        static ID3D12DescriptorHeap* ngxHeap = nullptr;
+        if (!ngxHeap) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 4096;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            HRESULT hhr = g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ngxHeap));
+            Log("SMOKE: NGX descriptor heap hr=0x%08X", (unsigned)hhr);
+        }
+        if (ngxHeap) {
+            ID3D12DescriptorHeap* heaps[] = { ngxHeap };
+            list->SetDescriptorHeaps(1, heaps);
+        }
+    }
 
     UpscalerEvaluateParams ep = {};
     ep.commandList = list;
