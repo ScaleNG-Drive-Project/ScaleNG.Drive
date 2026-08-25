@@ -921,6 +921,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             bool isBbLike = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) == 0;
             if (isBbLike && (!g_bbCached || g_bbFetchFails > 0)) {
                 StoreTracked(&g_bbCached, res);
+                { BookGuard _bg; g_resourceStates[res] = D3D12_RESOURCE_STATE_COMMON; }
                 Log("hooks: backbuffer candidate cached from RTV creation %p (%ux%u fmt %u flags %X)",
                     (void*)res, (unsigned)rd.Width, (unsigned)rd.Height,
                     (unsigned)rd.Format, (unsigned)rd.Flags);
