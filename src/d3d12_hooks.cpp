@@ -903,12 +903,10 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                                  const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                  D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
-    // PASSTHROUGH unless bridge ready + DLAA on (prevents artifacts from
-    // GetDesc/map-writes during menu/loading rendering)
-    if (!g_bridgeReady || !g_dlaaMode) {
-        if (Real_CreateRenderTargetView) Real_CreateRenderTargetView(device, res, desc, handle);
-        return;
-    }
+    // DISCOVERY MUST ALWAYS RUN: resources are discovered at creation time
+    // BEFORE the bridge exists - gating on g_bridgeReady creates a
+    // chicken-and-egg deadlock (need discovery to build bridge, need bridge
+    // to enable discovery).
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
         // BACKBUFFER CAPTURE (polite): flip-model swapchain buffers carry
@@ -1073,11 +1071,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                    D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
-    // PASSTHROUGH unless bridge ready + DLAA on
-    if (!g_bridgeReady || !g_dlaaMode) {
-        if (Real_CreateShaderResourceView) Real_CreateShaderResourceView(device, res, desc, handle);
-        return;
-    }
+    // DISCOVERY MUST ALWAYS RUN (same reason as CreateRenderTargetView)
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
         desc->Texture2D.MipLevels == 1) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
