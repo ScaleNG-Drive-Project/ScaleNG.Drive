@@ -19,6 +19,8 @@ extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR
 PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
 void EnsureUpscalerInit();
+
+static bool IsReadablePtr(const void* p, size_t len);
 static bool s_creatingBridge = false;   // true while EnsureBridge creates its device
 unsigned g_mvFirstValidFrame = 0;
 unsigned g_depthFirstValidFrame = 0;
