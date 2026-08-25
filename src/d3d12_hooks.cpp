@@ -4200,7 +4200,7 @@ void RunNgxSyntheticTest()
                 Log("SMOKE-UNWRAP: real vtable=%p", rvt);
                 td->Release();
                 __try {
-                    auto mem = (__forceinline void**)g_device;
+                    auto mem = (void**)g_device;
                     for (int off = 0; off < 64; ++off) {
                         void* cand = mem[off];
                         if (!cand) continue;
