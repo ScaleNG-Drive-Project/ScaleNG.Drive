@@ -3243,7 +3243,6 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
 
     bool inject = false;
     bool injectBefore = false;
-    bool injectBefore = false;
     if (dst && src && src->pResource != dst->pResource &&
         src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
@@ -3433,7 +3432,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
         Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, src, srcBox);
     if (inject && !injectBefore)
         DoInjection(list);
-Forward:
+Forward: ;
 }
 
 void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
