@@ -2929,22 +2929,23 @@ void EnsureGlobalSwapchainHookImpl()
 {
     static int s_tries = 0;
     if (g_scanDone || s_tries >= 10) return;
-    if (!g_device || !g_graphicsQueue) return;
+    // NOTE: don't require g_device/g_graphicsQueue here — the EGSH dummy path
+    // creates its OWN device+swapchain specifically so it can hook the shared
+    // DXGI vtable WITHOUT needing to intercept the game's device creation.
     ++s_tries;
 
     __try {
-        // Get a REAL dxgi factory (OptiScaler wraps the factories returned by
-        // CreateDXGIFactory* with broken vtables). The game's device is created
-        // with DISABLE_IMPLICIT_DXGI so QI(IDXGIDevice) fails - instead use the
-        // adapter the game passed to D3D12CreateDevice: its parent IS the real
-        // dxgi factory that enumerated it.
+        // SINGLE-DEVICE: get a factory directly (don't need game's adapter)
         IDXGIFactory* factory = nullptr;
         HRESULT hr = E_FAIL;
-        if (g_adapter) {
-            hr = g_adapter->GetParent(__uuidof(IDXGIFactory2), (void**)&factory);
+        {
+            typedef HRESULT(WINAPI* PFN_CreateDXGI)(const IID&, void**);
+            HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
+            PFN_CreateDXGI mkF = dxgiMod ? (PFN_CreateDXGI)GetProcAddress(dxgiMod, "CreateDXGIFactory1") : nullptr;
+            if (mkF) hr = mkF(__uuidof(IDXGIFactory), (void**)&factory);
         }
         if (FAILED(hr) || !factory) {
-            Log("hooks: EGSH adapter GetParent failed (hr=%08X)", (unsigned)hr);
+            Log("hooks: EGSH CreateDXGIFactory1 failed (hr=%08X)", (unsigned)hr);
             return;
         }
         Log("hooks: EGSH real factory %p", (void*)factory);
