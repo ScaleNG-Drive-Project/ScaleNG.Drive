@@ -195,6 +195,14 @@ extern "C" __declspec(dllexport) void InitializeASI()
         Log("process: %ls", exePath);
         Log("========================================");
         Log("ScaleNG.asi loaded");
+        // MINIMAL MODE: log presence and exit immediately.
+        // No hooks, no detours, no VEH, no DRED, no NGX env vars.
+        // Isolates DLL-presence effects from hook effects.
+        Log("MINIMAL MODE: no hooks installed - DLL presence only");
+        if (pShared) InterlockedExchange(pShared, 2);
+        if (pShared) UnmapViewOfFile(pShared);
+        if (hMap) CloseHandle(hMap);
+        return;
         Log("init: loading config");
         LoadConfig();
         if (!g_config.enabled) {
