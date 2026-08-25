@@ -2929,144 +2929,111 @@ void EnsureGlobalSwapchainHookImpl()
 {
     static int s_tries = 0;
     if (g_scanDone || s_tries >= 10) return;
-    // NOTE: don't require g_device/g_graphicsQueue here — the EGSH dummy path
-    // creates its OWN device+swapchain specifically so it can hook the shared
-    // DXGI vtable WITHOUT needing to intercept the game's device creation.
     ++s_tries;
 
     __try {
-        // SINGLE-DEVICE: get a factory directly (don't need game's adapter)
-        IDXGIFactory* factory = nullptr;
-        HRESULT hr = E_FAIL;
+        // ================================================================
+        // STEP 1: Create dummy device + swapchain CLEANLY (no hooks yet!)
+        // ================================================================
+        HWND dummyWnd = EnsureDummyWindow();
+        ID3D12Device* ddev = nullptr;
+        HRESULT dhr = E_FAIL;
+        {
+            typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+            HMODULE d3dMod = GetModuleHandleA("d3d12.dll");
+            PFN_D3D12Create mkDev = d3dMod ? (PFN_D3D12Create)GetProcAddress(d3dMod, "D3D12CreateDevice") : nullptr;
+            if (mkDev) dhr = mkDev(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&ddev);
+        }
+        if (FAILED(dhr) || !ddev) {
+            Log("hooks: EGSH fresh device FAILED hr=%08X", (unsigned)dhr);
+            return;
+        }
+        Log("hooks: EGSH device ok %p", (void*)ddev);
+
+        ID3D12CommandQueue* dq = nullptr;
+        { D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+          ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&dq)); }
+        if (!dq) { ddev->Release(); return; }
+
+        // Create swapchain DIRECTLY via export (no hooks active yet!)
+        IDXGIFactory4* f4 = nullptr;
+        IDXGISwapChain1* dummy = nullptr;
         {
             typedef HRESULT(WINAPI* PFN_CreateDXGI)(const IID&, void**);
             HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
             PFN_CreateDXGI mkF = dxgiMod ? (PFN_CreateDXGI)GetProcAddress(dxgiMod, "CreateDXGIFactory1") : nullptr;
-            if (mkF) hr = mkF(__uuidof(IDXGIFactory), (void**)&factory);
+            if (mkF) mkF(__uuidof(IDXGIFactory4), (void**)&f4);
         }
-        if (FAILED(hr) || !factory) {
-            Log("hooks: EGSH CreateDXGIFactory1 failed (hr=%08X)", (unsigned)hr);
-            return;
-        }
-        Log("hooks: EGSH real factory %p", (void*)factory);
+        if (!f4) { dq->Release(); ddev->Release(); return; }
 
-        void** fvt = *(void***)factory;
-        static bool s_slotsLogged = false;
-        if (!s_slotsLogged) {
-            s_slotsLogged = true;
-            Log("hooks: EGSH factory slots 10..17: %p %p %p %p %p %p %p %p",
-                (void*)fvt[10], (void*)fvt[11], (void*)fvt[12], (void*)fvt[13],
-                (void*)fvt[14], (void*)fvt[15], (void*)fvt[16], (void*)fvt[17]);
+        DXGI_SWAP_CHAIN_DESC1 sd = {};
+        sd.BufferCount = 2; sd.Width = 8; sd.Height = 8;
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.SampleDesc.Count = 1; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
+        Log("hooks: EGSH clean swapchain hr=0x%08X sc=%p", (unsigned)dhr, (void*)dummy);
+
+        // ================================================================
+        // STEP 2: Hook Present on the dummy swapchain's vtable.
+        // Real DXGI swapchain: slot 7 = Present. Pure pointer swap.
+        // Since all IDXGISwapChain objects share the same class vtable,
+        // this intercepts Present for EVERY swapchain including the game's.
+        // ================================================================
+        if (SUCCEEDED(dhr) && dummy) {
+            void** dvt = *(void***)dummy;
+            MEMORY_BASIC_INFORMATION mbi = {};
+            VirtualQuery(dvt, &mbi, sizeof(mbi));
+            DWORD oldProt = 0;
+            if (VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProt)) {
+                Real_Present = (PFN_Present)dvt[7];   // slot 7 = Present
+                dvt[7] = (void*)&Hook_Present;
+                VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
+                Log("hooks: PRESENT HOOKED via vtable swap (slot 7) orig=%p", (void*)Real_Present);
+            } else {
+                Log("hooks: VirtualProtect failed on swapchain vtable");
+            }
         }
-        if (!IsReadablePtr(fvt, sizeof(void*) * 14) || !fvt[10]) {
-            Log("hooks: EGSH real factory vtable bad (slot10 %p)", (void*)fvt[10]);
-            factory->Release();
-            return;
+
+        // Cleanup temp objects
+        if (dummy) { dummy->Release(); dummy = nullptr; }
+        if (f4) f4->Release();
+        if (dq) dq->Release();
+        ddev->Release();
+
+        // ================================================================
+        // STEP 3: Factory vtable swaps for future swapchain creation
+        // ================================================================
+        IDXGIFactory* factory = nullptr;
+        {
+            typedef HRESULT(WINAPI* PFN_CreateDXGI)(const IID&, void**);
+            HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
+            PFN_CreateDXGI mkF = dxgiMod ? (PFN_CreateDXGI)GetProcAddress(dxgiMod, "CreateDXGIFactory1") : nullptr;
+            if (mkF) mkF(__uuidof(IDXGIFactory), (void**)&factory);
         }
-        // All real dxgi factory instances share this static vtable, so hooking
-        // slots 10/15 here covers EVERY swapchain the game creates through any
-        // real factory. Chained on top of any OptiScaler detour already in the
-        // slot (MH reads the current slot value).
-        if (!Real_CreateSwapChainForHwnd && fvt[15]) {
-            // PURE VTABLE SWAP for factory slot 15
+        if (factory) {
+            void** fvt = *(void***)factory;
             MEMORY_BASIC_INFORMATION fmbi = {};
             VirtualQuery(fvt, &fmbi, sizeof(fmbi));
             DWORD foldProt = 0;
             if (VirtualProtect(fmbi.BaseAddress, fmbi.RegionSize, PAGE_READWRITE, &foldProt)) {
-                Real_CreateSwapChainForHwnd = (PFN_CreateSwapChainForHwnd)fvt[15];
-                fvt[15] = (void*)&Hook_CreateSwapChainForHwnd;
-                VirtualProtect(fmbi.BaseAddress, fmbi.RegionSize, foldProt, &foldProt);
-                void* targets[1] = { (void*)Hook_CreateSwapChainForHwnd };
-                CfgMarkValid(targets, 1);
-                Log("hooks: EGSH real factory slot15 SWAPPED");
-            }
-        }
-        if (!Real_CreateSwapChain && fvt[10]) {
-            MEMORY_BASIC_INFORMATION fmbi2 = {};
-            VirtualQuery(fvt, &fmbi2, sizeof(fmbi2));
-            DWORD foldProt2 = 0;
-            if (VirtualProtect(fmbi2.BaseAddress, fmbi2.RegionSize, PAGE_READWRITE, &foldProt2)) {
-                Real_CreateSwapChain = (PFN_CreateSwapChain)fvt[10];
-                fvt[10] = (void*)&Hook_CreateSwapChain;
-                VirtualProtect(fmbi2.BaseAddress, fmbi2.RegionSize, foldProt2, &foldProt2);
-                void* targets[1] = { (void*)Hook_CreateSwapChain };
-                CfgMarkValid(targets, 1);
-                Log("hooks: EGSH real factory slot10 SWAPPED");
-            }
-        }
-        // SELF-SUFFICIENT DUMMY PATH: the game's device rejects IDXGIDevice QI
-        // (DISABLE_IMPLICIT_DXGI-style), so swapchain creation on ITS queues
-        // fails (887A0001) or AVs inside dxgi. Create a FRESH device + queue +
-        // factory instead - the resulting swapchain uses the SAME shared static
-        // dxgi vtable as every other swapchain, so InstallSwapchainHooks on it
-        // lands MinHook on the shared Present/Present1 functions and covers the
-        // game's real Present no matter how its own swapchain behaves.
-        {
-            HWND dummyWnd = EnsureDummyWindow();
-            Log("hooks: EGSH dummy window %p", (void*)dummyWnd);
-            ID3D12Device* ddev = nullptr;
-            HRESULT dhr = E_FAIL;
-            if (Real_D3D12CreateDevice_Tramp)
-                dhr = Real_D3D12CreateDevice_Tramp(nullptr, D3D_FEATURE_LEVEL_11_0,
-                                             __uuidof(ID3D12Device), (void**)&ddev);
-            Log("hooks: EGSH fresh device hr=%08X dev=%p", (unsigned)dhr, (void*)ddev);
-            IDXGISwapChain1* dummy = nullptr;
-            if (SUCCEEDED(dhr) && ddev) {
-                ID3D12CommandQueue* dq = nullptr;
-                D3D12_COMMAND_QUEUE_DESC qd = {};
-                qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-                if (SUCCEEDED(ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&dq))) && dq) {
-                    typedef HRESULT(WINAPI* PFN_CreateDXGIFactory1Raw)(REFIID, void**);
-                    HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
-                    PFN_CreateDXGIFactory1Raw mkFactory =
-                        dxgiMod ? (PFN_CreateDXGIFactory1Raw)GetProcAddress(dxgiMod, "CreateDXGIFactory1")
-                                : nullptr;
-                    IDXGIFactory4* f4 = nullptr;
-                    HRESULT fhr = mkFactory ? mkFactory(__uuidof(IDXGIFactory4), (void**)&f4) : E_FAIL;
-                    Log("hooks: EGSH fresh factory hr=%08X f=%p", (unsigned)fhr, (void*)f4);
-                    if (SUCCEEDED(fhr) && f4) {
-                        DXGI_SWAP_CHAIN_DESC1 sd = {};
-                        sd.BufferCount = 2;
-                        sd.Width = 8;
-                        sd.Height = 8;
-                        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-                        sd.SampleDesc.Count = 1;
-                        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-                        sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-                        // BYPASS OUR HOOK: f4 shares the static dxgi vtable, so
-                        // the virtual call would re-enter Hook_CreateSwapChain-
-                        // ForHwnd (self-re-entrancy) - observed returning
-                        // S_OK with an uninitialized 0xCC out-param, which
-                        // then poisoned the game's real swapchain handling.
-                        // The trampoline IS the original function.
-                        if (Real_CreateSwapChainForHwnd)
-                            dhr = Real_CreateSwapChainForHwnd((IDXGIFactory2*)f4, dq,
-                                dummyWnd, &sd, nullptr, nullptr,
-                                __uuidof(IDXGISwapChain1), (void**)&dummy);
-                        else
-                            dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
-                        Log("hooks: EGSH fresh ForHwnd hr=%08X sc=%p", (unsigned)dhr, (void*)dummy);
-                        // NEVER InstallSwapchainHooks on the dummy: it is a
-                        // REAL DXGI swapchain whose vt[8] is GetBuffer, not
-                        // Present (the wrapped game swapchain differs!). The
-                        // old '!Real_Present' condition let this fire and we
-                        // hooked GetBuffer as Present process-wide -> every
-                        // GetBuffer became an injection attempt (freeze class,
-                        // 14k guarded faults). Engine's own swapchain gets
-                        // hooked via the factory-slot15 path instead.
-                        if (dummy) { dummy->Release(); dummy = nullptr; }
-                        f4->Release();
-                    }
-                    dq->Release();
+                if (!Real_CreateSwapChainForHwnd && fvt[15]) {
+                    Real_CreateSwapChainForHwnd = (PFN_CreateSwapChainForHwnd)fvt[15];
+                    fvt[15] = (void*)&Hook_CreateSwapChainForHwnd;
+                    Log("hooks: factory slot15 SWAPPED");
                 }
-                ddev->Release();
+                if (!Real_CreateSwapChain && fvt[10]) {
+                    Real_CreateSwapChain = (PFN_CreateSwapChain)fvt[10];
+                    fvt[10] = (void*)&Hook_CreateSwapChain;
+                    Log("hooks: factory slot10 SWAPPED");
+                }
+                VirtualProtect(fmbi.BaseAddress, fmbi.RegionSize, foldProt, &foldProt);
             }
-            Log("hooks: EGSH dummy result - Real_Present %s",
-                Real_Present ? "HOOKED" : "NOT HOOKED");
-            g_swapchain = nullptr; // real one adopted at first present via Hook_Present self-heal
+            factory->Release();
         }
-        factory->Release();
+
+        g_swapchain = nullptr; // real one adopted at first present via Hook_Present self-heal
         g_scanDone = true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
