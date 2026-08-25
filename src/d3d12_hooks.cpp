@@ -2678,7 +2678,7 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
                         if (SUCCEEDED(qhr) && dxgiDev) {
                             // A2: adapter info from that device
                             IDXGIAdapter* pad = nullptr;
-                            if (SUCCEEDED(dxgidev->GetAdapter(&pad))) {
+                            if (SUCCEEDED(dxgiDev->GetAdapter(&pad))) {
                                 DXGI_ADAPTER_DESC pdesc = {};
                                 if (SUCCEEDED(pad->GetDesc(&pdesc)))
                                     Log("IDENTITY-B: adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
