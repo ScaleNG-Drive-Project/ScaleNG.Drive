@@ -1,6 +1,6 @@
  ScaleNG
 
- Timestamp is 6a8deeda (Tue Aug 25 12:36:58 2026)
+ Timestamp is 6a8df032 (Tue Aug 25 12:42:42 2026)
 
  Preferred load address is 0000000180000000
 
@@ -3382,7 +3382,7 @@
  0002:00000d5c       ??_C@_01LFCBOECM@?4@       00000001800b5d5c     main.obj
  0002:00000d60       ??_C@_02PBFOLPKM@?$FN?5@   00000001800b5d60     main.obj
  0002:00000d64       ??_C@_03PKPBNCAL@?o?$LL?$LP@ 00000001800b5d64     main.obj
- 0002:00000d68       ??_C@_08EBNEGFLA@12?336?354@ 00000001800b5d68     main.obj
+ 0002:00000d68       ??_C@_08BIHCPBDH@12?342?339@ 00000001800b5d68     main.obj
  0002:00000d78       ??_C@_0M@KOHFMJBL@Aug?525?52026@ 00000001800b5d78     main.obj
  0002:00000d88       ??_C@_0DK@NHNMMLBJ@ScaleNG?4asi?5log?5started?5?9?5build?5@ 00000001800b5d88     main.obj
  0002:00000dd0       ??_C@_11LOCGONAA@@         00000001800b5dd0     main.obj

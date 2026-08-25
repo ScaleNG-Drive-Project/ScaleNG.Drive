@@ -4340,7 +4340,7 @@ void RunNgxSyntheticTest()
         return;
     }
     UpscalerInitParams ip = {};
-    ip.device = g_device;  // GAME'S DEVICE
+    ip.device = ngxDev;  // UNWRAPPED device
     ip.renderWidth = w;
     ip.renderHeight = h;
     ip.displayWidth = w;
