@@ -217,6 +217,13 @@ extern "C" __declspec(dllexport) void InitializeASI()
         Log("init: installing VEH");
         HooksInstallVEH();
         HooksInstallCreateDeviceDetour();
+        // BOOTSTRAP: call EGSH directly from init so Present gets hooked
+        // without depending on ExecuteCommandLists hook (which is disabled).
+        {
+            Log("init: bootstrapping EGSH (direct call)");
+            extern void EnsureGlobalSwapchainHookEx();
+            EnsureGlobalSwapchainHookEx();
+        }
         Log("ScaleNG.asi initialization complete");
     } __except (SehFilter(GetExceptionCode(), GetExceptionInformation())) {
         // P0 item 2: record the FAILED terminal state so a later call can

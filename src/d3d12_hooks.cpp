@@ -4064,6 +4064,8 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list)
 
 } // namespace
 
+void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHook(); }
+
 void HooksSetConfig(const ScaleNgConfig& config)
 {
     g_cfg = config;
