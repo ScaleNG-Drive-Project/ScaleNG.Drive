@@ -149,6 +149,7 @@ private:
     NVSDK_NGX_Parameter* m_parameters = nullptr;
     NgxParamStore* m_paramStore = nullptr;
     NVSDK_NGX_Handle* m_feature = nullptr;
+    ID3D12DescriptorHeap* m_evalHeap = nullptr;
 
     uint32_t m_renderWidth = 0;
     uint32_t m_renderHeight = 0;

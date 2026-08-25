@@ -512,6 +512,23 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     ID3D12DescriptorHeap* savedHeaps[2] = { nullptr, nullptr };
     HooksGetDescriptorHeaps(&savedCount, savedHeaps);
 
+    // CRITICAL: Bind an explicit CBV/SRV/UAV heap before EvaluateFeature.
+    // Without a shader-visible heap bound on the command list, NGX's internal
+    // SetComputeRootDescriptorTable calls have no backing storage -> driver
+    // fault -> device removed (0x887A0001).
+    if (!m_evalHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 4096;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_evalHeap)))) {
+            Log("DLSS: failed to create eval descriptor heap");
+            return false;
+        }
+    }
+    ID3D12DescriptorHeap* heapsToBind[] = { m_evalHeap };
+    params.commandList->SetDescriptorHeaps(1, heapsToBind);
+
     unsigned evSeh = 0;
     int evr;
     __try {
@@ -574,6 +591,7 @@ void NvDlssUpscaler::UpdateSizes(unsigned int rw, unsigned int rh,
 void NvDlssUpscaler::Shutdown()
 {
     DestroyFeature();
+    if (m_evalHeap) { m_evalHeap->Release(); m_evalHeap = nullptr; }
     UnloadNGX();
     m_initialized = false;
 }
