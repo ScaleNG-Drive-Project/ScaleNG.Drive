@@ -193,12 +193,12 @@ extern "C" __declspec(dllexport) void InitializeASI()
         wchar_t exePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         Log("process: %ls", exePath);
-        Log("========================================");
-        Log("ScaleNG.asi loaded");
-        // MINIMAL MODE: log presence and exit immediately.
-        // No hooks, no detours, no VEH, no DRED, no NGX env vars.
-        // Isolates DLL-presence effects from hook effects.
-        Log("MINIMAL MODE: no hooks installed - DLL presence only");
+        // BISECT STAGE 1: D3D12CreateDevice detour only.
+        // Captures g_device when the game creates it. No other hooks.
+        Log("BISECT STAGE 1: installing D3D12CreateDevice detour only");
+        HooksSetConfig(g_config);
+        HooksInstallCreateDeviceDetour();
+        Log("ScaleNG.asi initialization complete");
         if (pShared) InterlockedExchange(pShared, 2);
         if (pShared) UnmapViewOfFile(pShared);
         if (hMap) CloseHandle(hMap);
