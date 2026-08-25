@@ -2827,6 +2827,7 @@ static bool IsExecutableImagePtr(const void* p)
 // the Present hook was actually installed on a sane target.
 bool InstallSwapchainHooks(IDXGISwapChain* sc)
 {
+    Log("hooks: InstallSwapchainHooks called sc=%p", (void*)sc);
     if (!sc) return false;
     void** vt = nullptr;
     __try {
@@ -3268,13 +3269,16 @@ PFN_CreateDXGIFactory Real_CreateDXGIFactory = nullptr;
 void HookFactoryObject(IDXGIFactory* factory)
 {
     if (!factory) return;
+    Log("hooks: HookFactoryObject called factory=%p", (void*)factory);
     if (!g_anyFactory) g_anyFactory = factory;
     void** vt = *(void***)factory;
     bool any = false;
     if (!Real_CreateSwapChainForHwnd &&
         MH_CreateHook(vt[15], &Hook_CreateSwapChainForHwnd, (void**)&Real_CreateSwapChainForHwnd) == MH_OK) {
-        if (MH_EnableHook(vt[15]) == MH_OK) { any = true; }
+        if (MH_EnableHook(vt[15]) == MH_OK) { any = true; Log("hooks: factory slot15 hooked OK"); }
         else { Real_CreateSwapChainForHwnd = nullptr; }
+    } else if (Real_CreateSwapChainForHwnd) {
+        Log("hooks: factory slot15 already hooked");
     }
     if (!Real_CreateSwapChainForCoreWindow &&
         MH_CreateHook(vt[16], &Hook_CreateSwapChainForCoreWindow, (void**)&Real_CreateSwapChainForCoreWindow) == MH_OK) {
