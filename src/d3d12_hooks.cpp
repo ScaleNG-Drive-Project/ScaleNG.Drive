@@ -4319,10 +4319,10 @@ void RunNgxSyntheticTest()
         bars[3].Transition.pResource = out;
         bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        list->ResourceBarrier(4, bars);
+        cl->ResourceBarrier(4, bars);
 
         UpscalerEvaluateParams ep = {};
-        ep.commandList = list;
+        ep.commandList = cl;
         ep.color = color;
         ep.depth = depth;
         ep.motionVectors = mv;
@@ -4332,12 +4332,12 @@ void RunNgxSyntheticTest()
         ep.sharpness = 0.0f;
 
         bool eok = g_upscaler->Evaluate(ep);
-        HRESULT chr = list->Close();
+        HRESULT chr = cl->Close();
 
-        queue->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList*const*>(&cl));
+        q->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList*const*>(&cl));
 
         fence->SetEventOnCompletion(iter + 1, evt);
-        queue->Signal(fence, iter + 1);
+        q->Signal(fence, iter + 1);
         DWORD wr = WaitForSingleObject(evt, 10000);
 
         if (wr == WAIT_OBJECT_0) { ++pass; }
