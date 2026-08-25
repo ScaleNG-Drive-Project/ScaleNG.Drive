@@ -3228,7 +3228,10 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
     if (!g_bridgeReady || !g_dlaaMode) {
         goto Forward;
     }
+
     bool inject = false;
+    bool injectBefore = false;
+    if (dst && src && src->pResource != dst->pResource &&
         src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         dst->SubresourceIndex == 0 && src->SubresourceIndex == 0 &&
