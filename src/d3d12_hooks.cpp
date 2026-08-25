@@ -4321,8 +4321,8 @@ void RunNgxSyntheticTest()
     Log("SMOKE: GPU execution %s", wr==WAIT_OBJECT_0 ? "COMPLETED" : "TIMEOUT/FAILED");
 
     // Check device health after execution
-    drr = ngxDev->GetDeviceRemovedReason();
-    Log("SMOKE: post-exec devRemoved=0x%08X",(unsigned)drr);
+    HRESULT postDrr = ngxDev->GetDeviceRemovedReason();
+    Log("SMOKE: post-exec devRemoved=0x%08X",(unsigned)postDrr);
 
     // Cleanup
     CloseHandle(evt); if(fence)fence->Release();
@@ -4330,7 +4330,7 @@ void RunNgxSyntheticTest()
     if(mv)mv->Release(); if(out)out->Release();
     if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
 
-    bool pass = eok && (wr==WAIT_OBJECT_0) && SUCCEEDED(drr);
+    bool pass = eok && (wr==WAIT_OBJECT_0) && SUCCEEDED(postDrr);
     Log("SMOKE: RESULT - %s", pass ? "PASS" : "FAIL");
 }
 
