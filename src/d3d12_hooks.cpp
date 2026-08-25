@@ -503,7 +503,7 @@ UINT64 g_injFenceVal = 0;
 bool g_injSubmitted = false;
 IDXGIFactory* g_anyFactory = nullptr;
 
-void EnsureGlobalSwapchainHook();
+void EnsureGlobalSwapchainHookImpl();
 
 // ---- On-screen HUD (drawn into the backbuffer at Present) ----
 bool g_showHud = true;
@@ -1118,12 +1118,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue);
 void InjectAtPresent();
 bool g_inInject = false;
 
+void EnsureGlobalSwapchainHookImpl();
+
 void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                               ID3D12CommandList* const* lists)
 {
     if (queue)
         g_graphicsQueue = queue;
-    EnsureGlobalSwapchainHook();
+    EnsureGlobalSwapchainHookImpl();
     static int s_execCalls = 0;
     if (s_execCalls < 5) {
         ++s_execCalls;
@@ -2923,7 +2925,7 @@ static HWND EnsureDummyWindow()
     return s_dummyHwnd;
 }
 
-void EnsureGlobalSwapchainHook()
+void EnsureGlobalSwapchainHookImpl()
 {
     static int s_tries = 0;
     if (g_scanDone || s_tries >= 10) return;
@@ -4038,7 +4040,7 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
             }
         }
         if (queue) g_graphicsQueue = queue;
-        EnsureGlobalSwapchainHook();
+        EnsureGlobalSwapchainHookImpl();
     }
     return hr;
 }
@@ -4064,7 +4066,7 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list)
 
 } // namespace
 
-void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHook(); }
+void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHookImpl(); }
 
 void HooksSetConfig(const ScaleNgConfig& config)
 {
