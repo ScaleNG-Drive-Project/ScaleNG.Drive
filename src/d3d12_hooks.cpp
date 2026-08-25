@@ -781,10 +781,12 @@ void EnsureUpscalerInit()
     // NOTE: must run BEFORE the atomic 'attempted' mark below - deferring is
     // not attempting, and the flag would otherwise block all retries forever
     // (seen live: exactly one defer line, then init never re-ran).
-    if (HooksGetQuietFrames() < 600) {
+    // SINGLE-DEVICE: reduced sequencing requirement since no second device.
+    // Still need some stability before NGX touches the driver.
+    if (HooksGetQuietFrames() < 120) {
         static int s_seqLogs = 0;
         if (++s_seqLogs <= 5)
-            Log("hooks: NGX init deferred - chain quiet %uf/600f", HooksGetQuietFrames());
+            Log("hooks: NGX init deferred - chain quiet %uf/120f", HooksGetQuietFrames());
         return; // retried by later callers
     }
     // Atomic: only one thread may attempt NGX init
@@ -3135,6 +3137,54 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
         if (desc) g_bbFormat = desc->Format;
         Log("hooks: CreateSwapChainForHwnd returned %p (hwnd %p, format %d, hr=%08X)",
             (void*)sc, (void*)hwnd, (int)g_bbFormat, (unsigned)hr);
+
+        // ================================================================
+        // SINGLE-DEVICE CAPTURE: the IUnknown* device parameter IS the
+        // game's D3D12 command queue. Capture it and derive the device.
+        // This is the ONLY place we can reliably get both in one shot.
+        // ================================================================
+        static long s_captured = 0;
+        if (InterlockedCompareExchange(&s_captured, 1, 0) == 0 && device) {
+            // QI to ID3D12CommandQueue
+            ID3D12CommandQueue* q = nullptr;
+            HRESULT qhr = device->QueryInterface(__uuidof(ID3D12CommandQueue), (void**)&q);
+            Log("SINGLE-DEV: QI(ID3D12CommandQueue) hr=0x%08X ptr=%p", (unsigned)qhr, (void*)q);
+            if (SUCCEEDED(qhr) && q) {
+                g_graphicsQueue = q;
+                Log("SINGLE-DEV: GAME QUEUE CAPTURED %p", (void*)q);
+
+                // GetDevice from the queue → real ID3D12Device
+                ID3D12Device* dev = nullptr;
+                HRESULT dhr = q->GetDevice(__uuidof(ID3D12Device), (void**)&dev);
+                Log("SINGLE-DEV: queue->GetDevice(ID3D12Device) hr=0x%08X ptr=%p",
+                    (unsigned)dhr, (void*)dev);
+                if (SUCCEEDED(dhr) && dev) {
+                    if (!g_device || g_device != dev) {
+                        Log("SINGLE-DEV: DEVICE CAPTURED %p (matches g_device=%d)",
+                            (void*)dev, (g_device == dev) ? 1 : 0);
+                        g_device = dev; // use this for everything
+                    }
+                    // Adapter identity from the real device
+                    IDXGIDevice* dxgidev = nullptr;
+                    if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev))) {
+                        IDXGIAdapter* ad = nullptr;
+                        if (SUCCEEDED(dxgidev->GetAdapter(&ad))) {
+                            DXGI_ADAPTER_DESC adesc = {};
+                            if (SUCCEEDED(ad->GetDesc(&adesc)))
+                                Log("SINGLE-DEV: adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
+                                    adesc.VendorId, adesc.Description,
+                                    (unsigned)adesc.AdapterLuid.HighPart,
+                                    (unsigned)adesc.AdapterLuid.LowPart);
+                            ad->Release();
+                        }
+                        dxgidev->Release();
+                    }
+                }
+            } else {
+                Log("SINGLE-DEV: device param is NOT a command queue (wrapped?)");
+            }
+        }
+        // END SINGLE-DEVICE CAPTURE
         // ADAPTER IDENTITY via the swapchain itself: QI on the RAW swapchain
         // (not the wrapped game device) always works and names the physical
         // adapter that owns PRESENT - the ground truth for hybrid triage.
