@@ -2745,29 +2745,30 @@ void EnsureGlobalSwapchainHook()
         // real factory. Chained on top of any OptiScaler detour already in the
         // slot (MH reads the current slot value).
         if (!Real_CreateSwapChainForHwnd && fvt[15]) {
-            MH_STATUS st15 = MH_CreateHook(fvt[15], &Hook_CreateSwapChainForHwnd,
-                                           (void**)&Real_CreateSwapChainForHwnd);
-            if (st15 == MH_OK || st15 == MH_ERROR_ALREADY_CREATED) {
-                if (MH_EnableHook(fvt[15]) == MH_OK) {
-                    void* targets[1] = { (void*)Hook_CreateSwapChainForHwnd };
-                    CfgMarkValid(targets, 1);
-                    Log("hooks: EGSH real factory slot15 hooked");
-                }
-            } else {
-                Log("hooks: EGSH real factory slot15 hook failed (st=%d)", (int)st15);
+            // PURE VTABLE SWAP for factory slot 15
+            MEMORY_BASIC_INFORMATION fmbi = {};
+            VirtualQuery(fvt, &fmbi, sizeof(fmbi));
+            DWORD foldProt = 0;
+            if (VirtualProtect(fmbi.BaseAddress, fmbi.RegionSize, PAGE_READWRITE, &foldProt)) {
+                Real_CreateSwapChainForHwnd = (PFN_CreateSwapChainForHwnd)fvt[15];
+                fvt[15] = (void*)&Hook_CreateSwapChainForHwnd;
+                VirtualProtect(fmbi.BaseAddress, fmbi.RegionSize, foldProt, &foldProt);
+                void* targets[1] = { (void*)Hook_CreateSwapChainForHwnd };
+                CfgMarkValid(targets, 1);
+                Log("hooks: EGSH real factory slot15 SWAPPED");
             }
         }
         if (!Real_CreateSwapChain && fvt[10]) {
-            MH_STATUS st10 = MH_CreateHook(fvt[10], &Hook_CreateSwapChain,
-                                           (void**)&Real_CreateSwapChain);
-            if (st10 == MH_OK || st10 == MH_ERROR_ALREADY_CREATED) {
-                if (MH_EnableHook(fvt[10]) == MH_OK) {
-                    void* targets[1] = { (void*)Hook_CreateSwapChain };
-                    CfgMarkValid(targets, 1);
-                    Log("hooks: EGSH real factory slot10 hooked");
-                }
-            } else {
-                Log("hooks: EGSH real factory slot10 hook failed (st=%d)", (int)st10);
+            MEMORY_BASIC_INFORMATION fmbi2 = {};
+            VirtualQuery(fvt, &fmbi2, sizeof(fmbi2));
+            DWORD foldProt2 = 0;
+            if (VirtualProtect(fmbi2.BaseAddress, fmbi2.RegionSize, PAGE_READWRITE, &foldProt2)) {
+                Real_CreateSwapChain = (PFN_CreateSwapChain)fvt[10];
+                fvt[10] = (void*)&Hook_CreateSwapChain;
+                VirtualProtect(fmbi2.BaseAddress, fmbi2.RegionSize, foldProt2, &foldProt2);
+                void* targets[1] = { (void*)Hook_CreateSwapChain };
+                CfgMarkValid(targets, 1);
+                Log("hooks: EGSH real factory slot10 SWAPPED");
             }
         }
         // SELF-SUFFICIENT DUMMY PATH: the game's device rejects IDXGIDevice QI
@@ -3763,18 +3764,30 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         bool reinstallHooks = (g_device != newDev);
         g_device = newDev;
         if (reinstallHooks) {
-            // All ID3D12Device instances share one vtable; MinHook reports
-            // ALREADY_CREATED on repeats and leaves the trampolines intact.
+            // PURE VTABLE SWAP: never patch driver code bytes. Just redirect
+            // the vtable pointer to our hook and save the original for
+            // forwarding. The original function code is untouched.
             void** vtbl = *(void***)g_device;
-            MH_STATUS s20 = MH_CreateHook(vtbl[20], &Hook_CreateRenderTargetView, (void**)&Real_CreateRenderTargetView);
-            MH_STATUS s18 = MH_CreateHook(vtbl[18], &Hook_CreateShaderResourceView, (void**)&Real_CreateShaderResourceView);
-            MH_EnableHook(vtbl[20]);
-            MH_EnableHook(vtbl[18]);
+
+            // Make vtable page writable (it may be read-only)
+            MEMORY_BASIC_INFORMATION mbi = {};
+            VirtualQuery(vtbl, &mbi, sizeof(mbi));
+            DWORD oldProt = 0;
+            if (VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProt)) {
+                // Save originals and swap
+                Real_CreateRenderTargetView = (PFN_CreateRenderTargetView)vtbl[20];
+                Real_CreateShaderResourceView = (PFN_CreateShaderResourceView)vtbl[18];
+                vtbl[20] = (void*)&Hook_CreateRenderTargetView;
+                vtbl[18] = (void*)&Hook_CreateShaderResourceView;
+                VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
+                Log("hooks: device vtable SWAPPED (20, 18) - no code patched");
+            } else {
+                Log("hooks: VirtualProtect on vtable failed - device hooks not installed");
+            }
             {
                 void* targets[2] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView };
                 CfgMarkValid(targets, 2);
             }
-            Log("hooks: device vtable hooks (20:%d 18:%d)", (int)s20, (int)s18);
         }
 
         ID3D12CommandQueue* queue = nullptr;
@@ -3782,15 +3795,17 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         if (SUCCEEDED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) && queue) {
             void** qv = *(void***)queue;
-            if (MH_CreateHook(qv[10], &Hook_ExecuteCommandLists, (void**)&Real_ExecuteCommandLists) == MH_OK) {
-                MH_EnableHook(qv[10]);
-                {
-                    void* targets[1] = { (void*)Hook_ExecuteCommandLists };
-                    CfgMarkValid(targets, 1);
-                }
-                Log("hooks: queue slot 10 hooked");
+            // PURE VTABLE SWAP for queue too
+            MEMORY_BASIC_INFORMATION qmbi = {};
+            VirtualQuery(qv, &qmbi, sizeof(qmbi));
+            DWORD qoldProt = 0;
+            if (VirtualProtect(qmbi.BaseAddress, qmbi.RegionSize, PAGE_READWRITE, &qoldProt)) {
+                Real_ExecuteCommandLists = (PFN_ExecuteCommandLists)qv[10];
+                qv[10] = (void*)&Hook_ExecuteCommandLists;
+                VirtualProtect(qmbi.BaseAddress, qmbi.RegionSize, qoldProt, &qoldProt);
+                Log("hooks: queue vtable SWAPPED (slot 10)");
             } else {
-                Log("hooks: queue slot 10 already hooked (shared vtable)");
+                Log("hooks: VirtualProtect on queue vtable failed");
             }
         }
         if (queue) g_graphicsQueue = queue;
