@@ -2635,6 +2635,12 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
             if (sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
+                // BISECT STAGE 2: attempt NGX init on game device at first adoption
+                static long s_ngxAttempted = 0;
+                if (InterlockedCompareExchange(&s_ngxAttempted, 1, 0) == 0) {
+                    Log("BISECT STAGE 2: attempting NGX init on game device");
+                    EnsureUpscalerInit();
+                }
             }
             if (!g_inPresent) {
                 g_inPresent = true;

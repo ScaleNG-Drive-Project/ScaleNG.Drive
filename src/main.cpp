@@ -193,12 +193,16 @@ extern "C" __declspec(dllexport) void InitializeASI()
         wchar_t exePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         Log("process: %ls", exePath);
-        // BISECT STAGE 1: D3D12CreateDevice detour only.
-        // Captures g_device when the game creates it. No other hooks.
-        Log("BISECT STAGE 1: installing D3D12CreateDevice detour only");
+        // BISECT STAGE 2: + NGX init on game device
+        Log("BISECT STAGE 2: D3D12CreateDevice detour + NGX init on game device");
         HooksSetConfig(g_config);
         HooksInstallCreateDeviceDetour();
         Log("ScaleNG.asi initialization complete");
+        if (pShared) InterlockedExchange(pShared, 2);
+        if (pShared) UnmapViewOfFile(pShared);
+        if (hMap) CloseHandle(hMap);
+        return;
+        Log("init: loading config");
         if (pShared) InterlockedExchange(pShared, 2);
         if (pShared) UnmapViewOfFile(pShared);
         if (hMap) CloseHandle(hMap);
