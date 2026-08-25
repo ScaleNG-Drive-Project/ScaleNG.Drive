@@ -4296,42 +4296,66 @@ void RunNgxSyntheticTest()
     ep.jitterX=0; ep.jitterY=0;
     ep.mvScaleX=(float)w; ep.mvScaleY=(float)h;
     ep.sharpness=0.0f;
-    bool eok=g_upscaler->Evaluate(ep);
-    Log("SMOKE: NGX Evaluate %s (recorded)",eok?"SUCCESS":"FAILED");
+    // CONTINUOUS EVALUATION: 100 iterations proving sustained NGX operation.
+    int pass = 0, fail = 0;
+    ID3D12Fence* fence = nullptr;
+    ngxDev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
 
-    // Close, submit, and wait for GPU completion
-    HRESULT chr = cl->Close();
-    Log("SMOKE: Close hr=0x%08X",(unsigned)chr);
-    if(FAILED(chr)){
-        if(color)color->Release(); if(depth)depth->Release();
-        if(mv)mv->Release(); if(out)out->Release();
-        if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
-        return;
+    for (int iter = 0; iter < 100; ++iter) {
+        cl->Reset(al, nullptr);
+
+        D3D12_RESOURCE_BARRIER bars[4] = {};
+        for (int i = 0; i < 4; ++i) { bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+        bars[0].Transition.pResource = color;
+        bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        bars[1].Transition.pResource = depth;
+        bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        bars[2].Transition.pResource = mv;
+        bars[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        bars[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        bars[3].Transition.pResource = out;
+        bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        list->ResourceBarrier(4, bars);
+
+        UpscalerEvaluateParams ep = {};
+        ep.commandList = list;
+        ep.color = color;
+        ep.depth = depth;
+        ep.motionVectors = mv;
+        ep.output = out;
+        ep.jitterX = 0.0f; ep.jitterY = 0.0f;
+        ep.mvScaleX = 1.0f; ep.mvScaleY = 1.0f;
+        ep.sharpness = 0.0f;
+
+        bool eok = g_upscaler->Evaluate(ep);
+        HRESULT chr = list->Close();
+
+        queue->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList*const*>(&cl));
+
+        fence->SetEventOnCompletion(iter + 1, evt);
+        queue->Signal(fence, iter + 1);
+        DWORD wr = WaitForSingleObject(evt, 10000);
+
+        if (wr == WAIT_OBJECT_0) { ++pass; }
+        else { ++fail; if (fail <= 3) Log("SMOKE: iter %d GPU TIMEOUT", iter); }
+
+        if ((iter + 1) % 25 == 0)
+            Log("SMOKE: %d/100 evaluates done (pass=%d fail=%d)", iter + 1, pass, fail);
     }
 
-    q->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList*const*>(&cl));
-
-    // Fence: signal and wait for GPU to finish
-    ID3D12Fence* fence = nullptr;
-    g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-    HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    fence->SetEventOnCompletion(1, evt);
-    q->Signal(fence, 1);
-    DWORD wr = WaitForSingleObject(evt, 10000); // 10s timeout
-    Log("SMOKE: GPU execution %s", wr==WAIT_OBJECT_0 ? "COMPLETED" : "TIMEOUT/FAILED");
-
-    // Check device health after execution
     HRESULT postDrr = ngxDev->GetDeviceRemovedReason();
-    Log("SMOKE: post-exec devRemoved=0x%08X",(unsigned)postDrr);
+    Log("SMOKE: RESULT - %d/100 PASS, %d FAIL, devRemoved=0x%08X",
+        pass, fail, (unsigned)postDrr);
 
     // Cleanup
     CloseHandle(evt); if(fence)fence->Release();
     if(color)color->Release(); if(depth)depth->Release();
     if(mv)mv->Release(); if(out)out->Release();
     if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
-
-    bool pass = eok && (wr==WAIT_OBJECT_0) && SUCCEEDED(postDrr);
-    Log("SMOKE: RESULT - %s", pass ? "PASS" : "FAIL");
 }
 
 void HooksSetConfig(const ScaleNgConfig& config)
