@@ -23,6 +23,7 @@ void HooksInstallVEH();
 void HooksSetConfig(const ScaleNgConfig& config);
 void EnsureGlobalSwapchainHook();
 void EnsureGlobalSwapchainHookEx();
+void RunNgxSyntheticTest();
 
 void HooksInstallCreateDeviceDetour();
 

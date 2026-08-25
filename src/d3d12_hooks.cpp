@@ -4169,6 +4169,177 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list)
 
 void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHookImpl(); }
 
+// ============================================================================
+// SYNTHETIC NGX SMOKE TEST
+// Self-contained test: creates own device textures, initializes NGX on the
+// game's captured device, runs one evaluate. No engine resources touched.
+// Proves NGX can execute on the game's device. Zero hooks required.
+// ============================================================================
+
+void RunNgxSyntheticTest()
+{
+    Log("SMOKE: starting synthetic NGX test");
+
+    if (!g_device) {
+        Log("SMOKE: FAIL - g_device not captured (game created device before ASI loaded?)");
+        return;
+    }
+    Log("SMOKE: device=%p", (void*)g_device);
+
+    // Check device is alive
+    HRESULT drr = g_device->GetDeviceRemovedReason();
+    if (FAILED(drr)) {
+        Log("SMOKE: FAIL - device removed hr=0x%08X", (unsigned)drr);
+        return;
+    }
+    Log("SMOKE: device healthy");
+
+    // Create 512x512 test textures
+    UINT w = 512, h = 512;
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+
+    ID3D12Resource* color = nullptr; ID3D12Resource* depth = nullptr;
+    ID3D12Resource* mv = nullptr; ID3D12Resource* out = nullptr;
+
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color));
+    Log("SMOKE: color tex hr=0x%08X", (unsigned)hr);
+
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth));
+    Log("SMOKE: depth tex hr=0x%08X", (unsigned)hr);
+
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mv));
+    Log("SMOKE: mv tex hr=0x%08X", (unsigned)hr);
+
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out));
+    Log("SMOKE: out tex hr=0x%08X", (unsigned)hr);
+
+    if (!color || !depth || !mv || !out) {
+        Log("SMOKE: FAIL - texture creation");
+        return;
+    }
+
+    // Create command queue + allocator + list
+    ID3D12CommandQueue* queue = nullptr;
+    { D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+      g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)); }
+    ID3D12CommandAllocator* alloc = nullptr;
+    g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+    ID3D12GraphicsCommandList* list = nullptr;
+    g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
+
+    Log("SMOKE: queue=%p alloc=%p list=%p", (void*)queue, (void*)alloc, (void*)list);
+
+    if (!queue || !alloc || !list) {
+        Log("SMOKE: FAIL - command infrastructure");
+        return;
+    }
+
+    // Initialize NGX on game's device
+    if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
+    if (!g_upscaler) {
+        Log("SMOKE: FAIL - upscaler creation");
+        return;
+    }
+    UpscalerInitParams ip = {};
+    ip.device = g_device;  // GAME'S DEVICE
+    ip.renderWidth = w;
+    ip.renderHeight = h;
+    ip.displayWidth = w;
+    ip.displayHeight = h;
+    ip.dlssDllPath = g_cfg.dlssDllPath;
+    ip.appId = g_cfg.appId;
+    ip.perfQuality = 0; // ultra performance
+    ip.mvJittered = false;
+    ip.autoExposure = true;
+    bool initOk = g_upscaler->Init(ip);
+    Log("SMOKE: NGX Init %s", initOk ? "SUCCESS" : "FAILED");
+
+    if (!initOk) {
+        Log("SMOKE: RESULT - NGX init failed on game device");
+        // Cleanup
+        color->Release(); depth->Release(); mv->Release(); out->Release();
+        list->Release(); alloc->Release(); queue->Release();
+        return;
+    }
+
+    // Evaluate
+    list->Reset(alloc, nullptr);
+
+    // Barrier all inputs to readable
+    D3D12_RESOURCE_BARRIER bars[4] = {};
+    for (int i = 0; i < 4; ++i) { bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+    bars[0].Transition.pResource = color;
+    bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bars[1].Transition.pResource = depth;
+    bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bars[2].Transition.pResource = mv;
+    bars[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bars[3].Transition.pResource = out;
+    bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(4, bars);
+
+    UpscalerEvaluateParams ep = {};
+    ep.commandList = list;
+    ep.color = color;
+    ep.depth = depth;
+    ep.motionVectors = mv;
+    ep.output = out;
+    ep.jitterX = 0.0f; ep.jitterY = 0.0f;
+    ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
+    ep.sharpness = 0.0f;
+    bool evalOk = g_upscaler->Evaluate(ep);
+    Log("SMOKE: NGX Evaluate %s", evalOk ? "SUCCESS" : "FAILED");
+
+    list->Close();
+
+    // Submit and wait
+    ID3D12CommandList* cls[] = { list };
+    queue->ExecuteCommandLists(1, cls);
+
+    // Fence wait for completion
+    ID3D12Fence* fence = nullptr;
+    g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    fence->SetEventOnCompletion(1, evt);
+    queue->Signal(fence, 1);
+    WaitForSingleObject(evt, 5000); // wait max 5s
+    DWORD waitResult = WaitForSingleObject(evt, 0);
+    Log("SMOKE: GPU execution %s (wait=0x%08X)", waitResult == WAIT_OBJECT_0 ? "COMPLETE" : "TIMEOUT", (unsigned)waitResult);
+
+    CloseHandle(evt);
+    if (fence) fence->Release();
+
+    Log("SMOKE: RESULT - %s", evalOk ? "PASS - NGX works on game device" : "FAIL - NGX rejected");
+
+    // Cleanup
+    if (color) color->Release();
+    if (depth) depth->Release();
+    if (mv) mv->Release();
+    if (out) out->Release();
+    if (list) list->Release();
+    if (alloc) alloc->Release();
+    if (queue) queue->Release();
+}
+
 void HooksSetConfig(const ScaleNgConfig& config)
 {
     g_cfg = config;
