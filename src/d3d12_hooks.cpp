@@ -4297,13 +4297,41 @@ void RunNgxSyntheticTest()
     ep.mvScaleX=(float)w; ep.mvScaleY=(float)h;
     ep.sharpness=0.0f;
     bool eok=g_upscaler->Evaluate(ep);
-    Log("SMOKE: NGX Evaluate %s",eok?"SUCCESS":"FAILED");
+    Log("SMOKE: NGX Evaluate %s (recorded)",eok?"SUCCESS":"FAILED");
+
+    // Close, submit, and wait for GPU completion
+    HRESULT chr = cl->Close();
+    Log("SMOKE: Close hr=0x%08X",(unsigned)chr);
+    if(FAILED(chr)){
+        if(color)color->Release(); if(depth)depth->Release();
+        if(mv)mv->Release(); if(out)out->Release();
+        if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
+        return;
+    }
+
+    q->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList*const*>(&cl));
+
+    // Fence: signal and wait for GPU to finish
+    ID3D12Fence* fence = nullptr;
+    g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    fence->SetEventOnCompletion(1, evt);
+    q->Signal(fence, 1);
+    DWORD wr = WaitForSingleObject(evt, 10000); // 10s timeout
+    Log("SMOKE: GPU execution %s", wr==WAIT_OBJECT_0 ? "COMPLETED" : "TIMEOUT/FAILED");
+
+    // Check device health after execution
+    drr = ngxDev->GetDeviceRemovedReason();
+    Log("SMOKE: post-exec devRemoved=0x%08X",(unsigned)drr);
 
     // Cleanup
+    CloseHandle(evt); if(fence)fence->Release();
     if(color)color->Release(); if(depth)depth->Release();
     if(mv)mv->Release(); if(out)out->Release();
     if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
-    Log("SMOKE: test complete - %s", eok ? "PASS" : "FAIL");
+
+    bool pass = eok && (wr==WAIT_OBJECT_0) && SUCCEEDED(drr);
+    Log("SMOKE: RESULT - %s", pass ? "PASS" : "FAIL");
 }
 
 void HooksSetConfig(const ScaleNgConfig& config)
