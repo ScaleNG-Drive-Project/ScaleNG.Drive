@@ -3229,7 +3229,20 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
         goto Forward;
     }
 
+    // SEH helper kept out-of-line so CopyTexBody can own C++ objects.
+    struct Local {
+        static bool AltIsPairHalf(ID3D12Resource* alt) {
+            __try {
+                D3D12_RESOURCE_DESC ad = alt->GetDesc();
+                return ad.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+    };
+
     bool inject = false;
+    bool injectBefore = false;
     bool injectBefore = false;
     if (dst && src && src->pResource != dst->pResource &&
         src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
