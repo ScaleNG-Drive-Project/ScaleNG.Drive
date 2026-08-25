@@ -660,8 +660,6 @@ ID3D12Resource* SceneColorBound()
 void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES after)
 {
     if (!list || !res) return;
-    // SAFETY: skip barrier ops if bridge not ready or DLAA disabled
-    if (!g_bridgeReady || !g_dlaaMode) return;
     D3D12_RESOURCE_STATES before;
     bool tracked = false;
     { BookGuard _bg; auto it = g_resourceStates.find(res);
@@ -1638,13 +1636,15 @@ volatile long g_injResourcesReady = 0; // atomic: 0=not ready, 1=ready
 
 static DWORD WINAPI InitThreadProc(LPVOID)
 {
-    // SAFETY DEFAULT: injection resource creation on init thread DISABLED by default.
-    // Enable with SCALENG_ENABLE_INITRES=1 if explicitly needed.
-    static const bool s_noInitRes = GetEnvironmentVariableA("SCALENG_ENABLE_INITRES", nullptr, 0) == 0;
+    // ISOLATION (reviewer #16 pattern): SCALENG_NO_INITRES=1 skips wrapped-
+    // device resource creation on this background thread - prime suspect for
+    // the nvwgf2umx freeze class (every freeze fires immediately after
+    // 'present-injection resources created' from this thread).
+    static const bool s_noInitRes = GetEnvironmentVariableA("SCALENG_NO_INITRES", nullptr, 0) > 0;
     for (;;) {
         WaitForSingleObject(g_initThreadEv, INFINITE);
         if (s_noInitRes) {
-            Log("hooks: init thread - EnsureInjectionResources SKIPPED (safe default)");
+            Log("hooks: init thread - EnsureInjectionResources SKIPPED (isolation mode)");
             return 0;
         }
         if (!InterlockedCompareExchange(&g_injResourcesReady, 0, 0)) {
@@ -3111,9 +3111,10 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                         // NOTE: no EnsureUpscalerInit here - this runs on the
                         // engine ECL thread; NGX init races the Present thread
                         // (double-init corrupted NVIDIA global state).
-                        // SAFETY DEFAULT: camera CB patch DISABLED by default.
-                        // Enable with SCALENG_ENABLE_JITTER=1 if explicitly needed.
-                        if (g_dlaaMode && GetEnvironmentVariableA("SCALENG_ENABLE_JITTER", nullptr, 0) > 0)
+                        // ISOLATION (reviewer #16 pattern): SCALENG_NO_JITTER=1
+                        // disables the CB patch entirely - single-variable test
+                        // for whether jitter writing triggers nvwgf2umx AVs.
+                        if (g_dlaaMode && !GetEnvironmentVariableA("SCALENG_NO_JITTER", nullptr, 0))
                             ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
                                                 g_currJitter, g_prevJitter);
                         std::memcpy(g_lastPatchedCameraCb, cb, kCameraCbSize);
@@ -3223,12 +3224,9 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
                         const D3D12_BOX* srcBox)
 {
-    // SAFETY: skip ALL analysis if bridge not ready or DLAA disabled
-    // Prevents GetDesc/Barrier calls on engine resources during unstable startup
-    if (!g_bridgeReady || !g_dlaaMode) {
-        goto Forward;
-    }
-
+    // SAFETY: skip ALL analysis when bridge not ready (prevents GetDesc on
+    // engine resources during unstable startup / resource churn)
+    if (!g_bridgeReady || !g_dlaaMode) return;
     // SEH helper kept out-of-line so CopyTexBody can own C++ objects.
     struct Local {
         static bool AltIsPairHalf(ID3D12Resource* alt) {
@@ -3240,7 +3238,6 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
             }
         }
     };
-
     bool inject = false;
     bool injectBefore = false;
     if (dst && src && src->pResource != dst->pResource &&
@@ -3432,7 +3429,6 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
         Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, src, srcBox);
     if (inject && !injectBefore)
         DoInjection(list);
-Forward: ;
 }
 
 void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
@@ -3516,9 +3512,10 @@ void Hook_RSSetScissorRects(ID3D12GraphicsCommandList* list, UINT numRects,
 void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
                           const D3D12_RESOURCE_BARRIER* pBarriers)
 {
-    // SAFETY: skip all barrier tracking if bridge not ready or DLAA disabled
+    // SAFETY: skip tracking when bridge not ready (prevents map writes during churn)
     if (!g_bridgeReady || !g_dlaaMode) {
-        return Real_ResourceBarrier(list, numBarriers, pBarriers);
+        Real_ResourceBarrier(list, numBarriers, pBarriers);
+        return;
     }
     if (pBarriers && numBarriers > 0) {
         for (UINT i = 0; i < numBarriers; ++i) {
@@ -3569,10 +3566,11 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                              BOOL RTsSingleHandleToDescriptorRange,
                              const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencilDescriptor)
 {
-    // SAFETY: skip all analysis if bridge not ready or DLAA disabled
+    // SAFETY: skip tracking when bridge not ready (prevents map writes during churn)
     if (!g_bridgeReady || !g_dlaaMode) {
-        return Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
-                                       RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
+        Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
+                                RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
+        return;
     }
     if (numRenderTargets >= 1 && pRenderTargets) {
         g_boundRtv = pRenderTargets[0];
