@@ -3065,24 +3065,18 @@ void EnsureGlobalSwapchainHookImpl()
         Log("hooks: EGSH clean swapchain hr=0x%08X sc=%p", (unsigned)dhr, (void*)dummy);
 
         // ================================================================
-        // STEP 2: Hook Present on the dummy swapchain's vtable.
-        // Real DXGI swapchain: slot 7 = Present. Pure pointer swap.
-        // Since all IDXGISwapChain objects share the same class vtable,
-        // this intercepts Present for EVERY swapchain including the game's.
+        // STEP 2: DO NOT HOOK PRESENT.
+        // Present vtable modification causes: solid-color artifacts,
+        // freezes, missing game window, nvwgf2umx crashes, and
+        // STATUS_STACK_BUFFER_OVERRUN. Confirmed across every variant
+        // (MinHook patching AND pure vtable pointer swapping).
+        //
+        // Instead: NGX will be triggered by ExecuteCommandLists (queue
+        // level) or by a timer thread that detects active rendering via
+        // discovery state. Present forwarding stays untouched.
         // ================================================================
         if (SUCCEEDED(dhr) && dummy) {
-            void** dvt = *(void***)dummy;
-            MEMORY_BASIC_INFORMATION mbi = {};
-            VirtualQuery(dvt, &mbi, sizeof(mbi));
-            DWORD oldProt = 0;
-            if (VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProt)) {
-                Real_Present = (PFN_Present)dvt[7];   // slot 7 = Present
-                dvt[7] = (void*)&Hook_Present;
-                VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
-                Log("hooks: PRESENT HOOKED via vtable swap (slot 7) orig=%p", (void*)Real_Present);
-            } else {
-                Log("hooks: VirtualProtect failed on swapchain vtable");
-            }
+            Log("hooks: EGSH swapchain created (Present NOT hooked - stability)");
         }
 
         // Cleanup temp objects
