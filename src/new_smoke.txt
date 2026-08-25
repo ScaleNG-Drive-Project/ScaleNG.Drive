@@ -1,0 +1,110 @@
+void RunNgxSyntheticTest()
+{
+    static volatile long s_smokeRan = 0;
+    if (InterlockedCompareExchange(&s_smokeRan, 1, 0) != 0) return;
+
+    Log("SMOKE: starting synthetic NGX test");
+    if (!g_device) { Log("SMOKE: FAIL - no device"); return; }
+    Log("SMOKE: device=%p healthy", (void*)g_device);
+
+    // UNWRAP: find real ID3D12Device inside BeamNG's wrapper by vtable match.
+    // Create a clean device to discover the true D3D12Device vtable address,
+    // then scan g_device's memory for embedded objects with same vtable.
+    ID3D12Device* ngxDev = g_device;
+    {
+        typedef HRESULT(WINAPI* PFN_DC)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+        HMODULE dm = GetModuleHandleA("d3d12.dll");
+        auto mk = dm ? (PFN_DC)GetProcAddress(dm, "D3D12CreateDevice") : nullptr;
+        if (mk) {
+            ID3D12Device* td = nullptr;
+            if (SUCCEEDED(mk(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&td)) && td) {
+                void* rvt = *(void**)td;
+                Log("SMOKE-UNWRAP: real vtable=%p", rvt);
+                td->Release();
+                __try {
+                    auto mem = (__forceinline void**)g_device;
+                    for (int off = 0; off < 64; ++off) {
+                        void* cand = mem[off];
+                        if (!cand) continue;
+                        MEMORY_BASIC_INFORMATION m2 = {};
+                        if (!VirtualQuery(cand, &m2, sizeof(m2)) || m2.State != MEM_COMMIT) continue;
+                        if (*(void**)cand == rvt) {
+                            auto cd = (ID3D12Device*)cand;
+                            __try {
+                                if (SUCCEEDED(cd->GetDeviceRemovedReason())) {
+                                    ngxDev = cd;
+                                    Log("SMOKE-UNWRAP: FOUND real dev at +0x%x ptr=%p", off*8, (void*)ngxDev);
+                                    break;
+                                }
+                            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                if (ngxDev == g_device) Log("SMOKE-UNWRAP: no separate dev found - using g_device directly");
+            }
+        }
+    }
+    Log("SMOKE: using %s device %p", ngxDev == g_device ? "g_device" : "UNWRAPPED", (void*)ngxDev);
+
+    // Create 512x512 test textures on unwrapped device
+    UINT w = 512, h = 512;
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+
+    ID3D12Resource* color=nullptr,*depth=nullptr,*mv=nullptr,*out=nullptr;
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&color));
+    Log("SMOKE: color hr=0x%08X",(unsigned)hr);
+    rd.Format = DXGI_FORMAT_R32_FLOAT; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&depth));
+    Log("SMOKE: depth hr=0x%08X",(unsigned)hr);
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&mv));
+    Log("SMOKE: mv hr=0x%08X",(unsigned)hr);
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&out));
+    Log("SMOKE: out hr=0x%08X",(unsigned)hr);
+    if(!color||!depth||!mv||!out){Log("SMOKE: FAIL tex");return;}
+
+    ID3D12CommandQueue* q=nullptr;
+    {D3D12_COMMAND_QUEUE_DESC qd={};qd.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;ngxDev->CreateCommandQueue(&qd,IID_PPV_ARGS(&q));}
+    ID3D12CommandAllocator* al=nullptr;
+    ngxDev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&al));
+    ID3D12GraphicsCommandList* cl=nullptr;
+    ngxDev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,al,nullptr,IID_PPV_ARGS(&cl));
+    if(!q||!al||!cl){Log("SMOKE: FAIL cmd infra");return;}
+    Log("SMOKE: q=%p al=%p cl=%p",(void*)q,(void*)al,(void*)cl);
+
+    // NGX init on unwrapped game device
+    if(!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
+    if(!g_upscaler){Log("SMOKE: FAIL upscaler");return;}
+    UpscalerInitParams ip={};
+    ip.device=ngxDev; ip.renderWidth=w; ip.renderHeight=h;
+    ip.displayWidth=w; ip.displayHeight=h;
+    ip.dlssDllPath=g_cfg.dlssDllPath; ip.appId=g_cfg.appId;
+    ip.perfQuality=0; ip.mvJittered=false; ip.autoExposure=true;
+    bool iok=g_upscaler->Init(ip);
+    Log("SMOKE: NGX Init %s",iok?"SUCCESS":"FAILED");
+    if(!iok){Log("SMOKE: RESULT - init failed");return;}
+
+    // Evaluate
+    cl->Reset(al,nullptr);
+    UpscalerEvaluateParams ep={};
+    ep.commandList=cl; ep.color=color; ep.depth=depth;
+    ep.motionVectors=mv; ep.output=out;
+    ep.jitterX=0; ep.jitterY=0;
+    ep.mvScaleX=(float)w; ep.mvScaleY=(float)h;
+    ep.sharpness=0.0f;
+    bool eok=g_upscaler->Evaluate(ep);
+    Log("SMOKE: NGX Evaluate %s",eok?"SUCCESS":"FAILED");
+
+    // Cleanup
+    if(color)color->Release(); if(depth)depth->Release();
+    if(mv)mv->Release(); if(out)out->Release();
+    if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
+    Log("SMOKE: test complete - %s", eok ? "PASS" : "FAIL");
+}

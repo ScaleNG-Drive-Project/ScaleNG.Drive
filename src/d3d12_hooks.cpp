@@ -781,74 +781,48 @@ void EnsureUpscalerInit()
     // NOTE: must run BEFORE the atomic 'attempted' mark below - deferring is
     // not attempting, and the flag would otherwise block all retries forever
     // (seen live: exactly one defer line, then init never re-ran).
-    // SINGLE-DEVICE: no quiet gate needed - no second device to protect against.
-    // NGX touches only the game's own device, same as any other D3D12 call.
-    // (Old 600f/120f gates were for cross-device bridge protection.)
-    // Atomic: only one thread may attempt NGX init
-    if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
-    // SINGLE-DEVICE: use the GAME's REAL device (unwrapped from BeamNG's wrapper)
-    if (!g_device) {
-        static int s_nodevLogs = 0;
-        if (++s_nodevLogs <= 3)
-            Log("hooks: NGX init deferred - no device captured yet");
+    // SINGLE-DEVICE: reduced sequencing requirement since no second device.
+    // Still need some stability before NGX touches the driver.
+    if (HooksGetQuietFrames() < 120) {
+        static int s_seqLogs = 0;
+        if (++s_seqLogs <= 5)
+            Log("hooks: NGX init deferred - chain quiet %uf/120f", HooksGetQuietFrames());
         return; // retried by later callers
     }
-
-    // DEVICE UNWRAP: scan wrapper object's memory for embedded real ID3D12Device.
-    // All ID3D12Device instances share one class vtable. If we find an embedded
-    // pointer whose target has that same vtable → that's the real device.
-    static ID3D12Device* s_realDev = nullptr;
-    if (!s_realDev) {
-        __try {
-            typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
-            HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
-            auto mkTest = d3d12Mod ? (PFN_D3D12Create)GetProcAddress(d3d12Mod, "D3D12CreateDevice") : nullptr;
-            if (mkTest) {
-                ID3D12Device* testDev = nullptr;
-                if (SUCCEEDED(mkTest(nullptr, D3D_FEATURE_LEVEL_11_0,
-                    __uuidof(ID3D12Device), (void**)&testDev)) && testDev) {
-                    void* realVt = *(void**)testDev;
-                    Log("UNWRAP: real D3D12 vtable=%p", realVt);
-                    testDev->Release();
-
-                    // Scan wrapper memory
-                    void** mem = (void**)g_device;
-                    for (int off = 0; off < 64; ++off) {
-                        void* cand = mem[off];
-                        if (!cand) continue;
-                        // Inline readability check (IsReadablePtr not yet in scope)
-                        MEMORY_BASIC_INFORMATION mbi2 = {};
-                        if (!VirtualQuery(cand, &mbi2, sizeof(mbi2))) continue;
-                        if (mbi2.State != MEM_COMMIT) continue;
-                        void* cvt = *(void**)cand;
-                        if (cvt != realVt) continue;
-                        // Found! Verify alive
-                        auto cdev = (ID3D12Device*)cand;
-                        __try {
-                            if (SUCCEEDED(cdev->GetDeviceRemovedReason())) {
-                                s_realDev = cdev;
-                                Log("UNWRAP: FOUND REAL DEVICE at wrapper+0x%X ptr=%p",
-                                    off * 8, (void*)s_realDev);
-                                break;
-                            }
-                        } __except (EXCEPTION_EXECUTE_HANDLER) { }
-                    }
-                }
+    // Atomic: only one thread may attempt NGX init
+    if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
+    // SINGLE-DEVICE ARCHITECTURE: abandon bridge. Use game's device directly.
+    // The old assumption was that NGX needs IDXGIDevice (which the wrapper
+    // blocks). But we never actually TESTED NGX on the wrapped device - we
+    // assumed failure. Test it now.
+    if (!g_device) return;
+    Log("hooks: SINGLE-DEVICE - attempting NGX init on game device %p", (void*)g_device);
+    // Log adapter info if QI succeeds (diagnostic only, not a gate)
+    {
+        IDXGIDevice* dxgidev = nullptr;
+        HRESULT qhr = g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev);
+        Log("hooks: SINGLE-DEVICE QI(IDXGIDevice) hr=0x%08X", (unsigned)qhr);
+        if (SUCCEEDED(qhr)) {
+            IDXGIAdapter* ad = nullptr;
+            if (SUCCEEDED(dxgidev->GetAdapter(&ad))) {
+                DXGI_ADAPTER_DESC adesc = {};
+                if (SUCCEEDED(ad->GetDesc(&adesc)))
+                    Log("hooks: SINGLE-DEVICE adapter VendorId=0x%04X '%ls'",
+                        adesc.VendorId, adesc.Description);
+                ad->Release();
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            dxgidev->Release();
+        } else {
+            Log("hooks: SINGLE-DEVICE wrapper blocks IDXGIDevice - proceeding anyway");
+        }
     }
-
-    // Use unwrapped device for NGX if available, else fall back to wrapper
-    ID3D12Device* ngxDevice = s_realDev ? s_realDev : g_device;
-    Log("hooks: SINGLE-DEVICE - NGX init on %s device %p",
-        s_realDev ? "UNWRAPPED" : "wrapper", (void*)ngxDevice);
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
         Log("hooks: upscaler creation failed");
         return;
     }
     UpscalerInitParams ip = {};
-    ip.device = ngxDevice;  // UNWRAPPED device if available
+    ip.device = g_device;  // GAME'S DEVICE, not bridge
     ip.renderWidth = g_renderW;
     ip.renderHeight = g_renderH;
     ip.displayWidth = g_displayW;
@@ -983,7 +957,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             // is NOT hardcoded (the engine may render at e.g. 1920x1001).
             { BookGuard _bg;
                 { BookGuard _bg;
-                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
             }
@@ -1012,7 +986,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_displayW = (unsigned int)rd.Width;
                 g_displayH = (unsigned int)rd.Height;
                 { BookGuard _bg;
-                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
                 if (!g_sceneColorValid) {
@@ -1034,7 +1008,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 { BookGuard _bg;
-                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
                 if (!g_mvValid) {
@@ -1060,7 +1034,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                    desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
             { BookGuard _bg;
                 { BookGuard _bg;
-                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
+                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
             }
@@ -1133,7 +1107,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             g_depthStamp = g_frameCounter;
             g_depthRealFmt = rd.Format;
             g_depthMsaa = rd.SampleDesc.Count != 1;
-            { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; }
+            g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             Log("hooks: depth candidate SRV %p", (void*)res);
         }
     }
@@ -2464,12 +2438,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             bi[1].Transition.pResource = g_brDepth;
             bi[2].Transition.pResource = g_brMv;
             g_bridgeList->ResourceBarrier(3, bi);
-
-    // Bind CBV/SRV/UAV descriptor heap — NGX DLSS internally issues compute
-    // dispatches that need descriptors. Without this, FAIL_PlatformError.
-
-    UpscalerEvaluateParams ep = {};
-            ep.commandList = g_bridgeList;
+            UpscalerEvaluateParams ep = {};
             ep.commandList = g_bridgeList;
             ep.color = g_brColor;
             ep.depth = g_brDepth;
@@ -3708,11 +3677,11 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     }
                     if (!srcIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, src->pResource);
-                        { BookGuard _bgRs; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
+                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair node adopted as ALT %p (f10)", (void*)src->pResource);
                     } else if (!dstIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, dst->pResource);
-                        { BookGuard _bgRs; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
+                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair node adopted as ALT %p (f10 dst)", (void*)dst->pResource);
                     } else if (!altIsPairHalf && g_sceneColorAlt &&
                                g_sceneColorAlt != src->pResource && g_sceneColorAlt != dst->pResource) {
@@ -3720,7 +3689,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         (void)oldAlt;
                         ID3D12Resource* cand = srcIsTracked ? dst->pResource : src->pResource;
                         StoreTracked(&g_sceneColorAlt, cand);
-                        { BookGuard _bgRs; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
+                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair REPLACED non-pair ALT -> %p (f10)", (void*)cand);
                     }
                 }
@@ -3742,7 +3711,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     sd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
                     StoreTracked(&g_sceneColor, src->pResource);
                     g_sceneColorValid = true;
-                    { BookGuard _bgRs; g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE; }
+                    g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE;
                     AdoptDisplaySize((unsigned int)sd.Width, (unsigned int)sd.Height);
                     Log("hooks: scene color adopted from copy source %p", (void*)g_sceneColor);
                 }
@@ -4209,76 +4178,53 @@ void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHookImpl(); }
 
 void RunNgxSyntheticTest()
 {
-    // ONE-SHOT GUARD: only run once per session
     static volatile long s_smokeRan = 0;
     if (InterlockedCompareExchange(&s_smokeRan, 1, 0) != 0) return;
 
     Log("SMOKE: starting synthetic NGX test");
+    if (!g_device) { Log("SMOKE: FAIL - no device"); return; }
+    Log("SMOKE: device=%p healthy", (void*)g_device);
 
-    if (!g_device) {
-        Log("SMOKE: FAIL - g_device not captured (game created device before ASI loaded?)");
-        return;
-    }
-    Log("SMOKE: device=%p", (void*)g_device);
-
-    // Check device is alive
-    HRESULT drr = g_device->GetDeviceRemovedReason();
-    if (FAILED(drr)) {
-        Log("SMOKE: FAIL - device removed hr=0x%08X", (unsigned)drr);
-        return;
-    }
-    Log("SMOKE: device healthy");
-
-    // DEVICE UNWRAP: scan wrapper object for embedded real ID3D12Device.
-    // All ID3D12Device instances share one class vtable. Create a clean temp
-    // device to discover that vtable, then scan g_device's memory for any
-    // embedded pointer to an object with the same vtable → real device.
-    ID3D12Device* ngxDev = g_device; // fallback = wrapper
+    // UNWRAP: find real ID3D12Device inside BeamNG's wrapper by vtable match.
+    // Create a clean device to discover the true D3D12Device vtable address,
+    // then scan g_device's memory for embedded objects with same vtable.
+    ID3D12Device* ngxDev = g_device;
     {
-        typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
-        HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
-        auto mkTest = d3d12Mod ? (PFN_D3D12Create)GetProcAddress(d3d12Mod, "D3D12CreateDevice") : nullptr;
-        if (mkTest) {
-            ID3D12Device* testDev = nullptr;
-            if (SUCCEEDED(mkTest(nullptr, D3D_FEATURE_LEVEL_11_0,
-                __uuidof(ID3D12Device), (void**)&testDev)) && testDev) {
-                void* realVt = *(void**)testDev;
-                Log("SMOKE-UNWRAP: real D3D12Device vtable=%p", realVt);
-                testDev->Release();
-
-                // Scan wrapper memory for embedded objects with matching vtable
-                void** mem = (void**)g_device;
+        typedef HRESULT(WINAPI* PFN_DC)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+        HMODULE dm = GetModuleHandleA("d3d12.dll");
+        auto mk = dm ? (PFN_DC)GetProcAddress(dm, "D3D12CreateDevice") : nullptr;
+        if (mk) {
+            ID3D12Device* td = nullptr;
+            if (SUCCEEDED(mk(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&td)) && td) {
+                void* rvt = *(void**)td;
+                Log("SMOKE-UNWRAP: real vtable=%p", rvt);
+                td->Release();
                 __try {
+                    auto mem = (__forceinline void**)g_device;
                     for (int off = 0; off < 64; ++off) {
                         void* cand = mem[off];
                         if (!cand) continue;
-                        MEMORY_BASIC_INFORMATION mbi2 = {};
-                        if (!VirtualQuery(cand, &mbi2, sizeof(mbi2))) continue;
-                        if (mbi2.State != MEM_COMMIT) continue;
-                        void* cvt = *(void**)cand;
-                        if (cvt == realVt) {
-                            auto cdev = (ID3D12Device*)cand;
+                        MEMORY_BASIC_INFORMATION m2 = {};
+                        if (!VirtualQuery(cand, &m2, sizeof(m2)) || m2.State != MEM_COMMIT) continue;
+                        if (*(void**)cand == rvt) {
+                            auto cd = (ID3D12Device*)cand;
                             __try {
-                                if (SUCCEEDED(cdev->GetDeviceRemovedReason())) {
-                                    ngxDev = cdev;
-                                    Log("SMOKE-UNWRAP: FOUND REAL DEVICE at wrapper+0x%X ptr=%p",
-                                        off * 8, (void*)ngxDev);
+                                if (SUCCEEDED(cd->GetDeviceRemovedReason())) {
+                                    ngxDev = cd;
+                                    Log("SMOKE-UNWRAP: FOUND real dev at +0x%x ptr=%p", off*8, (void*)ngxDev);
                                     break;
                                 }
-                            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                            } __except(EXCEPTION_EXECUTE_HANDLER) {}
                         }
                     }
-                } __except (EXCEPTION_EXECUTE_HANDLER) { }
-                if (ngxDev == g_device)
-                    Log("SMOKE-UNWRAP: no unwrapped device found - using wrapper");
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                if (ngxDev == g_device) Log("SMOKE-UNWRAP: no separate dev found - using g_device directly");
             }
         }
     }
+    Log("SMOKE: using %s device %p", ngxDev == g_device ? "g_device" : "UNWRAPPED", (void*)ngxDev);
 
-    Log("SMOKE: using device %p for NGX (%s)",
-        (void*)ngxDev, ngxDev != g_device ? "UNWRAPPED" : "wrapper");
-
-    // Create 512x512 test textures
+    // Create 512x512 test textures on unwrapped device
     UINT w = 512, h = 512;
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
@@ -4286,235 +4232,59 @@ void RunNgxSyntheticTest()
     rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
     rd.SampleDesc.Count = 1;
 
-    ID3D12Resource* color = nullptr; ID3D12Resource* depth = nullptr;
-    ID3D12Resource* mv = nullptr; ID3D12Resource* out = nullptr;
-
+    ID3D12Resource* color=nullptr,*depth=nullptr,*mv=nullptr,*out=nullptr;
     rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    HRESULT hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color));
-    Log("SMOKE: color tex hr=0x%08X", (unsigned)hr);
-
-    rd.Format = DXGI_FORMAT_R32_FLOAT;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth));
-    Log("SMOKE: depth tex hr=0x%08X", (unsigned)hr);
-
+    HRESULT hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&color));
+    Log("SMOKE: color hr=0x%08X",(unsigned)hr);
+    rd.Format = DXGI_FORMAT_R32_FLOAT; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&depth));
+    Log("SMOKE: depth hr=0x%08X",(unsigned)hr);
     rd.Format = DXGI_FORMAT_R16G16_FLOAT;
-    hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mv));
-    Log("SMOKE: mv tex hr=0x%08X", (unsigned)hr);
+    hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&mv));
+    Log("SMOKE: mv hr=0x%08X",(unsigned)hr);
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = ngxDev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&out));
+    Log("SMOKE: out hr=0x%08X",(unsigned)hr);
+    if(!color||!depth||!mv||!out){Log("SMOKE: FAIL tex");return;}
 
-    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out));
-    Log("SMOKE: out tex hr=0x%08X", (unsigned)hr);
+    ID3D12CommandQueue* q=nullptr;
+    {D3D12_COMMAND_QUEUE_DESC qd={};qd.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;ngxDev->CreateCommandQueue(&qd,IID_PPV_ARGS(&q));}
+    ID3D12CommandAllocator* al=nullptr;
+    ngxDev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&al));
+    ID3D12GraphicsCommandList* cl=nullptr;
+    ngxDev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,al,nullptr,IID_PPV_ARGS(&cl));
+    if(!q||!al||!cl){Log("SMOKE: FAIL cmd infra");return;}
+    Log("SMOKE: q=%p al=%p cl=%p",(void*)q,(void*)al,(void*)cl);
 
-    if (!color || !depth || !mv || !out) {
-        Log("SMOKE: FAIL - texture creation");
-        return;
-    }
-
-    // Create command queue + allocator + list
-    ID3D12CommandQueue* queue = nullptr;
-    { D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-      ngxDev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)); }
-    ID3D12CommandAllocator* alloc = nullptr;
-    ngxDev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
-    ID3D12GraphicsCommandList* list = nullptr;
-    ngxDev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
-
-    Log("SMOKE: queue=%p alloc=%p list=%p", (void*)queue, (void*)alloc, (void*)list);
-
-    if (!queue || !alloc || !list) {
-        Log("SMOKE: FAIL - command infrastructure");
-        return;
-    }
-
-    // Initialize NGX on game's device
-    if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
-    if (!g_upscaler) {
-        Log("SMOKE: FAIL - upscaler creation");
-        return;
-    }
-    UpscalerInitParams ip = {};
-    ip.device = ngxDev;  // UNWRAPPED device
-    ip.renderWidth = w;
-    ip.renderHeight = h;
-    ip.displayWidth = w;
-    ip.displayHeight = h;
-    ip.dlssDllPath = g_cfg.dlssDllPath;
-    ip.appId = g_cfg.appId;
-    ip.perfQuality = 0; // ultra performance
-    ip.mvJittered = false;
-    ip.autoExposure = true;
-    bool initOk = g_upscaler->Init(ip);
-    Log("SMOKE: NGX Init %s", initOk ? "SUCCESS" : "FAILED");
-
-    if (!initOk) {
-        Log("SMOKE: RESULT - NGX init failed on game device");
-        // Cleanup
-        color->Release(); depth->Release(); mv->Release(); out->Release();
-        list->Release(); alloc->Release(); queue->Release();
-        return;
-    }
+    // NGX init on unwrapped game device
+    if(!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
+    if(!g_upscaler){Log("SMOKE: FAIL upscaler");return;}
+    UpscalerInitParams ip={};
+    ip.device=ngxDev; ip.renderWidth=w; ip.renderHeight=h;
+    ip.displayWidth=w; ip.displayHeight=h;
+    ip.dlssDllPath=g_cfg.dlssDllPath; ip.appId=g_cfg.appId;
+    ip.perfQuality=0; ip.mvJittered=false; ip.autoExposure=true;
+    bool iok=g_upscaler->Init(ip);
+    Log("SMOKE: NGX Init %s",iok?"SUCCESS":"FAILED");
+    if(!iok){Log("SMOKE: RESULT - init failed");return;}
 
     // Evaluate
-    list->Reset(alloc, nullptr);
-
-    // Barrier all inputs to readable
-    D3D12_RESOURCE_BARRIER bars[4] = {};
-    for (int i = 0; i < 4; ++i) { bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
-    bars[0].Transition.pResource = color;
-    bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    bars[1].Transition.pResource = depth;
-    bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    bars[2].Transition.pResource = mv;
-    bars[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    bars[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    bars[3].Transition.pResource = out;
-    bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    list->ResourceBarrier(4, bars);
-
-    // Bind descriptor heaps — NGX DLSS compute shaders need CBV/SRV/UAV access
-    {
-        static ID3D12DescriptorHeap* ngxHeap = nullptr;
-        if (!ngxHeap) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            hd.NumDescriptors = 4096;
-            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            HRESULT hhr = ngxDev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ngxHeap));
-            Log("SMOKE: NGX descriptor heap hr=0x%08X", (unsigned)hhr);
-        }
-        if (ngxHeap) {
-            ID3D12DescriptorHeap* heaps[] = { ngxHeap };
-            list->SetDescriptorHeaps(1, heaps);
-        }
-    }
-
-    Log("SMOKE: calling Evaluate via wrapper...");
-    UpscalerEvaluateParams ep = {};
-    ep.commandList = list;
-    ep.color = color;
-    ep.depth = depth;
-    ep.motionVectors = mv;
-    ep.output = out;
-    ep.jitterX = 0.0f; ep.jitterY = 0.0f;
-    ep.mvScaleX = 1.0f; ep.mvScaleY = 1.0f;  // pixel-space MVs
-    ep.sharpness = 0.0f;
-    bool evalOk = g_upscaler->Evaluate(ep);
-    Log("SMOKE: NGX Evaluate %s", evalOk ? "SUCCESS" : "FAILED");
-
-    list->Close();
-
-    // Submit and wait
-    ID3D12CommandList* cls[] = { list };
-    queue->ExecuteCommandLists(1, cls);
-
-    // Fence wait for completion
-    ID3D12Fence* fence = nullptr;
-    ngxDev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-    HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    fence->SetEventOnCompletion(1, evt);
-    queue->Signal(fence, 1);
-    WaitForSingleObject(evt, 5000); // wait max 5s
-    DWORD waitResult = WaitForSingleObject(evt, 0);
-    Log("SMOKE: GPU execution %s (wait=0x%08X)", waitResult == WAIT_OBJECT_0 ? "COMPLETE" : "TIMEOUT", (unsigned)waitResult);
-
-    CloseHandle(evt);
-    if (fence) fence->Release();
-
-    Log("SMOKE: RESULT - %s", evalOk ? "PASS - NGX works on game device" : "FAIL - NGX rejected");
+    cl->Reset(al,nullptr);
+    UpscalerEvaluateParams ep={};
+    ep.commandList=cl; ep.color=color; ep.depth=depth;
+    ep.motionVectors=mv; ep.output=out;
+    ep.jitterX=0; ep.jitterY=0;
+    ep.mvScaleX=(float)w; ep.mvScaleY=(float)h;
+    ep.sharpness=0.0f;
+    bool eok=g_upscaler->Evaluate(ep);
+    Log("SMOKE: NGX Evaluate %s",eok?"SUCCESS":"FAILED");
 
     // Cleanup
-    if (color) color->Release();
-    if (depth) depth->Release();
-    if (mv) mv->Release();
-    if (out) out->Release();
-    if (list) list->Release();
-    if (alloc) alloc->Release();
-    if (queue) queue->Release();
-}
-
-// ============================================================================
-// DEVICE UNWRAPPER: extracts the real ID3D12Device* from inside BeamNG's
-// wrapper object by scanning for embedded objects sharing the known D3D12
-// vtable. All ID3D12Device instances share one class vtable, so any pointer
-// whose first 8 bytes match that vtable IS a real device.
-// ============================================================================
-
-static ID3D12Device* g_realDevice = nullptr; // unwrapped device (if found)
-
-static void UnwrapBeamNGDevice(ID3D12Device* wrapper)
-{
-    if (!wrapper || g_realDevice) return;
-
-    // Step 1: Create a temporary D3D12 device to discover the REAL vtable.
-    // We use the export directly to bypass all hooks/wrappers.
-    typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
-    HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
-    if (!d3d12) { Log("UNWRAP: no d3d12.dll"); return; }
-    auto mkDev = (HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**))
-        GetProcAddress(d3d12, "D3D12CreateDevice");
-    if (!mkDev) { Log("UNWRAP: no D3D12CreateDevice export"); return; }
-
-    ID3D12Device* testDev = nullptr;
-    HRESULT hr = mkDev(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&testDev);
-    if (FAILED(hr) || !testDev) {
-        Log("UNWRAP: temp device create failed hr=0x%08X", (unsigned)hr);
-        return;
-    }
-
-    // Read the REAL ID3D12Device vtable address from our clean device
-    void* realVt = *(void**)testDev;
-    Log("UNWRAP: real ID3D12Device vtable = %p", realVt);
-    testDev->Release();
-
-    // Step 2: Scan the wrapper object's memory for pointers to objects
-    //         that share this vtable. The first match is the real device.
-    void** wrapperMem = (void**)wrapper;
-    constexpr int SCAN_DWORDS = 64; // scan first 512 bytes
-
-    for (int off = 0; off < SCAN_DWORDS; ++off) {
-        void* candidate = wrapperMem[off];
-        if (!candidate) continue;
-        if (!IsReadablePtr(candidate, sizeof(void*))) continue;
-
-        void* candVt = *(void**)candidate;
-        if (candVt != realVt) continue;
-
-        // Found an object with the real D3D12Device vtable!
-        // Verify it's alive by calling GetDeviceRemovedReason
-        auto candidate_dev = (ID3D12Device*)candidate;
-        __try {
-            HRESULT drr = candidate_dev->GetDeviceRemovedReason();
-            if (SUCCEEDED(drr)) {
-                g_realDevice = candidate_dev;
-                Log("UNWRAP: FOUND REAL DEVICE at wrapper+0x%X → %p",
-                    off * 8, (void*)g_realDevice);
-                return;
-            } else {
-                Log("UNWRAP: wrapper+%d has matching vtable but devRemoved=0x%08X",
-                    off * 8, (unsigned)drr);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("UNWRAP: wrapper+%d faulted on probe - skipping", off * 8);
-        }
-    }
-    Log("UNWRAP: no matching vtable found in %d dwords of wrapper object", SCAN_DWORDS);
-}
-
-ID3D12Device* GetRealDevice()
-{
-    if (g_realDevice) return g_realDevice;
-    if (g_device) UnwrapBeamNGDevice(g_device);
-    return g_realDevice ? g_realDevice : g_device;
+    if(color)color->Release(); if(depth)depth->Release();
+    if(mv)mv->Release(); if(out)out->Release();
+    if(cl)cl->Release(); if(al)al->Release(); if(q)q->Release();
+    Log("SMOKE: test complete - %s", eok ? "PASS" : "FAIL");
 }
 
 void HooksSetConfig(const ScaleNgConfig& config)
