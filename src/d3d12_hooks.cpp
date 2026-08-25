@@ -787,22 +787,40 @@ void EnsureUpscalerInit()
             Log("hooks: NGX init deferred - chain quiet %uf/600f", HooksGetQuietFrames());
         return; // retried by later callers
     }
-    // Atomic: the camera-CB hook (engine ECL thread) and the Present thread
-    // can both reach this simultaneously - a plain check allowed double NGX
-    // init and corrupted NVIDIA global state.
+    // Atomic: only one thread may attempt NGX init
     if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
-    // Wait for the bridge device - initializing NGX on the game's wrapper
-    // device crashes the driver. If bridge isn't ready yet, don't mark
-    // attempted; a later call will retry once it exists.
-    extern ID3D12Device* g_bridgeDev;
-    if (!g_bridgeDev) return;
+    // SINGLE-DEVICE ARCHITECTURE: abandon bridge. Use game's device directly.
+    // The old assumption was that NGX needs IDXGIDevice (which the wrapper
+    // blocks). But we never actually TESTED NGX on the wrapped device - we
+    // assumed failure. Test it now.
+    if (!g_device) return;
+    Log("hooks: SINGLE-DEVICE - attempting NGX init on game device %p", (void*)g_device);
+    // Log adapter info if QI succeeds (diagnostic only, not a gate)
+    {
+        IDXGIDevice* dxgidev = nullptr;
+        HRESULT qhr = g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev);
+        Log("hooks: SINGLE-DEVICE QI(IDXGIDevice) hr=0x%08X", (unsigned)qhr);
+        if (SUCCEEDED(qhr)) {
+            IDXGIAdapter* ad = nullptr;
+            if (SUCCEEDED(dxgidev->GetAdapter(&ad))) {
+                DXGI_ADAPTER_DESC adesc = {};
+                if (SUCCEEDED(ad->GetDesc(&adesc)))
+                    Log("hooks: SINGLE-DEVICE adapter VendorId=0x%04X '%ls'",
+                        adesc.VendorId, adesc.Description);
+                ad->Release();
+            }
+            dxgidev->Release();
+        } else {
+            Log("hooks: SINGLE-DEVICE wrapper blocks IDXGIDevice - proceeding anyway");
+        }
+    }
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
         Log("hooks: upscaler creation failed");
         return;
     }
     UpscalerInitParams ip = {};
-    ip.device = g_bridgeDev;
+    ip.device = g_device;  // GAME'S DEVICE, not bridge
     ip.renderWidth = g_renderW;
     ip.renderHeight = g_renderH;
     ip.displayWidth = g_displayW;
@@ -1819,10 +1837,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
     }
 
-    // Build bridge early - doesn't need backbuffer, only dims + format
-    if (g_dlaaMode && g_displayW > 0 && g_bbFormat != DXGI_FORMAT_UNKNOWN) {
-        EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device);
-    }
+    // SINGLE-DEVICE: bridge creation DISABLED - NGX runs on game's device
+    // if (g_dlaaMode && g_displayW > 0 && g_bbFormat != DXGI_FORMAT_UNKNOWN) {
+    //     EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device);
+    // }
 
     if (!bb) return; // no backbuffer = skip injection, but bridge may now exist
 
@@ -1865,14 +1883,14 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     }
 
     // Bridge device + shared textures: SAFE during load (every stable run
-    // built it there; late builds hit DEVICE_REMOVED under render load).
-    if (g_dlaaMode) {
-        if (doStepLog) Log("step: calling EnsureBridge");
-        if (!EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device)) {
-            static int s_brFail = 0;
-            if (++s_brFail <= 3) Log("hooks: bridge unavailable - DLAA disabled this session");
-        }
-    }
+    // SINGLE-DEVICE: bridge creation DISABLED
+    // if (g_dlaaMode) {
+    //     if (doStepLog) Log("step: calling EnsureBridge");
+    //     if (!EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device)) {
+    //         static int s_brFail = 0;
+    //         if (++s_brFail <= 3) Log("hooks: bridge unavailable - DLAA disabled this session");
+    //     }
+    // }
     // NGX runtime load + upscaler + injection PSOs/heaps: DEFERRED to settle
     // (these were the load-window perturbations worth avoiding).
     if (g_dlaaMode && g_settledOnce) {
