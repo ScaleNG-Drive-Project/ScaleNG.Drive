@@ -4229,6 +4229,55 @@ void RunNgxSyntheticTest()
     }
     Log("SMOKE: device healthy");
 
+    // DEVICE UNWRAP: scan wrapper object for embedded real ID3D12Device.
+    // All ID3D12Device instances share one class vtable. Create a clean temp
+    // device to discover that vtable, then scan g_device's memory for any
+    // embedded pointer to an object with the same vtable → real device.
+    ID3D12Device* ngxDev = g_device; // fallback = wrapper
+    {
+        typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+        HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
+        auto mkTest = d3d12Mod ? (PFN_D3D12Create)GetProcAddress(d3d12Mod, "D3D12CreateDevice") : nullptr;
+        if (mkTest) {
+            ID3D12Device* testDev = nullptr;
+            if (SUCCEEDED(mkTest(nullptr, D3D_FEATURE_LEVEL_11_0,
+                __uuidof(ID3D12Device), (void**)&testDev)) && testDev) {
+                void* realVt = *(void**)testDev;
+                Log("SMOKE-UNWRAP: real D3D12Device vtable=%p", realVt);
+                testDev->Release();
+
+                // Scan wrapper memory for embedded objects with matching vtable
+                void** mem = (void**)g_device;
+                __try {
+                    for (int off = 0; off < 64; ++off) {
+                        void* cand = mem[off];
+                        if (!cand) continue;
+                        MEMORY_BASIC_INFORMATION mbi2 = {};
+                        if (!VirtualQuery(cand, &mbi2, sizeof(mbi2))) continue;
+                        if (mbi2.State != MEM_COMMIT) continue;
+                        void* cvt = *(void**)cand;
+                        if (cvt == realVt) {
+                            auto cdev = (ID3D12Device*)cand;
+                            __try {
+                                if (SUCCEEDED(cdev->GetDeviceRemovedReason())) {
+                                    ngxDev = cdev;
+                                    Log("SMOKE-UNWRAP: FOUND REAL DEVICE at wrapper+0x%X ptr=%p",
+                                        off * 8, (void*)ngxDev);
+                                    break;
+                                }
+                            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                if (ngxDev == g_device)
+                    Log("SMOKE-UNWRAP: no unwrapped device found - using wrapper");
+            }
+        }
+    }
+
+    Log("SMOKE: using device %p for NGX (%s)",
+        (void*)ngxDev, ngxDev != g_device ? "UNWRAPPED" : "wrapper");
+
     // Create 512x512 test textures
     UINT w = 512, h = 512;
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -4242,24 +4291,24 @@ void RunNgxSyntheticTest()
 
     rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+    HRESULT hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color));
     Log("SMOKE: color tex hr=0x%08X", (unsigned)hr);
 
     rd.Format = DXGI_FORMAT_R32_FLOAT;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+    hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth));
     Log("SMOKE: depth tex hr=0x%08X", (unsigned)hr);
 
     rd.Format = DXGI_FORMAT_R16G16_FLOAT;
-    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+    hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mv));
     Log("SMOKE: mv tex hr=0x%08X", (unsigned)hr);
 
     rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+    hr = ngxDev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out));
     Log("SMOKE: out tex hr=0x%08X", (unsigned)hr);
 
@@ -4271,11 +4320,11 @@ void RunNgxSyntheticTest()
     // Create command queue + allocator + list
     ID3D12CommandQueue* queue = nullptr;
     { D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-      g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)); }
+      ngxDev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)); }
     ID3D12CommandAllocator* alloc = nullptr;
-    g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+    ngxDev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
     ID3D12GraphicsCommandList* list = nullptr;
-    g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
+    ngxDev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
 
     Log("SMOKE: queue=%p alloc=%p list=%p", (void*)queue, (void*)alloc, (void*)list);
 
@@ -4340,7 +4389,7 @@ void RunNgxSyntheticTest()
             hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             hd.NumDescriptors = 4096;
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            HRESULT hhr = g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ngxHeap));
+            HRESULT hhr = ngxDev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ngxHeap));
             Log("SMOKE: NGX descriptor heap hr=0x%08X", (unsigned)hhr);
         }
         if (ngxHeap) {
@@ -4370,7 +4419,7 @@ void RunNgxSyntheticTest()
 
     // Fence wait for completion
     ID3D12Fence* fence = nullptr;
-    g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    ngxDev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
     HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     fence->SetEventOnCompletion(1, evt);
     queue->Signal(fence, 1);
