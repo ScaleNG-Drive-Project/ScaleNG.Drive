@@ -1717,6 +1717,7 @@ static ID3D12Resource* g_ngxMv = nullptr;        // our MV (zeros = static frame
 static ID3D12Resource* g_ngxOut = nullptr;       // NGX output
 static ID3D12CommandAllocator* g_ngxAlloc = nullptr;
 static ID3D12GraphicsCommandList* g_ngxList = nullptr;
+static ID3D12CommandQueue* g_ngxQueue = nullptr;    // our own queue
 static bool g_ngxPipelineReady = false;
 static unsigned g_ngxFrameCount = 0;
 
@@ -1759,7 +1760,7 @@ static void CreateNgxTextures(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt
 static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandList* cmdList,
                                       ID3D12CommandQueue* queue)
 {
-    if (!g_device || !g_swapchain) return;
+    if (!g_swapchain) return;
 
     // Get backbuffer
     ID3D12Resource* bb = nullptr;
@@ -1770,17 +1771,34 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
 
     // Lazy-create everything on first valid frame
     if (!g_ngxPipelineReady) {
+        // Get device from swapchain (always works - raw COM call)
+        if (!g_device) {
+            IDXGIDevice* dxgidev = nullptr;
+            if (SUCCEEDED(g_swapchain->GetDevice(__uuidof(IDXGIDevice), (void**)&dxgidev))) {
+                dxgidev->QueryInterface(__uuidof(ID3D12Device), (void**)&g_device);
+                dxgidev->Release();
+            }
+        }
+        if (!g_device) { bb->Release(); return; }
+
         if (!g_upscaler) {
             EnsureUpscalerInit();
             if (!g_upscaler || !g_upscaler->IsReady()) { bb->Release(); return; }
         }
+
         CreateNgxTextures(g_device, w, h, bbd.Format);
         g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_ngxAlloc));
         g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_ngxAlloc, nullptr,
                                     IID_PPV_ARGS(&g_ngxList));
         g_ngxList->Close();
+
+        // Our OWN command queue on the game's device
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_ngxQueue));
+
         g_ngxPipelineReady = true;
-        Log("ngx-pipe: pipeline ready");
+        Log("ngx-pipe: pipeline ready (dev=%p queue=%p)", (void*)g_device, (void*)g_ngxQueue);
     }
 
     if (!g_ngxColor || !g_ngxDepth || !g_ngxMv || !g_ngxOut) { bb->Release(); return; }
@@ -1866,9 +1884,9 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
 
     g_ngxList->Close();
 
-    // Submit on game queue
+    // Submit on OUR queue
     ID3D12CommandList* cls[] = { g_ngxList };
-    queue->ExecuteCommandLists(1, cls);
+    g_ngxQueue->ExecuteCommandLists(1, cls);
 
     bb->Release();
 }
@@ -1899,22 +1917,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
 
     // SELF-CONTAINED NGX PIPELINE: bypasses ALL legacy architecture.
     // No bridge, no shared resources, no cross-device anything.
-    // Just NGX on game device + backbuffer copy in/out.
-    if (g_dlaaMode && g_swapchain && g_graphicsQueue && g_device) {
+    // Gets device + queue from swapchain internally. Only needs g_swapchain.
+    if (g_dlaaMode && g_swapchain) {
         __try {
-            // Get backbuffer for pipeline
-            IDXGISwapChain3* sc3 = nullptr;
-            if (SUCCEEDED(g_swapchain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
-                UINT idx = sc3->GetCurrentBackBufferIndex();
-                ID3D12Resource* bb = nullptr;
-                __try {
-                    if (SUCCEEDED(sc3->GetBuffer(idx, IID_PPV_ARGS(&bb))) && bb) {
-                        bb->Release(); // NgxSelfContainedPipeline re-fetches via GetBuffer(0)
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) { }
-                sc3->Release();
-            }
-            NgxSelfContainedPipeline(g_swapchain, nullptr, g_graphicsQueue);
+            NgxSelfContainedPipeline(g_swapchain, nullptr, nullptr);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             static int s_ngxStorm = 0;
             if (++s_ngxStorm <= 5)
