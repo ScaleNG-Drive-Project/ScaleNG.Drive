@@ -3764,6 +3764,8 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         bool reinstallHooks = (g_device != newDev);
         g_device = newDev;
         if (reinstallHooks) {
+            // DISABLED FOR BISECTION: re-enable one at a time
+            if (false) {
             // PURE VTABLE SWAP: never patch driver code bytes. Just redirect
             // the vtable pointer to our hook and save the original for
             // forwarding. The original function code is untouched.
@@ -3788,6 +3790,7 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                 void* targets[2] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView };
                 CfgMarkValid(targets, 2);
             }
+            } // end disabled device vtable swap
         }
 
         ID3D12CommandQueue* queue = nullptr;
@@ -3795,6 +3798,8 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         if (SUCCEEDED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) && queue) {
             void** qv = *(void***)queue;
+            // DISABLED FOR BISECTION
+            if (false) {
             // PURE VTABLE SWAP for queue too
             MEMORY_BASIC_INFORMATION qmbi = {};
             VirtualQuery(qv, &qmbi, sizeof(qmbi));
@@ -3804,6 +3809,7 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                 qv[10] = (void*)&Hook_ExecuteCommandLists;
                 VirtualProtect(qmbi.BaseAddress, qmbi.RegionSize, qoldProt, &qoldProt);
                 Log("hooks: queue vtable SWAPPED (slot 10)");
+            } // end disabled queue swap
             } else {
                 Log("hooks: VirtualProtect on queue vtable failed");
             }
