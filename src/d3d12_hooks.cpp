@@ -19,8 +19,6 @@ extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR
 PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
 void EnsureUpscalerInit();
-
-static bool IsReadablePtr(const void* p, size_t len);
 static bool s_creatingBridge = false;   // true while EnsureBridge creates its device
 unsigned g_mvFirstValidFrame = 0;
 unsigned g_depthFirstValidFrame = 0;
@@ -817,7 +815,11 @@ void EnsureUpscalerInit()
                     void** mem = (void**)g_device;
                     for (int off = 0; off < 64; ++off) {
                         void* cand = mem[off];
-                        if (!cand || !IsReadablePtr(cand, sizeof(void*))) continue;
+                        if (!cand) continue;
+                        // Inline readability check (IsReadablePtr not yet in scope)
+                        MEMORY_BASIC_INFORMATION mbi2 = {};
+                        if (!VirtualQuery(cand, &mbi2, sizeof(mbi2))) continue;
+                        if (mbi2.State != MEM_COMMIT) continue;
                         void* cvt = *(void**)cand;
                         if (cvt != realVt) continue;
                         // Found! Verify alive
