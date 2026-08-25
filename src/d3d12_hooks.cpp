@@ -955,6 +955,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             } else if (res != g_sceneColorAlt) {
                 StoreTracked(&g_sceneColorAlt, res);
                 g_sceneColorRtvAlt = handle;
+                AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
                 Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
             }
