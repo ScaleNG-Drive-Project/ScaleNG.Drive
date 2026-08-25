@@ -4182,8 +4182,27 @@ void RunNgxSyntheticTest()
     if (InterlockedCompareExchange(&s_smokeRan, 1, 0) != 0) return;
 
     Log("SMOKE: starting synthetic NGX test");
-    if (!g_device) { Log("SMOKE: FAIL - no device"); return; }
-    Log("SMOKE: device=%p healthy", (void*)g_device);
+    // If game device not captured (ASI loaded after device creation), create our own
+    if (!g_device) {
+        typedef HRESULT(WINAPI* PFN_DC)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+        HMODULE dm = GetModuleHandleA("d3d12.dll");
+        auto mkD = dm ? (PFN_DC)GetProcAddress(dm, "D3D12CreateDevice") : nullptr;
+        IDXGIFactory1* fct = nullptr;
+        { typedef HRESULT(WINAPI* PFN_CDXGI)(const IID&, void**);
+          HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+          auto mkF = dxgi ? (PFN_CDXGI)GetProcAddress(dxgi, "CreateDXGIFactory1") : nullptr;
+          if (mkF) mkF(__uuidof(IDXGIFactory1), (void**)&fct); }
+        IDXGIAdapter1* nva = nullptr;
+        if (fct) { for(UINT i=0; fct->EnumAdapters1(i,&nva)==S_OK;++i){
+            DXGI_ADAPTER_DESC1 d={};nva->GetDesc1(&d);
+            if(!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)&&d.VendorId==0x10DE)break; nva=nullptr;} }
+        if (nva && mkD)
+            mkD(nva,D3D_FEATURE_LEVEL_12_0,__uuidof(ID3D12Device),(void**)&g_device);
+        if (fct) fct->Release();
+        if (!g_device) { Log("SMOKE: FAIL - could not create fallback device"); return; }
+        Log("SMOKE: created OWN NVIDIA device for isolated NGX test");
+    }
+    Log("SMOKE: device=%p", (void*)g_device);
 
     // UNWRAP: find real ID3D12Device inside BeamNG's wrapper by vtable match.
     // Create a clean device to discover the true D3D12Device vtable address,
