@@ -1764,24 +1764,51 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
 {
     if (!g_swapchain) return;
 
-    // Get backbuffer
-    ID3D12Resource* bb = nullptr;
-    if (FAILED(g_swapchain->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return;
+    Log("ngx-pipe: enter");
 
-    D3D12_RESOURCE_DESC bbd = bb->GetDesc();
+    // Get backbuffer - GUARDED: sc may be a wrapped/garbage pointer
+    ID3D12Resource* bb = nullptr;
+    __try {
+        if (FAILED(g_swapchain->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) {
+            Log("ngx-pipe: GetBuffer FAILED");
+            return;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("ngx-pipe: GetBuffer AV");
+        return;
+    }
+    Log("ngx-pipe: bb=%p", (void*)bb);
+
+    D3D12_RESOURCE_DESC bbd = {};
+    __try {
+        bbd = bb->GetDesc();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("ngx-pipe: bb GetDesc AV");
+        bb->Release();
+        return;
+    }
     UINT w = (UINT)bbd.Width, h = (UINT)bbd.Height;
+    Log("ngx-pipe: bb %ux%u fmt=%u", w, h, (unsigned)bbd.Format);
 
     // Lazy-create everything on first valid frame
     if (!g_ngxPipelineReady) {
         // Get device from swapchain (always works - raw COM call)
         if (!g_device) {
+            Log("ngx-pipe: getting device from swapchain...");
             IDXGIDevice* dxgidev = nullptr;
-            if (SUCCEEDED(g_swapchain->GetDevice(__uuidof(IDXGIDevice), (void**)&dxgidev))) {
-                dxgidev->QueryInterface(__uuidof(ID3D12Device), (void**)&g_device);
-                dxgidev->Release();
+            __try {
+                if (SUCCEEDED(g_swapchain->GetDevice(__uuidof(IDXGIDevice), (void**)&dxgidev))) {
+                    dxgidev->QueryInterface(__uuidof(ID3D12Device), (void**)&g_device);
+                    dxgidev->Release();
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            if (!g_device) {
+                Log("ngx-pipe: FAILED to get device from swapchain");
+                bb->Release();
+                return;
             }
         }
-        if (!g_device) { bb->Release(); return; }
+        Log("ngx-pipe: device=%p", (void*)g_device);
 
         if (!g_upscaler) {
             EnsureUpscalerInit();
