@@ -2611,6 +2611,8 @@ static void LogPresentGuardDetails(void* exAddr)
     }
 }
 
+static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* queue);
+
 static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterval,
                                              UINT flags, int candIdx)
 {
@@ -2642,6 +2644,17 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
                 if (InterlockedCompareExchange(&s_ngxAttempted, 1, 0) == 0) {
                     Log("BISECT STAGE 2: attempting NGX init on game device");
                     EnsureUpscalerInit();
+                }
+            }
+            // SELF-CONTAINED NGX PIPELINE: runs every frame from Present.
+            // Gets device/queue/textures internally via swapchain.
+            if (g_dlaaMode && !g_passiveMode) {
+                __try {
+                    NgxSelfContainedPipeline(sc, nullptr, nullptr);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    static int s_ngxStorm = 0;
+                    if (++s_ngxStorm <= 3)
+                        Log("ngx-pipe: guarded fault");
                 }
             }
             if (!g_inPresent) {
