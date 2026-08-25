@@ -104,7 +104,7 @@ static void LoadConfig()
     if (renderScale < 0.5f) renderScale = 0.5f;
     if (renderScale > 0.99f) renderScale = 0.99f;
     g_config.renderScale = renderScale;
-    g_config.dlaa = getBool(L"dlaa", false);
+    g_config.dlaa = getBool(L"dlaa", true); // force DLAA default ON
     g_config.hud = getBool(L"hud", true);
     g_config.legacyScale = getBool(L"legacyScale", false);
     g_config.passive = getBool(L"passive", false);
@@ -114,6 +114,9 @@ static void LoadConfig()
     g_config.autoExposure = getBool(L"autoExposure", true);
     g_config.appId = (unsigned int)getInt(L"appId", 0xE658700);
     g_config.enabled = getBool(L"enabled", true);
+    // FORCE DLAA MODE: ini parsing unreliable across encoding changes
+    g_config.dlaa = true;
+    g_config.enabled = true;
 
     wchar_t upscaler[32] = {};
     GetPrivateProfileStringW(L"ScaleNG", L"upscaler", L"dlss", upscaler, 32, iniPath);
