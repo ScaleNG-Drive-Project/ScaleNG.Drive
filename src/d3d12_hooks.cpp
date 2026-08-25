@@ -983,7 +983,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             // is NOT hardcoded (the engine may render at e.g. 1920x1001).
             { BookGuard _bg;
                 { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
             }
@@ -1012,7 +1012,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_displayW = (unsigned int)rd.Width;
                 g_displayH = (unsigned int)rd.Height;
                 { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
                 if (!g_sceneColorValid) {
@@ -1034,7 +1034,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
                 if (!g_mvValid) {
@@ -1060,7 +1060,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                    desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
             { BookGuard _bg;
                 { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
                     { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 }
             }
@@ -1133,7 +1133,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             g_depthStamp = g_frameCounter;
             g_depthRealFmt = rd.Format;
             g_depthMsaa = rd.SampleDesc.Count != 1;
-            g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            { BookGuard _bgRs; g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; }
             Log("hooks: depth candidate SRV %p", (void*)res);
         }
     }
@@ -3708,11 +3708,11 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     }
                     if (!srcIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, src->pResource);
-                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        { BookGuard _bgRs; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
                         Log("hooks: terminal pair node adopted as ALT %p (f10)", (void*)src->pResource);
                     } else if (!dstIsTracked && !g_sceneColorAlt) {
                         StoreTracked(&g_sceneColorAlt, dst->pResource);
-                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        { BookGuard _bgRs; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
                         Log("hooks: terminal pair node adopted as ALT %p (f10 dst)", (void*)dst->pResource);
                     } else if (!altIsPairHalf && g_sceneColorAlt &&
                                g_sceneColorAlt != src->pResource && g_sceneColorAlt != dst->pResource) {
@@ -3720,7 +3720,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         (void)oldAlt;
                         ID3D12Resource* cand = srcIsTracked ? dst->pResource : src->pResource;
                         StoreTracked(&g_sceneColorAlt, cand);
-                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        { BookGuard _bgRs; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
                         Log("hooks: terminal pair REPLACED non-pair ALT -> %p (f10)", (void*)cand);
                     }
                 }
@@ -3742,7 +3742,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     sd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
                     StoreTracked(&g_sceneColor, src->pResource);
                     g_sceneColorValid = true;
-                    g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    { BookGuard _bgRs; g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE; }
                     AdoptDisplaySize((unsigned int)sd.Width, (unsigned int)sd.Height);
                     Log("hooks: scene color adopted from copy source %p", (void*)g_sceneColor);
                 }
