@@ -1737,7 +1737,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     ID3D12Resource* bb = nullptr;
     IDXGISwapChain3* sc3 = nullptr;
     // Nothing to fetch from and nothing cached -> nothing to do here.
-    if (!g_bbCached && !g_swapchain) return;
+    if (!g_bbCached && !g_swapchain && !g_sceneColorValid) return;
     // POLITE PATH: use RTV-captured backbuffer when available - never probe
     // the engine's guarded wrapper via GetBuffer (software-AV storm class).
     bool usedCachedBb = false;
@@ -1745,15 +1745,22 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         bb = g_bbCached;
         usedCachedBb = true;
         g_injStep = "bb-cached";
-        D3D12_RESOURCE_DESC bbd = bb->GetDesc();
-        // TRUSTED SOURCE: RTV-captured backbuffer assigns display directly -
-        // going through AdoptDisplaySize's hysteresis lets competing callers
-        // reset the candidate forever, leaving display stuck at 0x0.
-        if ((unsigned int)bbd.Width >= 1000 && bbd.Height >= 700 &&
-            ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)) {
-            g_displayW = (unsigned int)bbd.Width;
-            g_displayH = (unsigned int)bbd.Height;
-            Log("hooks: display committed from cached backbuffer %ux%u", g_displayW, g_displayH);
+        // Guarded GetDesc: cached resource may be freed by the engine before
+        // we use it. On fault, drop the cache and fall through to scene-based
+        // display sizing instead of blocking the pipeline.
+        __try {
+            D3D12_RESOURCE_DESC bbd = bb->GetDesc();
+            if ((unsigned int)bbd.Width >= 1000 && bbd.Height >= 700 &&
+                ((unsigned int)bbd.Width != g_displayW || (unsigned int)bbd.Height != g_displayH)) {
+                g_displayW = (unsigned int)bbd.Width;
+                g_displayH = (unsigned int)bbd.Height;
+                Log("hooks: display committed from cached backbuffer %ux%u", g_displayW, g_displayH);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("hooks: bb-cached faulted (freed) - clearing cache");
+            g_bbCached = nullptr;
+            bb = nullptr;
+            usedCachedBb = false;
         }
     }
     if (!usedCachedBb) {
@@ -1796,9 +1803,27 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
         }
     }
     g_injStep = "bb-fetched";
-    if (!bb) return; // faulted calls land here WITHOUT resetting the breaker
-    // Success resets the dead-swapchain circuit breaker - only on REAL fetch.
-    g_bbFetchFails = 0;
+    // FALLBACK: commit display from scene color when no backbuffer available.
+    // Then build bridge BEFORE the bb check - NGX on bridge device doesn't
+    // need the game's backbuffer, only display dims + shared textures.
+    if (!bb && g_sceneColorValid && g_sceneColor) {
+        __try {
+            D3D12_RESOURCE_DESC scd = g_sceneColor->GetDesc();
+            if ((unsigned int)scd.Width >= 1000 && scd.Height >= 700 &&
+                g_displayW == 0) {
+                g_displayW = (unsigned int)scd.Width;
+                g_displayH = (unsigned int)scd.Height;
+                Log("hooks: display committed from scene color %ux%u", g_displayW, g_displayH);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+
+    // Build bridge early - doesn't need backbuffer, only dims + format
+    if (g_dlaaMode && g_displayW > 0 && g_bbFormat != DXGI_FORMAT_UNKNOWN) {
+        EnsureBridge(g_displayW, g_displayH, g_bbFormat, g_device);
+    }
+
+    if (!bb) return; // no backbuffer = skip injection, but bridge may now exist
 
     // The backbuffer IS the true display surface: adopt its dimensions so the
     // DLAA feature (render==display) always matches what we feed it. Without
