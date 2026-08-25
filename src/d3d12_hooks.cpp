@@ -2666,6 +2666,55 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
             if (sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
+                // COMMIT A: capture and log ALL swapchain-derived identities
+                static long s_identityLogged = 0;
+                if (InterlockedCompareExchange(&s_identityLogged, 1, 0) == 0) {
+                    __try {
+                        // A1: swapchain->GetDevice(IDXGIDevice)
+                        IDXGIDevice* dxgiDev = nullptr;
+                        HRESULT qhr = sc->GetDevice(__uuidof(IDXGIDevice), (void**)&dxgiDev);
+                        Log("IDENTITY-A: sc->GetDevice(IDXGIDevice) hr=0x%08X ptr=%p",
+                            (unsigned)qhr, (void*)dxgiDev);
+                        if (SUCCEEDED(qhr) && dxgiDev) {
+                            // A2: adapter info from that device
+                            IDXGIAdapter* pad = nullptr;
+                            if (SUCCEEDED(dxgidev->GetAdapter(&pad))) {
+                                DXGI_ADAPTER_DESC pdesc = {};
+                                if (SUCCEEDED(pad->GetDesc(&pdesc)))
+                                    Log("IDENTITY-B: adapter VendorId=0x%04X '%ls' LUID=%08X:%08X",
+                                        pdesc.VendorId, pdesc.Description,
+                                        (unsigned)pdesc.AdapterLuid.HighPart,
+                                        (unsigned)pdesc.AdapterLuid.LowPart);
+                                pad->Release();
+                            }
+                            // A3: QI to ID3D12Device
+                            ID3D12Device* d3ddev = nullptr;
+                            HRESULT d3hr = dxgiDev->QueryInterface(__uuidof(ID3D12Device), (void**)&d3ddev);
+                            Log("IDENTITY-C: QI(ID3D12Device) hr=0x%08X ptr=%p",
+                                (unsigned)d3hr, (void*)d3ddev);
+                            if (SUCCEEDED(d3hr) && d3ddev) {
+                                // A4: compare with captured g_device
+                                Log("IDENTITY-D: g_device(from detour)=%p match=%d",
+                                    (void*)g_device, (g_device == d3ddev) ? 1 : 0);
+                                // A5: create our own queue on this device
+                                D3D12_COMMAND_QUEUE_DESC qd = {};
+                                qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                                ID3D12CommandQueue* q = nullptr;
+                                HRESULT qhr2 = d3ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+                                Log("IDENTITY-E: CreateCommandQueue hr=0x%08X queue=%p",
+                                    (unsigned)qhr2, (void*)q);
+                                if (q) { g_graphicsQueue = q; Log("IDENTITY-F: queue stored as g_graphicsQueue"); }
+                                if (d3ddev != g_device) { d3ddev->Release(); }
+                                else { /* same object, don't double-release */ d3ddev->Release(); }
+                            }
+                            dxgiDev->Release();
+                        } else {
+                            Log("IDENTITY-A FAILED - swapchain GetDevice rejected");
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        Log("IDENTITY: probe guarded (exception)");
+                    }
+                }
                 // BISECT STAGE 2: attempt NGX init on game device at first adoption
                 static long s_ngxAttempted = 0;
                 if (InterlockedCompareExchange(&s_ngxAttempted, 1, 0) == 0) {
