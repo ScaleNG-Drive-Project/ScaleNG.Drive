@@ -491,12 +491,7 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     // Per-evaluate dimensions (NVIDIA sample: NGX_D3D12_EVALUATE_DLSS_EXT)
     m_paramStore->SetUI(NVSDK_NGX_Parameter_Width, m_renderWidth);
     m_paramStore->SetUI(NVSDK_NGX_Parameter_Height, m_renderHeight);
-    m_paramStore->SetUI(NVSDK_NGX_Parameter_OutWidth, m_displayWidth);
     m_paramStore->SetUI(NVSDK_NGX_Parameter_OutHeight, m_displayHeight);
-
-    // Auto-exposure signal (required when AutoExposure flag set at creation)
-    if (m_autoExposure)
-        m_paramStore->SetUI(NVSDK_NGX_Parameter_DLSS_Enable_Auto_Exposure, 1);
 
     m_paramStore->SetF(NVSDK_NGX_Parameter_Jitter_Offset_X, params.jitterX);
     m_paramStore->SetF(NVSDK_NGX_Parameter_Jitter_Offset_Y, params.jitterY);
