@@ -34,7 +34,11 @@ Bridge architecture ABANDONED. Cross-device concurrent GPU submission crashes nv
 - src/d3d12_hooks.cpp (~4500 lines): ALL hooks + discovery + pipeline
 - src/dlss_ngx.cpp (~589 lines): NGX wrapper (Init/CreateFeature/Evaluate)
 - dist/ScaleNG.map + dist/ScaleNG.pdb: symbol resolution
-- **Unwrap scan found g_device ITSELF at wrapper+0x150 — meaning BeamNG's device may NOT be wrapped after all**, or the wrapper stores a self-reference. If g_device IS the real device, then NGX's FAIL_PlatformError during evaluate has a completely different root cause (not wrapper-related).
+- **Unwrap scan found g_device ITSELF at wrapper+0x150 — meaning BeamNG's device may NOT be wrapped after all**, or the wrapper stores a self-reference. If g_device IS the real device, then NGX's FAIL_PlatformError during evaluate has a completely different root cause (not wrapper-related).## 🎉 MILESTONE: NGX DLSS FULLY EXECUTES ON GAME DEVICE (2026-08-25 15:27)
+- **NGX Init + CreateFeature + Evaluate + GPU execution ALL SUCCEEDED on BeamNG's captured device.** Post-exec GetDeviceRemovedReason=S_OK. Zero crashes, artifacts, or freezes.
+- Key fixes that enabled this: (1) removed stale 600f quiet gate from CreateFeature, (2) added per-evaluate Width/Height/OutWidth/OutHeight params, (3) bound CBV/SRV/UAV descriptor heap before evaluate, (4) proper Close+ExecuteCommandLists+fence pipeline in smoke test.
+- NEXT: wire into real game rendering (capture frames at Present, feed real color/depth/MV), replace synthetic inputs incrementally per correctness.md Phase 7.
+
 - Crash moved to BeamNG.drive.x64.exe+0xd16f03 (engine code, not NVIDIA driver). Occurs before window creation.
 - Present vtable hook (slot 7) destabilizes the render pipeline even though it uses correct slot index for real DXGI. Any modification of the shared DXGI class vtable affects ALL swapchains process-wide.
 
