@@ -42,6 +42,7 @@ ScaleNgConfig g_cfg;
 bool g_cfgSet = false;
 
 volatile LONG g_smokeBusy = 0; // nonzero while smoke test owns the driver
+volatile LONG g_presentSelfTestFired = 0;
 ID3D12Device* g_device = nullptr;
 ID3D12Resource* g_cameraRing = nullptr;
 
@@ -2846,6 +2847,13 @@ static void LogInjectFault(unsigned code)
 
 HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UINT flags)
 {
+    // Unconditional first-call proof: if THIS never logs, nothing on earth
+    // is calling dxgi's public Present in this process.
+    {
+        static volatile LONG s_first = 0;
+        if (InterlockedCompareExchange(&s_first, 1, 0) == 0)
+            Log("Hook_Present ENTER sc=%p sync=%u flags=%u", (void*)sc, syncInterval, flags);
+    }
     if (sc) {
         __try {
             // Terminal-node correlation (unconditional entry): what the copy
@@ -3201,6 +3209,20 @@ void EnsureGlobalSwapchainHookImpl()
                 }
                 void* vt[2] = { (void*)Hook_Present, (void*)Hook_Present1 };
                 CfgMarkValid(vt, 2);
+            }
+
+            // SELF-TEST: present our own dummy swapchain. If Hook_Present
+            // fires (flag flips), the patch is live and ANY real-dxgi
+            // presenter would be caught. If it does NOT fire, the game's
+            // silence is explained differently (patch ineffective).
+            {
+                extern volatile LONG g_presentSelfTestFired;
+                InterlockedExchange(&g_presentSelfTestFired, 0);
+                HRESULT shr = E_FAIL;
+                __try { shr = dummy->Present(0, 0); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                Sleep(150);
+                Log("hooks: SELF-TEST dummy->Present hr=0x%08X fired=%s",
+                    (unsigned)shr, g_presentSelfTestFired ? "YES" : "NO");
             }
         }
 
