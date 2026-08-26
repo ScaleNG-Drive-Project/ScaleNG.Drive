@@ -18,7 +18,7 @@ extern "C" WINBASEAPI DWORD WINAPI K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR
 
 PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
 
-void EnsureUpscalerInit();
+void EnsureUpscalerInit(bool bypassQuietGate = false);
 static bool s_creatingBridge = false;   // true while EnsureBridge creates its device
 unsigned g_mvFirstValidFrame = 0;
 unsigned g_depthFirstValidFrame = 0;
@@ -776,7 +776,7 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
         g_renderW, g_renderH);
 }
 
-void EnsureUpscalerInit()
+void EnsureUpscalerInit(bool bypassQuietGate)
 {
     // FULL NGX SEQUENCING (fix89 extension): nvngx/NVAPI *loading* also races
     // load churn. The 00:00 run died with nvngx loaded at +5s pre-CreateFeature.
@@ -786,7 +786,7 @@ void EnsureUpscalerInit()
     // (seen live: exactly one defer line, then init never re-ran).
     // SINGLE-DEVICE: reduced sequencing requirement since no second device.
     // Still need some stability before NGX touches the driver.
-    if (HooksGetQuietFrames() < 120) {
+    if (!bypassQuietGate && HooksGetQuietFrames() < 120) {
         static int s_seqLogs = 0;
         if (++s_seqLogs <= 5)
             Log("hooks: NGX init deferred - chain quiet %uf/120f", HooksGetQuietFrames());
@@ -847,7 +847,7 @@ void DoInjection(ID3D12GraphicsCommandList* list)
     // path records NGX work into the ENGINE's command list - illegal when
     // the feature lives on the bridge device. Hard-disable in DLAA mode.
     if (g_dlaaMode) return;
-    EnsureUpscalerInit();
+    EnsureUpscalerInit(false);
     if (!g_upscaler || !g_upscaler->IsReady()) return;
 
     if (!g_dlssOutValid) CreateDlssOut();
@@ -1823,7 +1823,7 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         static int s_devLogs = 0; if (++s_devLogs <= 3) Log("ngx-pipe: device=%p", (void*)g_device);
 
         if (!g_upscaler) {
-            EnsureUpscalerInit();
+            EnsureUpscalerInit(true /*Present pipeline: bypass legacy quiet gate*/);
             if (!g_upscaler || !g_upscaler->IsReady()) { bb->Release(); return; }
         }
 
@@ -2207,7 +2207,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             g_dlssOutFormat = g_bbFormat;
             Log("hooks: DLSS output format -> %d (backbuffer)", (int)g_bbFormat);
         }
-        EnsureUpscalerInit();
+        EnsureUpscalerInit(false);
         if (!g_dlssOutValid) CreateDlssOut();
     }
 
@@ -2779,7 +2779,7 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
                 static long s_ngxAttempted = 0;
                 if (InterlockedCompareExchange(&s_ngxAttempted, 1, 0) == 0) {
                     Log("BISECT STAGE 2: attempting NGX init on game device");
-                    EnsureUpscalerInit();
+                    EnsureUpscalerInit(false);
                 }
             }
             // SELF-CONTAINED NGX PIPELINE: runs every frame from Present.
