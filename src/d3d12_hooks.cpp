@@ -1920,7 +1920,7 @@ static bool B2StartHelper()
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     g_b2Pipe = CreateNamedPipeA("\\\\.\\pipe\\ScaleNG_NGX",
         PIPE_ACCESS_DUPLEX,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1, sizeof(unsigned long long) * 8, sizeof(unsigned long long) * 8, 0, &sa);
     if (g_b2Pipe == INVALID_HANDLE_VALUE) {
         Log("ngx-b2: CreateNamedPipe FAILED err=%lu", GetLastError());
@@ -1978,12 +1978,19 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
         *outVal = (unsigned long long)(uintptr_t)val;
         return true;
     };
+    static unsigned long long s_fInVal = 0, s_fOutVal = 0;
     B2SetupMsg m = {};
-    if (!dupInto(g_b2HColor, &m.hColor) || !dupInto(g_b2HOut, &m.hOut) ||
-        !dupInto(g_b2HFIn,  &m.hFIn)  || !dupInto(g_b2HFOut, &m.hFOut)) {
-        Log("ngx-b2: DuplicateHandle FAILED err=%lu", GetLastError());
+    if (!dupInto(g_b2HColor, &m.hColor) || !dupInto(g_b2HOut, &m.hOut)) {
+        Log("ngx-b2: DuplicateHandle(color/out) FAILED err=%lu", GetLastError());
         return false;
     }
+    // Fences persist across resizes: duplicate ONCE, reuse values after.
+    if (s_fInVal && s_fOutVal) {
+        m.hFIn = s_fInVal; m.hFOut = s_fOutVal;
+    } else if (!dupInto(g_b2HFIn, &m.hFIn) || !dupInto(g_b2HFOut, &m.hFOut)) {
+        Log("ngx-b2: DuplicateHandle(fences) FAILED err=%lu", GetLastError());
+        return false;
+    } else { s_fInVal = m.hFIn; s_fOutVal = m.hFOut; }
     m.w = w; m.h = h; m.fmt = (unsigned)fmt;
     m.startVal = g_b2Val + 1; // next frame index helper should expect
     DWORD wr = 0, rd = 0;
@@ -2258,15 +2265,18 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
         DWORD wr = 0;
         WriteFile(g_b2Pipe, &v, sizeof(v), &wr, nullptr);
         unsigned long long ack = 0;
-        DWORD rd = 0;
-        // ack with bounded CPU wait (helper typically replies in <2ms)
-        for (int spin = 0; spin < 50; ++spin) {
-            if (PeekNamedPipe(g_b2Pipe, nullptr, 0, nullptr, &rd, nullptr) && rd >= sizeof(ack))
-                break;
+        DWORD rd = 0, have = 0;
+        for (int spin = 0; spin < 250 && have < sizeof(ack); ++spin) {
+            if (!PeekNamedPipe(g_b2Pipe, nullptr, 0, nullptr, &rd, nullptr)) break;
+            if (rd > have) {
+                DWORD want = sizeof(ack) - have;
+                if (!ReadFile(g_b2Pipe, ((BYTE*)&ack) + have, want, &rd, nullptr)) break;
+                have += rd;
+                if (have >= sizeof(ack)) break;
+            }
             Sleep(1);
         }
-        if (ReadFile(g_b2Pipe, &ack, sizeof(ack), &rd, nullptr) &&
-            rd == sizeof(ack) && ack == v)
+        if (have == sizeof(ack) && ack == v)
             helperAcked = true;
     }
 

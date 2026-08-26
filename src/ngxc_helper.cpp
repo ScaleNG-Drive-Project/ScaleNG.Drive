@@ -316,6 +316,23 @@ static int RunSelfTest()
     return pass == 100 ? 0 : 6;
 }
 
+
+static bool ReadExact(HANDLE h, PVOID buf, DWORD n)
+{
+    BYTE* p = (BYTE*)buf;
+    DWORD have = 0;
+    while (have < n) {
+        DWORD got = 0;
+        if (!ReadFile(h, p + have, n - have, &got, nullptr) || got == 0) return false;
+        have += got;
+    }
+    return true;
+}
+static bool WriteExact(HANDLE h, const VOID* buf, DWORD n)
+{
+    DWORD w = 0;
+    return WriteFile(h, buf, n, &w, nullptr) && w == n;
+}
 int main(int argc, char** argv)
 {
     if (argc > 1 && !lstrcmpiA(argv[1], "--selftest")) {
@@ -334,29 +351,28 @@ int main(int argc, char** argv)
         LogLine("helper: pipe connect FAILED err=%lu", GetLastError());
         return 3;
     }
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
+    // BYTE mode: stream framing handled by exact-size read loops.
+
 
     unsigned int hello[2] = {};
-    DWORD br = 0;
-    if (!ReadFile(pipe, hello, sizeof(hello), &br, nullptr) ||
-        hello[0] != 0x58474E53) { // 'SNGX'
-        LogLine("helper: bad hello (%08X)", hello[0]);
+    if (!ReadExact(pipe, hello, sizeof(hello)) || hello[0] != 0x58474E53) {
+        LogLine("helper: bad hello");
         return 4;
     }
-    unsigned int ack[2] = { 0x58474E48, 1 }; // 'HNGX'
-    WriteFile(pipe, ack, sizeof(ack), &br, nullptr);
+    unsigned int ackw[2] = { 0x58474E48, 1 };
+    WriteExact(pipe, ackw, sizeof(ackw));
     LogLine("helper: handshake done");
 
     SetupMsg sm = {};
-    while (ReadFile(pipe, &sm, sizeof(sm), &br, nullptr) && br == sizeof(sm)) {
+    for (;;) {
+        if (!ReadExact(pipe, &sm, sizeof(sm))) break;
         if (!ApplySetup(sm)) {
-            unsigned int r = 0x4C494146; // 'FAIL'
-            WriteFile(pipe, &r, sizeof(r), &br, nullptr);
+            unsigned int r = 0x4C494146;
+            WriteExact(pipe, &r, sizeof(r));
             continue;
         }
-        unsigned int r = 0x59414B4F; // 'OKAY'
-        WriteFile(pipe, &r, sizeof(r), &br, nullptr);
+        unsigned int r = 0x59414B4F;
+        WriteExact(pipe, &r, sizeof(r));
 
         // FRAME LOOP: one submission per game signal; NGX lands next stage.
         unsigned long long v = s_seedVal;
@@ -381,14 +397,11 @@ int main(int argc, char** argv)
                     if ((++s_idle % 600) == 0) LogLine("helper: idle (waiting frames)");
                     continue;
                 }
-                BYTE hdr[8];
-                DWORD got = 0;
-                if (!ReadFile(pipe, hdr, sizeof(hdr), &got, nullptr) || got != sizeof(hdr)) break;
                 unsigned long long fv = 0;
-                memcpy(&fv, hdr, sizeof(fv));
+                if (!ReadExact(pipe, &fv, sizeof(fv))) break;
                 if (fv == 0xFFFFFFFFFFFFFFFF) { // setup marker follows
                     SetupMsg m2{};
-                    if (!ReadFile(pipe, &m2, sizeof(m2), &got, nullptr) || got != sizeof(m2)) break;
+                        if (!ReadExact(pipe, &m2, sizeof(m2))) break;
                     if (!ApplySetup(m2)) break;
                     continue;
                 }
@@ -485,8 +498,7 @@ int main(int argc, char** argv)
             DWORD avail = 0;
             if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail >= sizeof(SetupMsg)) {
                 SetupMsg m2 = {};
-                DWORD r2 = 0;
-                if (ReadFile(pipe, &m2, sizeof(m2), &r2, nullptr) && r2 == sizeof(m2)) {
+                if (ReadExact(pipe, &m2, sizeof(m2))) {
                     LogLine("helper: re-setup");
                     if (!ApplySetup(m2)) break;
                 }
