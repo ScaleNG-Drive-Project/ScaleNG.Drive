@@ -34,7 +34,11 @@ Bridge architecture ABANDONED. Cross-device concurrent GPU submission crashes nv
 - src/d3d12_hooks.cpp (~4500 lines): ALL hooks + discovery + pipeline
 - src/dlss_ngx.cpp (~589 lines): NGX wrapper (Init/CreateFeature/Evaluate)
 - dist/ScaleNG.map + dist/ScaleNG.pdb: symbol resolution
-- **Unwrap scan found g_device ITSELF at wrapper+0x150 — meaning BeamNG's device may NOT be wrapped after all**, or the wrapper stores a self-reference. If g_device IS the real device, then NGX's FAIL_PlatformError during evaluate has a completely different root cause (not wrapper-related).## 🎉 MILESTONE: NGX DLSS FULLY EXECUTES ON GAME DEVICE (2026-08-25 15:27)
+- **Unwrap scan found g_device ITSELF at wrapper+0x150 — meaning BeamNG's device may NOT be wrapped after all**, or the wrapper stores a self-reference. If g_device IS the real device, then NGX's FAIL_PlatformError during evaluate has a completely different root cause (not wrapper-related).## 🎉 MILESTONE: NGX DLSS FULLY EXECUTES ON GAME DEVICE (2026-08-25 15:27)## 🏆 MILESTONE: NGX DLSS 200/200 SUSTAINED EVALUATES PASSING (2026-08-25 ~18:04)
+- **100/100 evaluate loops passed twice in one session (200 total), devRemoved=0x00000000 after both.** No crash, no artifacts, no freeze across user's play session.
+- Fixes that got us here: (1) unconditional nvngx_dlss.dll re-mirror each init w/ diagnostics (stale copy caused 0xBAD0000B), (2) discard cmd list on Evaluate failure (never submit broken work), (3) correct out-resource COMMON->UAV barrier, (4) explicit CBV/SRV/UAV heap bound before evaluate, (5) OutWidth param, (6) 16ms pacing between iterations.
+- NEXT: wire real game frames through the proven pipeline via PresentCore (capture backbuffer -> color input -> evaluate -> copy back). The hard part is done.
+
 - **NGX Init + CreateFeature + Evaluate + GPU execution ALL SUCCEEDED on BeamNG's captured device.** Post-exec GetDeviceRemovedReason=S_OK. Zero crashes, artifacts, or freezes.
 - Key fixes that enabled this: (1) removed stale 600f quiet gate from CreateFeature, (2) added per-evaluate Width/Height/OutWidth/OutHeight params, (3) bound CBV/SRV/UAV descriptor heap before evaluate, (4) proper Close+ExecuteCommandLists+fence pipeline in smoke test.
 - NEXT: wire into real game rendering (capture frames at Present, feed real color/depth/MV), replace synthetic inputs incrementally per correctness.md Phase 7.
