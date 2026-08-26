@@ -98,7 +98,10 @@ bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
     // NGX searches for feature snippets beside the PROCESS EXE (plus driver
     // store). Games ship nvngx_dlss.dll there; our copy lives in plugins\,
     // which the core never scans -> CreateFeature returned NotInitialized.
-    // Self-host: mirror the snippet next to the exe once.
+    // Self-host: mirror the snippet next to the exe EVERY init.
+    // A stale/partial/corrupt copy from an interrupted session previously
+    // caused FAIL_UnableToInitializeFeature (0xBAD0000B) - only-if-missing
+    // copying left the bad file in place forever.
     {
         wchar_t exePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -107,9 +110,15 @@ bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
         wchar_t dst[MAX_PATH] = {};
         lstrcpyW(dst, exePath);
         lstrcatW(dst, L"nvngx_dlss.dll");
-        if (GetFileAttributesW(dst) == INVALID_FILE_ATTRIBUTES && dllPath && *dllPath) {
-            if (CopyFileW(dllPath, dst, FALSE))
-                Log("DLSS: mirrored snippet to exe dir: %ls", dst);
+        if (dllPath && *dllPath) {
+            BOOL copied = CopyFileW(dllPath, dst, FALSE); // always overwrite
+            DWORD srcAttr = GetFileAttributesW(dllPath);
+            DWORD dstAttr = GetFileAttributesW(dst);
+            Log("DLSS: snippet mirror src=%ls exists=%d -> dst=%ls exists=%d copyOK=%d",
+                dllPath, (srcAttr != INVALID_FILE_ATTRIBUTES),
+                dst, (dstAttr != INVALID_FILE_ATTRIBUTES), (int)copied);
+        } else {
+            Log("DLSS: no dlssDllPath provided - snippet mirror skipped (dst may be stale)");
         }
     }
     // PART 1: preload nvapi64.dll BEFORE the NGX core. Driver 596.49's
