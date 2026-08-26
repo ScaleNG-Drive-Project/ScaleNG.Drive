@@ -1846,7 +1846,114 @@ static void B2EnsureDummyInputs(UINT w, UINT h)
     s_w = w; s_h = h;
 }
 
-static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
+// ---- cross-process helper management --------------------------------------
+static HANDLE g_b2Helper  = nullptr; // child process
+static HANDLE g_b2Pipe    = nullptr;
+static bool   g_b2UseHelper = true;  // cross-process NGX ownership
+static HANDLE g_b2HColor  = nullptr, g_b2HOut = nullptr;
+static HANDLE g_b2HFIn    = nullptr, g_b2HFOut = nullptr;
+
+static void B2KillHelper()
+{
+    if (g_b2Pipe)    { CloseHandle(g_b2Pipe);   g_b2Pipe = nullptr; }
+    if (g_b2Helper)  { TerminateProcess(g_b2Helper, 0); CloseHandle(g_b2Helper); g_b2Helper = nullptr; }
+}
+
+static bool B2StartHelper()
+{
+    if (!g_b2UseHelper || g_b2Pipe) return g_b2Pipe != nullptr;
+
+    wchar_t self[MAX_PATH] = {};
+    HMODULE mod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&B2StartHelper, &mod);
+    if (mod) GetModuleFileNameW(mod, self, MAX_PATH);
+    wchar_t* slash = wcsrchr(self, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wchar_t exe[MAX_PATH];
+    lstrcpyW(exe, self); lstrcatW(exe, L"ScaleNG_NGX_helper.exe");
+    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) {
+        Log("ngx-b2: helper exe missing at %ls", exe);
+        g_b2UseHelper = false;
+        return false;
+    }
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    g_b2Pipe = CreateNamedPipeA("\\\\.\\pipe\\ScaleNG_NGX",
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        1, sizeof(unsigned long long) * 8, sizeof(unsigned long long) * 8, 0, &sa);
+    if (g_b2Pipe == INVALID_HANDLE_VALUE) {
+        Log("ngx-b2: CreateNamedPipe FAILED err=%lu", GetLastError());
+        g_b2Pipe = nullptr; g_b2UseHelper = false;
+        return false;
+    }
+
+    wchar_t cmd[MAX_PATH * 2];
+    _snwprintf_s(cmd, _TRUNCATE, L"\"%ls\" %lu", exe, GetCurrentProcessId());
+    PROCESS_INFORMATION pi = {};
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    if (!CreateProcessW(exe, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        Log("ngx-b2: spawn FAILED err=%lu", GetLastError());
+        CloseHandle(g_b2Pipe); g_b2Pipe = nullptr; g_b2UseHelper = false;
+        return false;
+    }
+    g_b2Helper = pi.hProcess; CloseHandle(pi.hThread);
+
+    if (!ConnectNamedPipe(g_b2Pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) {
+        Log("ngx-b2: ConnectNamedPipe FAILED err=%lu", GetLastError());
+        B2KillHelper(); g_b2UseHelper = false;
+        return false;
+    }
+
+    unsigned int hello[2] = { 0x58474E53, 1 }; // 'SNGX'
+    unsigned int ack[2] = {};
+    DWORD wr = 0, rd = 0;
+    if (!WriteFile(g_b2Pipe, hello, sizeof(hello), &wr, nullptr) ||
+        !ReadFile(g_b2Pipe, ack, sizeof(ack), &rd, nullptr) ||
+        ack[0] != 0x58474E48) {
+        Log("ngx-b2: handshake FAILED (ack=%08X)", ack[0]);
+        B2KillHelper(); g_b2UseHelper = false;
+        return false;
+    }
+    Log("ngx-b2: helper connected pid=%lu", GetProcessId(g_b2Helper));
+    return true;
+}
+
+struct B2SetupMsg {
+    unsigned long long hColor, hOut, hFIn, hFOut;
+    unsigned int w, h, fmt;
+};
+
+static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
+{
+    if (!B2StartHelper()) return false;
+
+    auto dupInto = [](HANDLE nt, unsigned long long* outVal) -> bool {
+        if (!nt) return false;
+        HANDLE val = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), nt, g_b2Helper, &val, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return false;
+        *outVal = (unsigned long long)(uintptr_t)val;
+        return true;
+    };
+    B2SetupMsg m = {};
+    if (!dupInto(g_b2HColor, &m.hColor) || !dupInto(g_b2HOut, &m.hOut) ||
+        !dupInto(g_b2HFIn,  &m.hFIn)  || !dupInto(g_b2HFOut, &m.hFOut)) {
+        Log("ngx-b2: DuplicateHandle FAILED err=%lu", GetLastError());
+        return false;
+    }
+    m.w = w; m.h = h; m.fmt = (unsigned)fmt;
+    DWORD wr = 0, rd = 0;
+    if (!WriteFile(g_b2Pipe, &m, sizeof(m), &wr, nullptr)) return false;
+    unsigned int resp = 0;
+    if (!ReadFile(g_b2Pipe, &resp, sizeof(resp), &rd, nullptr) || resp != 0x59414B4F) {
+        Log("ngx-b2: setup rejected by helper (%08X)", resp);
+        return false;
+    }
+    Log("ngx-b2: helper owns NGX now (%ux%u)", w, h);
+    return true;
+}static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
 {
     if (g_b2Ready && g_b2W == w && g_b2H == h && g_b2Fmt == fmt)
         return true;
@@ -1858,7 +1965,7 @@ static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
         if (!g_b2Dev) s_lastFailMs = nowMs; // arm on first attempt of this burst
     }
     Log("ngx-b2: init %ux%u fmt=%u", w, h, (unsigned)fmt);
-    if (!g_b2Ready && !g_b2Dev) {
+    if (!g_b2UseHelper && !g_b2Ready && !g_b2Dev) {
         // THROTTLE: failed init retried every frame spammed 9k lines once.
         static DWORD s_lastFailMs = 0;
         DWORD nowMs = GetTickCount();
@@ -1958,16 +2065,25 @@ static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_b2OutG)))) {
             Log("ngx-b2: shared tex creation FAILED"); return false;
         }
-        if (!B2OpenShared(g_b2Dev, g_b2ColorG, &g_b2ColorO) ||
-            !B2OpenShared(g_b2Dev, g_b2OutG, &g_b2OutO)) {
+        if (!g_b2UseHelper && (!B2OpenShared(g_b2Dev, g_b2ColorG, &g_b2ColorO) ||
+            !B2OpenShared(g_b2Dev, g_b2OutG, &g_b2OutO))) {
             Log("ngx-b2: OpenSharedHandle FAILED"); return false;
+        }
+        // NT handles for cross-process duplication (helper mode)
+        if (FAILED(g_device->CreateSharedHandle(g_b2ColorG, nullptr, GENERIC_ALL, nullptr, &g_b2HColor)) ||
+            FAILED(g_device->CreateSharedHandle(g_b2OutG,   nullptr, GENERIC_ALL, nullptr, &g_b2HOut))) {
+            Log("ngx-b2: CreateSharedHandle(color/out) FAILED"); return false;
         }
         // shared fences
         ID3D12Fence *fiG=nullptr,*foG=nullptr,*fiO=nullptr,*foO=nullptr;
         bool ok =
             SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fiG))) &&
-            SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&foG))) &&
-            B2OpenShared(g_b2Dev, fiG, &fiO) && B2OpenShared(g_b2Dev, foG, &foO);
+            SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&foG)));
+        if (ok && !g_b2UseHelper)
+            ok = B2OpenShared(g_b2Dev, fiG, &fiO) && B2OpenShared(g_b2Dev, foG, &foO);
+        if (ok)
+            ok = SUCCEEDED(g_device->CreateSharedHandle(fiG, nullptr, GENERIC_ALL, nullptr, &g_b2HFIn)) &&
+                 SUCCEEDED(g_device->CreateSharedHandle(foG, nullptr, GENERIC_ALL, nullptr, &g_b2HFOut));
         if (!ok) {
             Log("ngx-b2: shared fence FAILED");
             if(fiG)fiG->Release(); if(foG)foG->Release(); if(fiO)fiO->Release(); if(foO)foO->Release();
@@ -1976,7 +2092,20 @@ static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
         g_b2FenceInG = fiG; g_b2FenceOutG = foG; g_b2FIO = fiO; g_b2FOO = foO;
     }
 
-    // NGX upscaler on OUR device
+    if (g_b2UseHelper) {
+        // CROSS-PROCESS MODE: helper owns device + NGX entirely.
+        if (!B2SendSetup(w, h, fmt)) {
+            Log("ngx-b2: helper setup FAILED - disabling helper this session");
+            g_b2UseHelper = false;
+            return false;
+        }
+        g_b2W = w; g_b2H = h; g_b2Fmt = fmt;
+        g_b2Ready = true;
+        Log("ngx-b2: READY via HELPER");
+        return true;
+    }
+    // LOCAL-MODE fallback (helper unavailable): NGX on our own clean device.
+    if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);    // NGX upscaler on OUR device
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) { Log("ngx-b2: upscaler create FAILED"); return false; }
     UpscalerInitParams ip = {};
@@ -2013,7 +2142,7 @@ static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
 static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt)
 {
     if (!EnsureNgxBridgeB2(w, h, fmt)) return;
-    B2EnsureDummyInputs(w, h);
+    if (!g_b2UseHelper) B2EnsureDummyInputs(w, h);
 
     ++g_b2Val;
     UINT64 v = g_b2Val;
@@ -2052,10 +2181,11 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     s_gq->ExecuteCommandLists(1, l1);
     s_gq->Signal(g_b2FenceInG, v);
 
-    // STAGE 2 (ours): wait fIn -> NGX -> ALWAYS signal fOut
-    g_b2Q->Wait(g_b2FIO, v);
+    // STAGE 2: helper-owned (cross-process NGX) or local clean-device fallback.
     bool recorded = false;
-    if (SUCCEEDED(g_b2List->Reset(g_b2Alloc, nullptr))) {
+    if (g_b2UseHelper) {
+        recorded = true; // helper watches fIn(v), runs NGX, signals fOut itself
+    } else if (g_b2Q && SUCCEEDED(g_b2List->Reset(g_b2Alloc, nullptr))) {
         UpscalerEvaluateParams ep = {};
         ep.commandList = g_b2List;
         ep.color = g_b2ColorO;
@@ -2071,7 +2201,7 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
             g_b2Q->ExecuteCommandLists(1, l2);
         } else recorded = false;
     }
-    g_b2Q->Signal(g_b2FOO, v); // unconditional - stage 3 must never starve
+    if (!g_b2UseHelper) g_b2Q->Signal(g_b2FOO, v); // local mode: we own fOut
 
     // STAGE 3 (game): wait fOut -> sharedOut -> bb
     s_gq->Wait(g_b2FenceOutG, v);

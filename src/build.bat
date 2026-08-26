@@ -71,3 +71,27 @@ if exist "%OUT%\ScaleNG.asi" (
     echo [ERROR] Output rename failed.
     exit /b 1
 )
+
+rem ---- NGX helper exe (cross-process bridge worker) ----
+(
+    echo /nologo /O2 /EHsc /std:c++17 /MT /Zi /D_CRT_SECURE_NO_WARNINGS
+    echo /Fo"%OBJDIR%/helper_"
+    echo "%SRC%ngxc_helper.cpp"
+    echo user32.lib shell32.lib advapi32.lib
+    echo /link /DEBUG
+    echo /Fe:"%OUT%\ScaleNG_NGX_helper.exe"
+) > "%TEMP%\ScaleNG_helper.rsp"
+cl @"%TEMP%\ScaleNG_helper.rsp"
+if errorlevel 1 (
+    echo [ERROR] Helper compilation failed.
+    del "%TEMP%\ScaleNG_helper.rsp" >nul 2>&1
+    exit /b 1
+)
+del /q "%OBJDIR%\helper_*" >nul 2>&1
+del "%TEMP%\ScaleNG_helper.rsp" >nul 2>&1
+if exist "%OUT%\ScaleNG_NGX_helper.exe" (
+    echo [OK] Built %OUT%\ScaleNG_NGX_helper.exe
+) else (
+    echo [ERROR] Helper output missing.
+    exit /b 1
+)
