@@ -1822,6 +1822,27 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         }
         static int s_devLogs = 0; if (++s_devLogs <= 3) Log("ngx-pipe: device=%p", (void*)g_device);
 
+        // GAME-WRAPPER TRIPWIRE: BeamNG's device wrapper fails IDXGIDevice QI.
+        // NGX dispatch recording against this wrapper hangs/crashes the process
+        // (proven 23:01 crash-in-overlay + 23:11 deadlock, vs 200/200 on a clean
+        // device). Until a shared-handle bridge exists, refuse to run NGX here.
+        {
+            static volatile LONG s_ngxBlocked = 0;
+            if (!InterlockedCompareExchange(&s_ngxBlocked, 0, 0)) {
+                IDXGIDevice* probe = nullptr;
+                HRESULT qhr = g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&probe);
+                if (probe) probe->Release();
+                if (FAILED(qhr)) {
+                    InterlockedExchange(&s_ngxBlocked, 1);
+                    Log("ngx-pipe: game-wrapped device detected (QI hr=0x%08X) - NGX disabled for stability", (unsigned)qhr);
+                }
+            }
+            if (InterlockedCompareExchange(&s_ngxBlocked, 0, 0)) {
+                bb->Release();
+                return; // stable passthrough: no GPU work, no NGX
+            }
+        }
+
         if (!g_upscaler) {
             EnsureUpscalerInit(true /*Present pipeline: bypass legacy quiet gate*/);
             if (!g_upscaler || !g_upscaler->IsReady()) { bb->Release(); return; }
