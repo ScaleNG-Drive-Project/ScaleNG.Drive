@@ -43,6 +43,7 @@ bool g_cfgSet = false;
 
 volatile LONG g_smokeBusy = 0; // nonzero while smoke test owns the driver
 volatile LONG g_presentSelfTestFired = 0;
+IDXGISwapChain* g_egshDummySC = nullptr; // never adopt/pipeline this one
 ID3D12Device* g_device = nullptr;
 ID3D12Resource* g_cameraRing = nullptr;
 
@@ -1771,7 +1772,8 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
 {
     if (!g_swapchain) return;
 
-    Log("ngx-pipe: enter");
+    static int s_enterLogs = 0;
+    if (++s_enterLogs <= 3 || (s_enterLogs % 600) == 0) Log("ngx-pipe: enter #%d", s_enterLogs);
 
     // Get backbuffer - GUARDED: sc may be a wrapped/garbage pointer
     ID3D12Resource* bb = nullptr;
@@ -1784,7 +1786,7 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         Log("ngx-pipe: GetBuffer AV");
         return;
     }
-    Log("ngx-pipe: bb=%p", (void*)bb);
+    static int s_bbLogs = 0; if (++s_bbLogs <= 3) Log("ngx-pipe: bb=%p", (void*)bb);
 
     D3D12_RESOURCE_DESC bbd = {};
     __try {
@@ -1795,7 +1797,8 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         return;
     }
     UINT w = (UINT)bbd.Width, h = (UINT)bbd.Height;
-    Log("ngx-pipe: bb %ux%u fmt=%u", w, h, (unsigned)bbd.Format);
+    if (w < 256 || h < 128) { bb->Release(); return; } // EGSH dummy / tiny targets
+    static int s_dimLogs = 0; if (++s_dimLogs <= 3) Log("ngx-pipe: bb %ux%u fmt=%u", w, h, (unsigned)bbd.Format);
 
     // Lazy-create everything on first valid frame
     if (!g_ngxPipelineReady) {
@@ -1815,7 +1818,7 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
                 return;
             }
         }
-        Log("ngx-pipe: device=%p", (void*)g_device);
+        static int s_devLogs = 0; if (++s_devLogs <= 3) Log("ngx-pipe: device=%p", (void*)g_device);
 
         if (!g_upscaler) {
             EnsureUpscalerInit();
@@ -1985,7 +1988,9 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     // SELF-CONTAINED NGX PIPELINE: runs UNCONDITIONALLY.
     // Gets everything from swapchain internally. No other hooks needed.
     if (g_dlaaMode && g_swapchain && !g_ngxPipelineReady) {
-        Log("ngx-pipe: first Present - starting self-contained pipeline");
+        static int s_firstPresLogs = 0;
+        if (++s_firstPresLogs <= 3)
+            Log("ngx-pipe: first Present - starting self-contained pipeline");
     }
     if (g_dlaaMode && g_swapchain) {
         __try {
@@ -2879,7 +2884,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
                 Log("present-feed: last full-res src %p fmt %u",
                     g_topoLastSrc, g_topoLastFmt);
             }
-            if (sc != g_swapchain) {
+            if (sc == g_egshDummySC) { /* EGSH self-test present: never adopt */ }
+            else if (sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
@@ -2909,7 +2915,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT syncInterval, 
 {
     if (sc) {
         __try {
-            if (sc != g_swapchain) {
+            if (sc == (IDXGISwapChain1*)g_egshDummySC) { /* EGSH self-test present */ }
+            else if (sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
@@ -3143,6 +3150,7 @@ void EnsureGlobalSwapchainHookImpl()
             dhr = E_FAIL;
         }
         Log("hooks: EGSH clean swapchain hr=0x%08X sc=%p", (unsigned)dhr, (void*)dummy);
+        g_egshDummySC = dummy;
 
         // ================================================================
         // STEP 2: Hook PRESENT at FUNCTION LEVEL via the dummy swapchain.
@@ -3241,6 +3249,7 @@ void EnsureGlobalSwapchainHookImpl()
         }
 
         // Cleanup temp objects
+        g_egshDummySC = nullptr;
         if (dummy) { dummy->Release(); dummy = nullptr; }
         if (f4) f4->Release();
         if (dq) dq->Release();
