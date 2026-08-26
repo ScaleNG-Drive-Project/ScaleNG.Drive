@@ -75,6 +75,8 @@ struct SetupMsg {
     unsigned long long hFIn;
     unsigned long long hFOut;
     unsigned int w, h, fmt;
+    unsigned int pad;
+    unsigned long long startVal; // ASI's next expected fence value
 };
 
 static ID3D12Device*              g_dev    = nullptr;
@@ -90,6 +92,7 @@ static ID3D12Resource*            g_depthIn = nullptr; // zero-filled dummies
 static ID3D12Resource*            g_mvIn    = nullptr;
 static IUpscaler*                 s_up      = nullptr;
 static UINT                       s_initW   = 0, s_initH = 0;
+static unsigned long long         s_seedVal = 1;
 
 static bool InitDevice()
 {
@@ -184,6 +187,7 @@ static bool ApplySetup(const SetupMsg& m)
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_mvIn));
         // force in-loop NGX reinit at new dims
         s_up = nullptr; s_initW = 0; s_initH = 0;
+        s_seedVal = m.startVal;
     }
     LogLine("helper: setup %ux%u fmt=%u", m.w, m.h, m.fmt);
     return true;
@@ -272,7 +276,7 @@ static int RunSelfTest()
     HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
 
     int pass = 0;
-    unsigned long long v = 0;
+    unsigned long long v = s_seedVal;
     for (int i = 0; i < 100; ++i) {
         UpscalerEvaluateParams ep = {};
         ep.commandList = g_list;
@@ -355,7 +359,7 @@ int main(int argc, char** argv)
         WriteFile(pipe, &r, sizeof(r), &br, nullptr);
 
         // FRAME LOOP: one submission per game signal; NGX lands next stage.
-        unsigned long long v = 0;
+        unsigned long long v = s_seedVal;
         unsigned long long frames = 0;
         DWORD lastReport = GetTickCount();
         HANDLE parent = argc > 1 ? OpenProcess(0x00100000L /*PROCESS_SYNCHRONIZE*/, FALSE, atoi(argv[1])) : nullptr;
@@ -372,7 +376,18 @@ int main(int argc, char** argv)
                 v = completed + 1;
             }
             if (FAILED(g_fIn->SetEventOnCompletion(v, g_fInEv))) break;
-            if (WaitForSingleObject(g_fInEv, INFINITE) != WAIT_OBJECT_0) break;
+            // Interruptible wait: poll pipe during wait so a resize SetupMsg
+            // can be consumed even while no frames are arriving.
+            bool signaled = false;
+            for (;;) {
+                DWORD wr2 = WaitForSingleObject(g_fInEv, 250);
+                if (wr2 == WAIT_OBJECT_0) { signaled = true; break; }
+                if (wr2 != WAIT_TIMEOUT) break;
+                DWORD avail2 = 0;
+                if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail2, nullptr) || avail2 >= sizeof(SetupMsg))
+                    break; // pipe dead or setup pending -> exit to outer handling
+            }
+            if (!signaled) break;
             ++frames;
 
             // NGX evaluate on shared color -> shared out (production path).

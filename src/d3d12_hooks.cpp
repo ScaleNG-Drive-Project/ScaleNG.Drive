@@ -1964,6 +1964,8 @@ static bool B2StartHelper()
 struct B2SetupMsg {
     unsigned long long hColor, hOut, hFIn, hFOut;
     unsigned int w, h, fmt;
+    unsigned int pad = 0;
+    unsigned long long startVal = 0; // epoch-sync for helper fence loop
 };
 
 static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
@@ -1985,6 +1987,7 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
         return false;
     }
     m.w = w; m.h = h; m.fmt = (unsigned)fmt;
+    m.startVal = g_b2Val + 1; // next frame index helper should expect
     DWORD wr = 0, rd = 0;
     if (!WriteFile(g_b2Pipe, &m, sizeof(m), &wr, nullptr)) return false;
     unsigned int resp = 0;
