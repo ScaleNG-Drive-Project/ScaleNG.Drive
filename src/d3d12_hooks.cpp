@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "d3d12_hooks.h"
+#include <tlhelp32.h>
 #include "log.h"
 #include "camera_cb.h"
 #include "dlss_ngx.h"
@@ -1853,6 +1854,28 @@ static bool   g_b2UseHelper = true;  // cross-process NGX ownership
 static HANDLE g_b2HColor  = nullptr, g_b2HOut = nullptr;
 static HANDLE g_b2HFIn    = nullptr, g_b2HFOut = nullptr;
 
+static void B2KillOrphans()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (!lstrcmpiW(pe.szExeFile, L"ScaleNG_NGX_helper.exe") &&
+                pe.th32ProcessID != GetCurrentProcessId()) {
+                HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                if (h) {
+                    Log("ngx-b2: terminating orphan helper pid=%lu", pe.th32ProcessID);
+                    TerminateProcess(h, 0);
+                    WaitForSingleObject(h, 2000);
+                    CloseHandle(h);
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+}
+
 static void B2KillHelper()
 {
     if (g_b2Pipe)    { CloseHandle(g_b2Pipe);   g_b2Pipe = nullptr; }
@@ -1861,7 +1884,9 @@ static void B2KillHelper()
 
 static bool B2StartHelper()
 {
-    if (!g_b2UseHelper || g_b2Pipe) return g_b2Pipe != nullptr;
+    if (!g_b2UseHelper) return false;
+    if (g_b2Pipe) return true;
+    B2KillOrphans(); // stale helpers hold the pipe name -> ERROR_PIPE_BUSY
 
     wchar_t self[MAX_PATH] = {};
     HMODULE mod = nullptr;
@@ -1880,7 +1905,7 @@ static bool B2StartHelper()
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     g_b2Pipe = CreateNamedPipeA("\\\\.\\pipe\\ScaleNG_NGX",
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         1, sizeof(unsigned long long) * 8, sizeof(unsigned long long) * 8, 0, &sa);
     if (g_b2Pipe == INVALID_HANDLE_VALUE) {
@@ -2049,6 +2074,10 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     }
 
     // shared texture pair on GAME device -> opened on ours
+    if (g_b2HColor) { CloseHandle(g_b2HColor); g_b2HColor = nullptr; }
+    if (g_b2HOut)   { CloseHandle(g_b2HOut);   g_b2HOut = nullptr; }
+    if (g_b2HFIn)   { CloseHandle(g_b2HFIn);   g_b2HFIn = nullptr; }
+    if (g_b2HFOut)  { CloseHandle(g_b2HFOut);  g_b2HFOut = nullptr; }
     B2ReleasePair();
     {
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;

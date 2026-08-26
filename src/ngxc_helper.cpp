@@ -24,9 +24,11 @@
 #include <cstdio>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <psapi.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "psapi.lib")
 
 static void LogLine(const char* fmt, ...)
 {
@@ -106,8 +108,10 @@ static bool InitDevice()
     IDXGIDevice* probe = nullptr;
     hr = g_dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&probe);
     if (probe) probe->Release();
-    LogLine("helper: device %p QI(IDXGIDevice)=0x%08X %s",
-        (void*)g_dev, (unsigned)hr, SUCCEEDED(hr) ? "(CLEAN)" : "(WRAPPED!)");
+    // NOTE: native ID3D12Device does NOT implement IDXGIDevice (D3D11-only).
+    // E_NOINTERFACE is EXPECTED - never treat it as wrapper evidence.
+    LogLine("helper: device %p QI(IDXGIDevice)=0x%08X (normal for D3D12)",
+        (void*)g_dev, (unsigned)hr);
 
     D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_q)))) return false;
@@ -186,42 +190,50 @@ int main(int argc, char** argv)
         unsigned int r = 0x59414B4F; // 'OKAY'
         WriteFile(pipe, &r, sizeof(r), &br, nullptr);
 
-        // FRAME LOOP: fence round-trip proof (NGX wiring lands next stage).
+        // FRAME LOOP: one submission per game signal; NGX lands next stage.
         unsigned long long v = 0;
-        unsigned frames = 0;
+        unsigned long long frames = 0;
         DWORD lastReport = GetTickCount();
+        HANDLE parent = argc > 1 ? OpenProcess(0x00100000L /*PROCESS_SYNCHRONIZE*/, FALSE, atoi(argv[1])) : nullptr;
         for (;;) {
-            // wait game signal
-            if (FAILED(g_fIn->SetEventOnCompletion(v, g_fInEv))) break;
-            if (WaitForSingleObject(g_fInEv, 4000) != WAIT_OBJECT_0) {
-                LogLine("helper: fIn timeout (v=%llu)", v);
+            if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) {
+                LogLine("helper: parent exited - bye");
                 break;
             }
-            ++v;
 
-            // TODO(next stage): record NGX evaluate color->out on g_list/g_q.
-            // For now: empty submission to keep allocator warm + prove ordering.
+            UINT64 completed = g_fIn->GetCompletedValue();
+            if (completed >= v) {
+                if (v != 0 && completed > v + 64)
+                    LogLine("helper: resync v %llu -> %llu", v, completed + 1);
+                v = completed + 1;
+            }
+            if (FAILED(g_fIn->SetEventOnCompletion(v, g_fInEv))) break;
+            if (WaitForSingleObject(g_fInEv, INFINITE) != WAIT_OBJECT_0) break;
+            ++frames;
+
+            // TODO(next stage): NGX evaluate color->out recorded here.
             if (SUCCEEDED(g_list->Reset(g_alloc, nullptr))) {
                 g_list->Close();
                 ID3D12CommandList* l[] = { g_list };
                 g_q->ExecuteCommandLists(1, l);
             }
-            g_q->Signal(g_fOut, v); // ALWAYS
+            g_q->Signal(g_fOut, v); // ALWAYS - stage3 must never starve
 
-            if ((++frames % 600) == 0 || (GetTickCount() - lastReport) > 5000) {
-                LogLine("helper: %u frames (v=%llu)", frames, v);
-                lastReport = GetTickCount();
+            DWORD nowT = GetTickCount();
+            if ((nowT - lastReport) > 5000) {
+                PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+                GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+                LogLine("helper: %llu frames (v=%llu) commit=%.0fMB ws=%.0fMB",
+                    frames, v, pmc.PagefileUsage / 1048576.0,
+                    pmc.WorkingSetSize / 1048576.0);
+                lastReport = nowT;
             }
 
-            // resize / re-setup notification arrives as new SetupMsg? We stay
-            // in-loop; game side sends nothing until teardown. Pipe read below
-            // would block, so poll pipe non-blocking every 64 frames instead.
-            if ((frames % 64) == 0) {
-                DWORD avail = 0;
-                if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) || avail == 0)
-                    continue;
+            DWORD avail = 0;
+            if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail >= sizeof(SetupMsg)) {
                 SetupMsg m2 = {};
-                if (ReadFile(pipe, &m2, sizeof(m2), &br, nullptr) && br == sizeof(m2)) {
+                DWORD r2 = 0;
+                if (ReadFile(pipe, &m2, sizeof(m2), &r2, nullptr) && r2 == sizeof(m2)) {
                     LogLine("helper: re-setup");
                     if (!ApplySetup(m2)) break;
                 }
