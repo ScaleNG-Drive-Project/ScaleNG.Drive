@@ -1769,6 +1769,266 @@ static void CreateNgxTextures(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt
         w, h, (void*)g_ngxColor, (void*)g_ngxDepth, (void*)g_ngxMv, (void*)g_ngxOut);
 }
 
+// ============================================================================
+// ============================================================================
+// FENCE-ORDERED SHARED-HANDLE BRIDGE (b2 - coexists with dormant legacy vars)
+// NGX runs on OUR clean NVIDIA device (200/200 proven); the game's wrapped
+// device only ever does copies. Simultaneous-access textures need no cross-
+// device state tracking. GPU-side fences sequence the hops - no CPU blocking.
+//
+//   game queue : copy bb->shColor ; signal fIn(v)
+//   our queue  : wait fIn(v) ; NGX shColor->shOut ; signal fOut(v)
+//   game queue : wait fOut(v) ; copy shOut->bb
+//
+// FAILURE LAW: fOut is ALWAYS signaled (queue-level Signal, list-independent).
+// A failed NGX frame degrades to stale-output passthrough - never deadlock.
+// ============================================================================
+
+static ID3D12Device*              g_b2Dev     = nullptr;
+static ID3D12CommandQueue*        g_b2Q       = nullptr;
+static ID3D12CommandAllocator*    g_b2Alloc   = nullptr;
+static ID3D12GraphicsCommandList* g_b2List    = nullptr;
+static ID3D12Resource*            g_b2ColorG  = nullptr;
+static ID3D12Resource*            g_b2ColorO  = nullptr;
+static ID3D12Resource*            g_b2OutG    = nullptr;
+static ID3D12Resource*            g_b2OutO    = nullptr;
+static ID3D12Fence*               g_b2FenceInG  = nullptr;
+static ID3D12Fence*               g_b2FenceOutG = nullptr;
+static ID3D12Fence*               g_b2FIO  = nullptr;
+static ID3D12Fence*               g_b2FOO  = nullptr;
+static UINT64                     g_b2Val  = 0;
+static bool                       g_b2Ready = false;
+static bool                       g_ngxBlocked = false; // wrapper detected -> bridge mode
+static UINT                       g_b2W = 0, g_b2H = 0;
+static DXGI_FORMAT                g_b2Fmt = DXGI_FORMAT_UNKNOWN;
+static ID3D12Resource*            g_b2Depth = nullptr;
+static ID3D12Resource*            g_b2Mv    = nullptr;
+
+template <typename T>
+static bool B2OpenShared(ID3D12Device* dev, ID3D12DeviceChild* obj, T** out)
+{
+    HANDLE h = nullptr;
+    if (FAILED(g_device->CreateSharedHandle(obj, nullptr, GENERIC_ALL, nullptr, &h)) || !h)
+        return false;
+    HRESULT hr = dev->OpenSharedHandle(h, IID_PPV_ARGS(out));
+    CloseHandle(h);
+    return SUCCEEDED(hr) && *out;
+}
+
+static void B2ReleasePair()
+{
+    for (auto** p : { &g_b2ColorG, &g_b2ColorO, &g_b2OutG, &g_b2OutO,
+                      &g_b2Depth, &g_b2Mv })
+        if (*p) { (*p)->Release(); *p = nullptr; }
+    for (auto** p : { &g_b2FIO, &g_b2FOO })
+        if (*p) { (*p)->Release(); *p = nullptr; }
+    if (g_b2FenceInG)  { g_b2FenceInG->Release();  g_b2FenceInG  = nullptr; }
+    if (g_b2FenceOutG) { g_b2FenceOutG->Release(); g_b2FenceOutG = nullptr; }
+}
+
+static void B2EnsureDummyInputs(UINT w, UINT h)
+{
+    static UINT s_w = 0, s_h = 0;
+    if (s_w == w && s_h == h && g_b2Depth && g_b2Mv) return;
+    if (g_b2Depth) { g_b2Depth->Release(); g_b2Depth = nullptr; }
+    if (g_b2Mv)    { g_b2Mv->Release();    g_b2Mv = nullptr; }
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    g_b2Dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_b2Depth));
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    g_b2Dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_b2Mv));
+    s_w = w; s_h = h;
+}
+
+static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
+{
+    if (g_b2Ready && g_b2W == w && g_b2H == h && g_b2Fmt == fmt)
+        return true;
+    Log("ngx-b2: init %ux%u fmt=%u", w, h, (unsigned)fmt);
+    if (!g_b2Ready && !g_b2Dev) {
+        typedef HRESULT(WINAPI* PFN_DC)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
+        HMODULE d3dMod = GetModuleHandleA("d3d12.dll");
+        PFN_DC mkDev = d3dMod ? (PFN_DC)GetProcAddress(d3dMod, "D3D12CreateDevice") : nullptr;
+        if (!mkDev || FAILED(mkDev(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                   __uuidof(ID3D12Device), (void**)&g_b2Dev)) || !g_b2Dev) {
+            Log("ngx-b2: own device FAILED"); return false;
+        }
+        IDXGIDevice* probe = nullptr;
+        HRESULT qhr = g_b2Dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&probe);
+        if (probe) probe->Release();
+        Log("ngx-b2: own device ok %p (QI hr=0x%08X)", (void*)g_b2Dev, (unsigned)qhr);
+        D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(g_b2Dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_b2Q))) ||
+            FAILED(g_b2Dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_b2Alloc))) ||
+            FAILED(g_b2Dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_b2Alloc, nullptr,
+                                              IID_PPV_ARGS(&g_b2List)))) {
+            Log("ngx-b2: own queue/list FAILED"); return false;
+        }
+        g_b2List->Close();
+    }
+
+    // shared texture pair on GAME device -> opened on ours
+    B2ReleasePair();
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Format = fmt;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                   D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_SHARED;
+        if (FAILED(g_device->CreateCommittedResource(&hp, hf, &rd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_b2ColorG))) ||
+            FAILED(g_device->CreateCommittedResource(&hp, hf, &rd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_b2OutG)))) {
+            Log("ngx-b2: shared tex creation FAILED"); return false;
+        }
+        if (!B2OpenShared(g_b2Dev, g_b2ColorG, &g_b2ColorO) ||
+            !B2OpenShared(g_b2Dev, g_b2OutG, &g_b2OutO)) {
+            Log("ngx-b2: OpenSharedHandle FAILED"); return false;
+        }
+        // shared fences
+        ID3D12Fence *fiG=nullptr,*foG=nullptr,*fiO=nullptr,*foO=nullptr;
+        bool ok =
+            SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fiG))) &&
+            SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&foG))) &&
+            B2OpenShared(g_b2Dev, fiG, &fiO) && B2OpenShared(g_b2Dev, foG, &foO);
+        if (!ok) {
+            Log("ngx-b2: shared fence FAILED");
+            if(fiG)fiG->Release(); if(foG)foG->Release(); if(fiO)fiO->Release(); if(foO)foO->Release();
+            return false;
+        }
+        g_b2FenceInG = fiG; g_b2FenceOutG = foG; g_b2FIO = fiO; g_b2FOO = foO;
+    }
+
+    // NGX upscaler on OUR device
+    if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
+    if (!g_upscaler) { Log("ngx-b2: upscaler create FAILED"); return false; }
+    UpscalerInitParams ip = {};
+    ip.device = g_b2Dev;
+    ip.renderWidth = w;  ip.renderHeight = h;
+    ip.displayWidth = w; ip.displayHeight = h;
+    ip.appId = g_cfg.appId;
+    ip.perfQuality = g_cfg.perfQuality;
+    ip.mvJittered = g_cfg.mvJittered != 0;
+    ip.autoExposure = g_cfg.autoExposure != 0;
+    {
+        static wchar_t dllPath[MAX_PATH];
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&EnsureNgxBridgeB2, &self);
+        wchar_t selfPath[MAX_PATH] = {};
+        if (self) GetModuleFileNameW(self, selfPath, MAX_PATH);
+        wchar_t* slash = wcsrchr(selfPath, L'\\');
+        if (slash) *(slash + 1) = L'\0';
+        lstrcpyW(dllPath, selfPath); lstrcatW(dllPath, L"nvngx_dlss.dll");
+        ip.dlssDllPath = dllPath;
+    }
+    if (!g_upscaler->Init(ip) || !g_upscaler->IsReady()) {
+        Log("ngx-b2: NGX Init on own device FAILED"); return false;
+    }
+    g_upscaler->UpdateSizes(w, h, w, h);
+
+    g_b2W = w; g_b2H = h; g_b2Fmt = fmt;
+    g_b2Ready = true;
+    Log("ngx-b2: READY (own=%p game=%p)", (void*)g_b2Dev, (void*)g_device);
+    return true;
+}
+
+static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt)
+{
+    if (!EnsureNgxBridgeB2(w, h, fmt)) return;
+    B2EnsureDummyInputs(w, h);
+
+    ++g_b2Val;
+    UINT64 v = g_b2Val;
+
+    static ID3D12CommandAllocator*    s_alA = nullptr; static ID3D12GraphicsCommandList* s_clA = nullptr;
+    static ID3D12CommandAllocator*    s_alB = nullptr; static ID3D12GraphicsCommandList* s_clB = nullptr;
+    static ID3D12CommandQueue*        s_gq  = nullptr;
+    if (!s_gq) {
+        D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&s_gq)))) return;
+        if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_alA))) ||
+            FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alA, nullptr, IID_PPV_ARGS(&s_clA))) ||
+            FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_alB))) ||
+            FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alB, nullptr, IID_PPV_ARGS(&s_clB))))
+            return;
+        s_clA->Close(); s_clB->Close();
+    }
+
+    // STAGE 1 (game): bb -> sharedColor ; signal fIn
+    s_clA->Reset(s_alA, nullptr);
+    D3D12_RESOURCE_BARRIER b1 = {};
+    b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b1.Transition.pResource = bb;
+    b1.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b1.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b1.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_clA->ResourceBarrier(1, &b1);
+    D3D12_TEXTURE_COPY_LOCATION d1 = { g_b2ColorG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION s1 = { bb,         D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    s_clA->CopyTextureRegion(&d1, 0, 0, 0, &s1, nullptr);
+    b1.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b1.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    s_clA->ResourceBarrier(1, &b1);
+    s_clA->Close();
+    ID3D12CommandList* l1[] = { s_clA };
+    s_gq->ExecuteCommandLists(1, l1);
+    s_gq->Signal(g_b2FenceInG, v);
+
+    // STAGE 2 (ours): wait fIn -> NGX -> ALWAYS signal fOut
+    g_b2Q->Wait(g_b2FIO, v);
+    bool recorded = false;
+    if (SUCCEEDED(g_b2List->Reset(g_b2Alloc, nullptr))) {
+        UpscalerEvaluateParams ep = {};
+        ep.commandList = g_b2List;
+        ep.color = g_b2ColorO;
+        ep.depth = g_b2Depth;
+        ep.motionVectors = g_b2Mv;
+        ep.output = g_b2OutO;
+        ep.jitterX = 0; ep.jitterY = 0;
+        ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
+        ep.sharpness = g_cfg.sharpness;
+        recorded = g_upscaler->Evaluate(ep);
+        if (recorded && SUCCEEDED(g_b2List->Close())) {
+            ID3D12CommandList* l2[] = { g_b2List };
+            g_b2Q->ExecuteCommandLists(1, l2);
+        } else recorded = false;
+    }
+    g_b2Q->Signal(g_b2FOO, v); // unconditional - stage 3 must never starve
+
+    // STAGE 3 (game): wait fOut -> sharedOut -> bb
+    s_gq->Wait(g_b2FenceOutG, v);
+    s_clB->Reset(s_alB, nullptr);
+    D3D12_RESOURCE_BARRIER b3 = {};
+    b3.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b3.Transition.pResource = bb;
+    b3.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b3.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    b3.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_clB->ResourceBarrier(1, &b3);
+    D3D12_TEXTURE_COPY_LOCATION d3 = { bb,       D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION s3 = { g_b2OutG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    s_clB->CopyTextureRegion(&d3, 0, 0, 0, &s3, nullptr);
+    b3.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b3.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    s_clB->ResourceBarrier(1, &b3);
+    s_clB->Close();
+    ID3D12CommandList* l3[] = { s_clB };
+    s_gq->ExecuteCommandLists(1, l3);
+
+    static unsigned s_brFrames = 0;
+    if (++s_brFrames <= 5 || (s_brFrames % 600) == 0)
+        Log("ngx-b2: frame %u eval=%s", s_brFrames, recorded ? "ok" : "SKIP");
+}
 static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandList* cmdList,
                                       ID3D12CommandQueue* queue)
 {
@@ -1822,25 +2082,24 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         }
         static int s_devLogs = 0; if (++s_devLogs <= 3) Log("ngx-pipe: device=%p", (void*)g_device);
 
-        // GAME-WRAPPER TRIPWIRE: BeamNG's device wrapper fails IDXGIDevice QI.
-        // NGX dispatch recording against this wrapper hangs/crashes the process
-        // (proven 23:01 crash-in-overlay + 23:11 deadlock, vs 200/200 on a clean
-        // device). Until a shared-handle bridge exists, refuse to run NGX here.
-        {
-            static volatile LONG s_ngxBlocked = 0;
-            if (!InterlockedCompareExchange(&s_ngxBlocked, 0, 0)) {
-                IDXGIDevice* probe = nullptr;
-                HRESULT qhr = g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&probe);
-                if (probe) probe->Release();
-                if (FAILED(qhr)) {
-                    InterlockedExchange(&s_ngxBlocked, 1);
-                    Log("ngx-pipe: game-wrapped device detected (QI hr=0x%08X) - NGX disabled for stability", (unsigned)qhr);
-                }
+        // GAME-WRAPPER TRIPWIRE -> BRIDGE DISPATCH:
+        // BeamNG's device wrapper fails IDXGIDevice QI; NGX dispatch recording
+        // on this wrapped device hangs/crashes (proven twice). When detected,
+        // run the fence-ordered shared-handle bridge: NGX on OUR clean device,
+        // copies-only on the game device.
+        if (!g_ngxBlocked) {
+            IDXGIDevice* probe = nullptr;
+            HRESULT qhr = g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&probe);
+            if (probe) probe->Release();
+            if (FAILED(qhr)) {
+                g_ngxBlocked = true;
+                Log("ngx-pipe: game-wrapped device (QI hr=0x%08X) - enabling shared-handle bridge", (unsigned)qhr);
             }
-            if (InterlockedCompareExchange(&s_ngxBlocked, 0, 0)) {
-                bb->Release();
-                return; // stable passthrough: no GPU work, no NGX
-            }
+        }
+        if (g_ngxBlocked) {
+            NgxBridgeFrameB2(bb, w, h, bbd.Format);
+            bb->Release();
+            return;
         }
 
         if (!g_upscaler) {
