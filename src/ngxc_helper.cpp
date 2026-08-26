@@ -398,7 +398,9 @@ int main(int argc, char** argv)
                     continue;
                 }
                 unsigned long long fv = 0;
-                if (!ReadExact(pipe, &fv, sizeof(fv))) break;
+                LogLine("helper: waiting frame msg...");
+                if (!ReadExact(pipe, &fv, sizeof(fv))) { LogLine("helper: frame read FAILED"); break; }
+                LogLine("helper: frame msg v=%llu", (unsigned long long)fv);
                 if (fv == 0xFFFFFFFFFFFFFFFF) { // setup marker follows
                     SetupMsg m2{};
                         if (!ReadExact(pipe, &m2, sizeof(m2))) break;

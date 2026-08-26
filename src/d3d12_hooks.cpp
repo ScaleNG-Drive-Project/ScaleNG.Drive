@@ -2262,8 +2262,12 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     // signals fOut, then acks. We never read fence values cross-process.
     bool helperAcked = false;
     if (g_b2UseHelper && g_b2Pipe) {
-        DWORD wr = 0;
-        WriteFile(g_b2Pipe, &v, sizeof(v), &wr, nullptr);
+        static unsigned s_wDiag = 0; bool wrOK = false; DWORD wr = 0;
+        wrOK = WriteFile(g_b2Pipe, &v, sizeof(v), &wr, nullptr);
+        if (++s_wDiag <= 3)
+            Log("ngx-b2: frame msg write v=%llu ok=%d bytes=%lu err=%lu",
+                (unsigned long long)v, (int)wrOK, wr,
+                wrOK ? 0UL : GetLastError());
         unsigned long long ack = 0;
         DWORD rd = 0, have = 0;
         for (int spin = 0; spin < 250 && have < sizeof(ack); ++spin) {
