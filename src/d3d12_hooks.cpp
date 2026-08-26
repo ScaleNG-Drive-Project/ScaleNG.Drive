@@ -3123,6 +3123,18 @@ void EnsureGlobalSwapchainHookImpl()
             void* pPresent = dvt[8];
             void* pPresent1 = dvt[22];
             Log("hooks: EGSH dummy sc=%p vt8=%p vt22=%p", (void*)dummy, pPresent, pPresent1);
+            // Module ownership diagnostic: if these targets are NOT in
+            // dxgi.dll, the game routes Presents elsewhere and we need to know.
+            {
+                HMODULE mod = nullptr;
+                DWORD modNameLen = 0;
+                wchar_t modName[64] = L"?";
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCWSTR)pPresent, &mod) && mod)
+                    modNameLen = GetModuleFileNameW(mod, modName, 64);
+                wchar_t* base = wcsrchr(modName, L'\\');
+                Log("hooks: PRESENT target module: %ls", base ? base + 1 : modName);
+            }
             if (pPresent && IsExecutableImagePtr(pPresent)) {
                 MH_STATUS st = MH_CreateHook(pPresent, &Hook_Present, (void**)&Real_Present);
                 if (st == MH_OK && MH_EnableHook(pPresent) == MH_OK) {
@@ -3145,6 +3157,33 @@ void EnsureGlobalSwapchainHookImpl()
                 } else if (st1 != MH_ERROR_ALREADY_CREATED) {
                     Log("hooks: PRESENT1 fn-level hook FAILED st=%d", (int)st1);
                 }
+            }
+
+            // BELT-AND-BRACES: also swap the shared-table slot pointers.
+            // If the game's (wrapped) swapchain shares THIS table, the raw
+            // slot write routes it to us even if MinHook's function patch
+            // somehow misses. Harmless double coverage otherwise.
+            {
+                MEMORY_BASIC_INFORMATION vmbi = {};
+                VirtualQuery(dvt, &vmbi, sizeof(vmbi));
+                DWORD vold = 0;
+                if (VirtualProtect(vmbi.BaseAddress, vmbi.RegionSize, PAGE_READWRITE, &vold)) {
+                    if (!Real_Present && dvt[8]) {
+                        Real_Present = (PFN_Present)dvt[8];
+                        dvt[8] = (void*)&Hook_Present;
+                        Log("hooks: shared-table slot8 SWAPPED -> Hook_Present");
+                    }
+                    if (!Real_Present1 && dvt[22]) {
+                        Real_Present1 = (PFN_Present1)dvt[22];
+                        dvt[22] = (void*)&Hook_Present1;
+                        Log("hooks: shared-table slot22 SWAPPED -> Hook_Present1");
+                    }
+                    VirtualProtect(vmbi.BaseAddress, vmbi.RegionSize, vold, &vold);
+                } else {
+                    Log("hooks: shared-table swap skipped (VirtualProtect denied)");
+                }
+                void* vt[2] = { (void*)Hook_Present, (void*)Hook_Present1 };
+                CfgMarkValid(vt, 2);
             }
         }
 
