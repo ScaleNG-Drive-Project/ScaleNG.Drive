@@ -232,6 +232,8 @@ extern "C" __declspec(dllexport) void InitializeASI()
                 HooksSetSmokeBusy(1);
                 RunNgxSyntheticTest();
                 HooksSetSmokeBusy(0);
+                extern void HooksKickEGSH();
+                HooksKickEGSH(); // install Present hook now that driver is idle
                 Log("SMOKE: test complete");
                 return 0;
             }, nullptr, 0, nullptr);

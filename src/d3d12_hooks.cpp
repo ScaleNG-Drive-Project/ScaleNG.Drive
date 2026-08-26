@@ -3499,6 +3499,18 @@ void HookFactoryObject(IDXGIFactory* factory)
     if (!factory) return;
     Log("hooks: HookFactoryObject called factory=%p", (void*)factory);
     if (!g_anyFactory) g_anyFactory = factory;
+    // Periodic EGSH kick: guarantees the Present-hook installation eventually
+    // runs even if its first opportunities were skipped (smoke busy, early
+    // device creation). Cheap no-op once g_scanDone is set.
+    {
+        static volatile LONG s_kick = 0;
+        if (InterlockedCompareExchange(&s_kick, 1, 0) == 0) {
+            static int s_kickCount = 0;
+            if ((++s_kickCount % 8) == 1 && !g_scanDone)
+                HooksKickEGSH();
+            InterlockedExchange(&s_kick, 0);
+        }
+    }
     void** vt = *(void***)factory;
     bool any = false;
     if (!Real_CreateSwapChainForHwnd &&
@@ -4303,8 +4315,22 @@ void EnsureGlobalSwapchainHookEx() { EnsureGlobalSwapchainHookImpl(); }
 
 void RunNgxSyntheticTest()
 {
-    static volatile long s_smokeRan = 0;
-    if (InterlockedCompareExchange(&s_smokeRan, 1, 0) != 0) return;
+    // PROCESS-WIDE once-guard via named mapping: survives multiple ASI
+    // copies / loader re-entries where per-copy statics do not.
+    {
+        HANDLE hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 64, L"Local\\ScaleNG_SmokeRan");
+        long* pShared = hMap ? (long*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 64) : nullptr;
+        bool alreadyRan = true;
+        if (pShared) {
+            alreadyRan = (InterlockedCompareExchange(pShared, 1, 0) != 0);
+            UnmapViewOfFile(pShared);
+        } else {
+            static volatile long s_fallback = 0;
+            alreadyRan = (InterlockedCompareExchange(&s_fallback, 1, 0) != 0);
+        }
+        if (hMap) CloseHandle(hMap);
+        if (alreadyRan) return;
+    }
     InterlockedExchange(&g_smokeBusy, 1);
 
     Log("SMOKE: starting synthetic NGX test");
@@ -4545,6 +4571,7 @@ unsigned HooksGetQuietFrames() {
     return g_lastNewChainFrame ? (g_frameCounter - g_lastNewChainFrame) : 0;
 }
 void HooksSetSmokeBusy(int v) { InterlockedExchange(&g_smokeBusy, (LONG)v); }
+void HooksKickEGSH() { EnsureGlobalSwapchainHookImpl(); }
 
 // CPU-side microscope: VEH logs EVERY first-chance AV with module+offset as
 // it happens. Rotation-burst deaths show no SEH catch and no device-removed,

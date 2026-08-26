@@ -18,6 +18,8 @@ struct ScaleNgConfig {
 };
 
 unsigned HooksGetQuietFrames();
+void HooksSetSmokeBusy(int v);
+void HooksKickEGSH();
 void HooksDumpDRED(const char* why);
 void HooksInstallVEH();
 void HooksSetConfig(const ScaleNgConfig& config);
