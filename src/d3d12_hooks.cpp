@@ -2199,14 +2199,34 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     static ID3D12CommandAllocator*    s_alA = nullptr; static ID3D12GraphicsCommandList* s_clA = nullptr;
     static ID3D12CommandAllocator*    s_alB = nullptr; static ID3D12GraphicsCommandList* s_clB = nullptr;
     static ID3D12CommandQueue*        s_gq  = nullptr;
-    if (!s_gq) {
-        D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&s_gq)))) return;
+    static bool        s_gqTried = false;
+    if (!s_gq && !s_gqTried) {
+        s_gqTried = true;
+        // PREFER the game's own direct queue: same-queue submission makes our
+        // backbuffer transitions ordered against the game's rendering (a
+        // private queue racing the game on the same bb = device removal).
+        if (g_graphicsQueue) {
+            s_gq = g_graphicsQueue;
+            Log("ngx-b2: stages on GAME queue %p", (void*)s_gq);
+        } else {
+            D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&s_gq)))) return;
+            Log("ngx-b2: WARNING game queue unavailable - private queue (race risk)");
+        }
+    }
+    if (!s_gq) return;
+    // Allocators/lists are queue-agnostic; create once.
+    static bool s_listsTried = false;
+    if (!s_listsTried) {
+        s_listsTried = true;
         if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_alA))) ||
             FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alA, nullptr, IID_PPV_ARGS(&s_clA))) ||
             FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_alB))) ||
-            FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alB, nullptr, IID_PPV_ARGS(&s_clB))))
+            FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alB, nullptr, IID_PPV_ARGS(&s_clB)))) {
+            Log("ngx-b2: alloc/list creation FAILED");
+            s_gq = nullptr;
             return;
+        }
         s_clA->Close(); s_clB->Close();
     }
 
