@@ -1993,8 +1993,10 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     } else { s_fInVal = m.hFIn; s_fOutVal = m.hFOut; }
     m.w = w; m.h = h; m.fmt = (unsigned)fmt;
     m.startVal = g_b2Val + 1; // next frame index helper should expect
-    DWORD wr = 0, rd = 0;
-    if (!WriteFile(g_b2Pipe, &m, sizeof(m), &wr, nullptr)) return false;
+    const char tagS = 0x53; // 'S'
+    DWORD wa = 0, wb = 0, wr = 0, rd = 0;
+    if (!WriteFile(g_b2Pipe, &tagS, 1, &wa, nullptr) ||
+        !WriteFile(g_b2Pipe, &m, sizeof(m), &wb, nullptr)) return false;
     unsigned int resp = 0;
     if (!ReadFile(g_b2Pipe, &resp, sizeof(resp), &rd, nullptr) || resp != 0x59414B4F) {
         Log("ngx-b2: setup rejected by helper (%08X)", resp);
@@ -2262,12 +2264,14 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     // signals fOut, then acks. We never read fence values cross-process.
     bool helperAcked = false;
     if (g_b2UseHelper && g_b2Pipe) {
-        static unsigned s_wDiag = 0; bool wrOK = false; DWORD wr = 0;
-        wrOK = WriteFile(g_b2Pipe, &v, sizeof(v), &wr, nullptr);
+        static unsigned s_wDiag = 0;
+        const char tagF = 0x46; // 'F'
+        DWORD wa = 0, wb = 0;
+        bool wrOK = WriteFile(g_b2Pipe, &tagF, 1, &wa, nullptr) &&
+                    WriteFile(g_b2Pipe, &v, sizeof(v), &wb, nullptr);
         if (++s_wDiag <= 3)
-            Log("ngx-b2: frame msg write v=%llu ok=%d bytes=%lu err=%lu",
-                (unsigned long long)v, (int)wrOK, wr,
-                wrOK ? 0UL : GetLastError());
+            Log("ngx-b2: frame msg write v=%llu ok=%d err=%lu",
+                (unsigned long long)v, (int)wrOK, wrOK ? 0UL : GetLastError());
         unsigned long long ack = 0;
         DWORD rd = 0, have = 0;
         for (int spin = 0; spin < 250 && have < sizeof(ack); ++spin) {

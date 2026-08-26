@@ -333,6 +333,13 @@ static bool WriteExact(HANDLE h, const VOID* buf, DWORD n)
     DWORD w = 0;
     return WriteFile(h, buf, n, &w, nullptr) && w == n;
 }
+static bool ReadTag(HANDLE h, char* t)
+{
+    BYTE b = 0;
+    if (!ReadExact(h, &b, 1)) return false;
+    *t = (char)b;
+    return true;
+}
 int main(int argc, char** argv)
 {
     if (argc > 1 && !lstrcmpiA(argv[1], "--selftest")) {
@@ -397,10 +404,20 @@ int main(int argc, char** argv)
                     if ((++s_idle % 600) == 0) LogLine("helper: idle (waiting frames)");
                     continue;
                 }
+                char tg = 0;
                 unsigned long long fv = 0;
-                LogLine("helper: waiting frame msg...");
+                LogLine("helper: waiting msg...");
+                if (!ReadTag(pipe, &tg)) { LogLine("helper: tag read FAILED"); break; }
+                if (tg == 0x53) { // 'S' setup mid-stream
+                    SetupMsg ms{};
+                    if (!ReadExact(pipe, &ms, sizeof(ms))) break;
+                    LogLine("helper: mid-stream setup");
+                    if (!ApplySetup(ms)) break;
+                    continue;
+                }
+                if (tg != 0x46) { LogLine("helper: BAD tag %02X", (unsigned)tg); break; }
                 if (!ReadExact(pipe, &fv, sizeof(fv))) { LogLine("helper: frame read FAILED"); break; }
-                LogLine("helper: frame msg v=%llu", (unsigned long long)fv);
+                LogLine("helper: frame v=%llu", (unsigned long long)fv);
                 if (fv == 0xFFFFFFFFFFFFFFFF) { // setup marker follows
                     SetupMsg m2{};
                         if (!ReadExact(pipe, &m2, sizeof(m2))) break;
@@ -498,12 +515,22 @@ int main(int argc, char** argv)
             }
 
             DWORD avail = 0;
-            if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail >= sizeof(SetupMsg)) {
-                SetupMsg m2 = {};
-                if (ReadExact(pipe, &m2, sizeof(m2))) {
-                    LogLine("helper: re-setup");
-                    if (!ApplySetup(m2)) break;
-                }
+            if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail >= 1) {
+                // peek tag without consuming via manual look is complex on pipes;
+                // instead: only treat as setup if a tag byte read confirms
+                char t1 = 0;
+                if (ReadTag(pipe, &t1)) {
+                    if (t1 == 0x53) {
+                        SetupMsg m2 = {};
+                        if (!ReadExact(pipe, &m2, sizeof(m2))) break;
+                        LogLine("helper: re-setup");
+                        if (!ApplySetup(m2)) break;
+                    } else if (t1 == 0x46) {
+                        unsigned long long skipV = 0;
+                        if (!ReadExact(pipe, &skipV, sizeof(skipV))) break;
+                        continue; // frame msg consumed out-of-band; loop handles order
+                    }
+                } else break;
             }
         }
         LogLine("helper: frame loop ended - waiting for new setup or exit");
