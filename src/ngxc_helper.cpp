@@ -86,6 +86,10 @@ static ID3D12Resource*            g_out    = nullptr;
 static ID3D12Fence*               g_fIn    = nullptr;
 static ID3D12Fence*               g_fOut   = nullptr;
 static HANDLE                     g_fInEv  = nullptr;
+static ID3D12Resource*            g_depthIn = nullptr; // zero-filled dummies
+static ID3D12Resource*            g_mvIn    = nullptr;
+static IUpscaler*                 s_up      = nullptr;
+static UINT                       s_initW   = 0, s_initH = 0;
 
 static bool InitDevice()
 {
@@ -163,8 +167,25 @@ static bool ApplySetup(const SetupMsg& m)
     if (!g_fInEv) g_fInEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     D3D12_RESOURCE_DESC rd = g_color->GetDesc();
-    LogLine("helper: setup %ux%u fmt=%u (color desc %ux%u)",
-        m.w, m.h, m.fmt, (unsigned)rd.Width, rd.Height);
+    {
+        // zero-input dummies at color dims (DLSS requires valid bindings)
+        if (g_depthIn) { g_depthIn->Release(); g_depthIn = nullptr; }
+        if (g_mvIn)    { g_mvIn->Release();    g_mvIn = nullptr; }
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC dd = {};
+        dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        dd.Width = rd.Width; dd.Height = rd.Height;
+        dd.DepthOrArraySize = 1; dd.MipLevels = 1; dd.SampleDesc.Count = 1;
+        dd.Format = DXGI_FORMAT_R32_FLOAT;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_depthIn));
+        dd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_mvIn));
+        // force in-loop NGX reinit at new dims
+        s_up = nullptr; s_initW = 0; s_initH = 0;
+    }
+    LogLine("helper: setup %ux%u fmt=%u", m.w, m.h, m.fmt);
     return true;
 }
 
@@ -354,21 +375,84 @@ int main(int argc, char** argv)
             if (WaitForSingleObject(g_fInEv, INFINITE) != WAIT_OBJECT_0) break;
             ++frames;
 
-            // TODO(next stage): NGX evaluate color->out recorded here.
-            if (SUCCEEDED(g_list->Reset(g_alloc, nullptr))) {
-                g_list->Close();
+            // NGX evaluate on shared color -> shared out (production path).
+
+            if (!s_up) {
+                const UINT W = 1920, H = 1080; // provisional; re-init handles real dims
+                D3D12_RESOURCE_DESC cd = g_color ? g_color->GetDesc() : D3D12_RESOURCE_DESC{};
+                UINT w = (UINT)cd.Width, h = cd.Height;
+                s_up = CreateUpscaler(UPSCALER_DLSS);
+                if (s_up) {
+                    UpscalerInitParams ip = {};
+                    ip.device = g_dev;
+                    ip.renderWidth = w;  ip.renderHeight = h;
+                    ip.displayWidth = w; ip.displayHeight = h;
+                    ip.appId = 241534720; ip.perfQuality = 0;
+                    ip.mvJittered = true; ip.autoExposure = true;
+                    static wchar_t dllPath[MAX_PATH];
+                    char selfA[MAX_PATH] = {};
+                    GetModuleFileNameA(nullptr, selfA, MAX_PATH);
+                    char* s = strrchr(selfA, '\\');
+                    if (s) *(s + 1) = 0;
+                    MultiByteToWideChar(CP_ACP, 0, selfA, -1, dllPath, MAX_PATH);
+                    lstrcatW(dllPath, L"nvngx_dlss.dll");
+                    ip.dlssDllPath = dllPath;
+                    if (!s_up->Init(ip) || !s_up->IsReady()) {
+                        LogLine("helper: in-loop NGX init FAILED");
+                        s_up = nullptr;
+                    } else {
+                        LogLine("helper: in-loop NGX init ok (%ux%u)", w, h);
+                    }
+                }
+            }
+
+            bool recorded = false;
+            if (s_up && SUCCEEDED(g_list->Reset(g_alloc, nullptr))) {
+                const D3D12_RESOURCE_STATES SRV =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                D3D12_RESOURCE_BARRIER b[4] = {};
+                for (int k = 0; k < 4; ++k) { b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+                // simultaneous-access resources: states tracked per-device; on
+                // this device they live in COMMON between frames.
+                b[0].Transition.pResource = g_color; b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[0].Transition.StateAfter = SRV;
+                b[1].Transition.pResource = g_out;   b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                g_list->ResourceBarrier(2, b);
+
+                UpscalerEvaluateParams ep = {};
+                ep.commandList = g_list;
+                ep.color = g_color;
+                ep.depth = g_depthIn;
+                ep.motionVectors = g_mvIn;
+                ep.output = g_out;
+                ep.jitterX = 0; ep.jitterY = 0;
+                D3D12_RESOURCE_DESC cd = g_color->GetDesc();
+                ep.mvScaleX = (float)cd.Width; ep.mvScaleY = (float)cd.Height;
+                ep.sharpness = 0.0f;
+
+                recorded = s_up->Evaluate(ep);
+                HRESULT chr = g_list->Close();
+                if (SUCCEEDED(chr)) {
+                    ID3D12CommandList* l[] = { g_list };
+                    g_q->ExecuteCommandLists(1, l);
+                } else recorded = false;
+            }
+            if (!recorded && SUCCEEDED(g_list->Reset(g_alloc, nullptr))) {
+                g_list->Close(); // keep allocator warm even on skip
                 ID3D12CommandList* l[] = { g_list };
                 g_q->ExecuteCommandLists(1, l);
             }
             g_q->Signal(g_fOut, v); // ALWAYS - stage3 must never starve
 
+            static unsigned s_evalOk = 0, s_evalSkip = 0;
+            if (recorded) ++s_evalOk; else ++s_evalSkip;
+
             DWORD nowT = GetTickCount();
             if ((nowT - lastReport) > 5000) {
                 PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
                 GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
-                LogLine("helper: %llu frames (v=%llu) commit=%.0fMB ws=%.0fMB",
-                    frames, v, pmc.PagefileUsage / 1048576.0,
-                    pmc.WorkingSetSize / 1048576.0);
+                LogLine("helper: %llu frames (v=%llu) ok=%u skip=%u commit=%.0fMB",
+                    frames, v, s_evalOk, s_evalSkip,
+                    pmc.PagefileUsage / 1048576.0);
                 lastReport = nowT;
             }
 
