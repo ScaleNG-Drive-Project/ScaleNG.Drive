@@ -4324,7 +4324,7 @@ void RunNgxSyntheticTest()
         bars[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         bars[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         bars[3].Transition.pResource = out;
-        bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         cl->ResourceBarrier(4, bars);
 
@@ -4339,7 +4339,18 @@ void RunNgxSyntheticTest()
         ep.sharpness = 0.0f;
 
         bool eok = g_upscaler->Evaluate(ep);
+        if (!eok) {
+            // EvaluateFeature failed - NGX may have recorded partial/garbage
+            // commands. DO NOT submit - discard and abort.
+            Log("SMOKE: iter %d Evaluate FAILED - discarding command list, aborting", iter);
+            ++evalFails;
+            break;
+        }
         HRESULT chr = cl->Close();
+        if (FAILED(chr)) {
+            Log("SMOKE: iter %d Close FAILED hr=0x%08X", iter, (unsigned)chr);
+            break;
+        }
 
         q->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList*const*>(&cl));
 
@@ -4349,17 +4360,6 @@ void RunNgxSyntheticTest()
 
         if (wr == WAIT_OBJECT_0) { ++pass; }
         else { ++fail; if (fail <= 3) Log("SMOKE: iter %d GPU TIMEOUT", iter); }
-
-        // Stop hammering if Evaluate is consistently failing - something is broken
-        if (!eok) {
-            ++evalFails;
-            if (evalFails >= 5) {
-                Log("SMOKE: iter %d - 5 consecutive EvaluateFeature failures, aborting", iter);
-                break;
-            }
-        } else {
-            evalFails = 0;
-        }
 
         // Pace: don't starve the game's GPU work (prevents TDR during map load)
         Sleep(16);
