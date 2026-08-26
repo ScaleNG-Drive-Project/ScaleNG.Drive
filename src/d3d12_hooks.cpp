@@ -1882,24 +1882,24 @@ static void B2KillHelper()
     if (g_b2Helper)  { TerminateProcess(g_b2Helper, 0); CloseHandle(g_b2Helper); g_b2Helper = nullptr; }
 }
 
+static void B2CheckIniFlag()
+{
+    static bool s_checked = false;
+    if (s_checked) return;
+    s_checked = true;
+    wchar_t p[MAX_PATH];
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    wchar_t* sl = wcsrchr(p, L'\\');
+    if (sl) *(sl + 1) = 0;
+    lstrcatW(p, L"plugins\\ScaleNG.ini");
+    wchar_t buf[16] = {};
+    GetPrivateProfileStringW(L"bridge", L"helper", L"0", buf, 15, p);
+    g_b2UseHelper = _wtoi(buf) != 0;
+    Log("ngx-b2: helper mode %s (ini [bridge] helper)", g_b2UseHelper ? "ENABLED" : "off");
+}
+
 static bool B2StartHelper()
 {
-    if (!g_b2UseHelper) {
-        // opt-in: ScaleNG.ini [bridge] helper=1
-        static bool s_checked = false;
-        if (!s_checked) {
-            s_checked = true;
-            wchar_t p[MAX_PATH];
-            GetModuleFileNameW(nullptr, p, MAX_PATH);
-            wchar_t* sl = wcsrchr(p, L'\\');
-            if (sl) *(sl + 1) = 0;
-            lstrcatW(p, L"plugins\\ScaleNG.ini");
-            wchar_t buf[16] = {};
-            GetPrivateProfileStringW(L"bridge", L"helper", L"0", buf, 15, p);
-            g_b2UseHelper = _wtoi(buf) != 0;
-            Log("ngx-b2: helper mode %s (ini [bridge] helper)", g_b2UseHelper ? "ENABLED" : "off");
-        }
-    }
     if (!g_b2UseHelper) return false;
     if (g_b2Pipe) return true;
     B2KillOrphans(); // stale helpers hold the pipe name -> ERROR_PIPE_BUSY
@@ -1996,6 +1996,7 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     return true;
 }static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
 {
+    B2CheckIniFlag(); // must precede local-fallback branching
     if (g_b2Ready && g_b2W == w && g_b2H == h && g_b2Fmt == fmt)
         return true;
     // THROTTLE before any logging - failed init retried every frame once (9k lines).
