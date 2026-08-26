@@ -1852,61 +1852,78 @@ static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
         return true;
     Log("ngx-b2: init %ux%u fmt=%u", w, h, (unsigned)fmt);
     if (!g_b2Ready && !g_b2Dev) {
+        // THROTTLE: failed init retried every frame spammed 9k lines once.
+        static DWORD s_lastFailMs = 0;
+        DWORD nowMs = GetTickCount();
+        if (s_lastFailMs && (nowMs - s_lastFailMs) < 3000) return false;
+
         typedef HRESULT(WINAPI* PFN_DC)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
         HMODULE d3dMod = GetModuleHandleA("d3d12.dll");
         PFN_DC mkDev = d3dMod ? (PFN_DC)GetProcAddress(d3dMod, "D3D12CreateDevice") : nullptr;
-        if (!mkDev) { Log("ngx-b2: no D3D12CreateDevice export"); return false; }
+        if (!mkDev) { Log("ngx-b2: no D3D12CreateDevice export"); s_lastFailMs = nowMs; return false; }
 
-        // The wrapper ALIASES default-adapter creation to the game's cached
-        // device (proven: own==game pointer). Force an EXPLICIT physical
-        // NVIDIA adapter instead.
-        IDXGIFactory1* fac = nullptr;
+        // PRIVATE d3d12 COPY: defeats module-instance/IAT wrappers that alias
+        // every in-process device to the game's object.
+        typedef HRESULT(WINAPI* PFN_CF1)(const IID&, void**);
+        PFN_CF1 mkF = nullptr;
         {
-            typedef HRESULT(WINAPI* PFN_CF1)(const IID&, void**);
             HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
-            PFN_CF1 mkF = dxgiMod ? (PFN_CF1)GetProcAddress(dxgiMod, "CreateDXGIFactory1") : nullptr;
-            if (mkF) mkF(__uuidof(IDXGIFactory1), (void**)&fac);
+            mkF = dxgiMod ? (PFN_CF1)GetProcAddress(dxgiMod, "CreateDXGIFactory1") : nullptr;
         }
-        bool created = false;
-        if (fac) {
+        IDXGIFactory1* fac = nullptr;
+        if (mkF) mkF(__uuidof(IDXGIFactory1), (void**)&fac);
+
+        auto tryCreate = [&](PFN_DC dc, const char* tag) -> bool {
+            if (!dc || !fac) return false;
             IDXGIAdapter1* ad = nullptr;
             for (UINT i = 0; fac->EnumAdapters1(i, &ad) != DXGI_ERROR_NOT_FOUND; ++i) {
                 DXGI_ADAPTER_DESC1 d = {};
-                if (SUCCEEDED(ad->GetDesc1(&d))) {
-                    Log("ngx-b2: adapter %u Vendor=0x%04X '%ls'", i, d.VendorId, d.Description);
-                    if (d.VendorId == 0x10DE && !created) {
-                        HRESULT hr = mkDev(ad, D3D_FEATURE_LEVEL_11_0,
-                                           __uuidof(ID3D12Device), (void**)&g_b2Dev);
-                        created = SUCCEEDED(hr) && g_b2Dev;
-                        Log("ngx-b2: create-on-NVIDIA hr=0x%08X dev=%p",
-                            (unsigned)hr, (void*)g_b2Dev);
-                    }
+                if (SUCCEEDED(ad->GetDesc1(&d)) && d.VendorId == 0x10DE) {
+                    HRESULT hr = dc(ad, D3D_FEATURE_LEVEL_11_0,
+                                    __uuidof(ID3D12Device), (void**)&g_b2Dev);
+                    Log("ngx-b2: [%s] NVIDIA create hr=0x%08X dev=%p",
+                        tag, (unsigned)hr, (void*)g_b2Dev);
+                    bool ok = SUCCEEDED(hr) && g_b2Dev && g_b2Dev != g_device;
+                    ad->Release();
+                    if (!ok) g_b2Dev = nullptr;
+                    return ok;
                 }
                 ad->Release();
-                if (created) break;
             }
-            fac->Release();
-        }
+            return false;
+        };
+
+        bool created = tryCreate(mkDev, "system");
         if (!created) {
-            // last resort: default-adapter call, then REJECT aliasing
-            if (FAILED(mkDev(nullptr, D3D_FEATURE_LEVEL_11_0,
-                             __uuidof(ID3D12Device), (void**)&g_b2Dev)))
-                g_b2Dev = nullptr;
+            // private copy attempt
+            static HMODULE s_priv = nullptr;
+            if (!s_priv) {
+                wchar_t src[MAX_PATH], dst[MAX_PATH];
+                GetSystemDirectoryW(src, MAX_PATH); lstrcatW(src, L"\\d3d12.dll");
+                GetTempPathW(MAX_PATH, dst); lstrcatW(dst, L"ScaleNG_priv_d3d12.dll");
+                if (CopyFileW(src, dst, FALSE))
+                    s_priv = LoadLibraryW(dst);
+                Log("ngx-b2: private d3d12 copy -> %ls (%p)", dst, (void*)s_priv);
+            }
+            if (s_priv) {
+                PFN_DC privDev = (PFN_DC)GetProcAddress(s_priv, "D3D12CreateDevice");
+                created = tryCreate(privDev, "private");
+            }
         }
-        if (!g_b2Dev || g_b2Dev == g_device) {
-            Log("ngx-b2: no INDEPENDENT device (aliased=%d)", (int)(g_b2Dev == g_device));
-            if (g_b2Dev == g_device) g_b2Dev = nullptr;
+        if (fac) fac->Release();
+        if (!created) {
+            Log("ngx-b2: NO independent device available"); s_lastFailMs = nowMs;
             return false;
         }
         IDXGIDevice* probe = nullptr;
         HRESULT qhr = g_b2Dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&probe);
         if (probe) probe->Release();
         if (FAILED(qhr)) {
-            Log("ngx-b2: device STILL wrapper-blocked (QI hr=0x%08X) - abort", (unsigned)qhr);
-            g_b2Dev->Release(); g_b2Dev = nullptr;
+            Log("ngx-b2: device STILL wrapper-blocked (QI hr=0x%08X)", (unsigned)qhr);
+            g_b2Dev->Release(); g_b2Dev = nullptr; s_lastFailMs = nowMs;
             return false;
         }
-        Log("ngx-b2: own device ok %p", (void*)g_b2Dev);
+        Log("ngx-b2: INDEPENDENT device %p", (void*)g_b2Dev);
         D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         if (FAILED(g_b2Dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_b2Q))) ||
             FAILED(g_b2Dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_b2Alloc))) ||
