@@ -369,30 +369,32 @@ int main(int argc, char** argv)
                 break;
             }
 
-            UINT64 completed = g_fIn->GetCompletedValue();
-            if (completed >= v) {
-                if (v != 0 && completed > v + 64)
-                    LogLine("helper: resync v %llu -> %llu", v, completed + 1);
-                v = completed + 1;
+            // FRAME MSG (protocol v2): blocking read - the ASI sends one
+            // message per captured frame. SetupMsg may interleave; handle it.
+            {
+                DWORD availNow = 0;
+                if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &availNow, nullptr)) break;
+                if (availNow == 0) {
+                    // nothing yet: brief sleep to yield CPU (game paces us)
+                    Sleep(1);
+                    static unsigned s_idle = 0;
+                    if ((++s_idle % 600) == 0) LogLine("helper: idle (waiting frames)");
+                    continue;
+                }
+                BYTE hdr[8];
+                DWORD got = 0;
+                if (!ReadFile(pipe, hdr, sizeof(hdr), &got, nullptr) || got != sizeof(hdr)) break;
+                unsigned long long fv = 0;
+                memcpy(&fv, hdr, sizeof(fv));
+                if (fv == 0xFFFFFFFFFFFFFFFF) { // setup marker follows
+                    SetupMsg m2{};
+                    if (!ReadFile(pipe, &m2, sizeof(m2), &got, nullptr) || got != sizeof(m2)) break;
+                    if (!ApplySetup(m2)) break;
+                    continue;
+                }
+                v = fv;
             }
-            if (FAILED(g_fIn->SetEventOnCompletion(v, g_fInEv))) break;
-            // Interruptible wait: ALWAYS poll the pipe each pass. When a new
-            // setup arrives, old fences may already be satisfied -> without
-            // this check we spin forever and never consume the message.
-            bool signaled = false;
-            for (;;) {
-                if (v == 0 || g_fIn->GetCompletedValue() >= v) { signaled = true; break; }
-                DWORD wr2 = WaitForSingleObject(g_fInEv, 100);
-                if (wr2 == WAIT_OBJECT_0) { signaled = true; break; }
-                if (wr2 != WAIT_TIMEOUT) break;
-                DWORD avail2 = 0;
-                if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail2, nullptr))
-                    break; // pipe dead
-                if (avail2 >= sizeof(SetupMsg)) break; // setup pending -> outer
-            }
-            if (!signaled) break;
             ++frames;
-
             // NGX evaluate on shared color -> shared out (production path).
 
             if (!s_up) {
@@ -459,10 +461,16 @@ int main(int argc, char** argv)
                 ID3D12CommandList* l[] = { g_list };
                 g_q->ExecuteCommandLists(1, l);
             }
-            g_q->Signal(g_fOut, v); // ALWAYS - stage3 must never starve
+            g_q->Signal(g_fOut, v); // enqueue BEFORE ack - ASI GPU-waits on this
 
             static unsigned s_evalOk = 0, s_evalSkip = 0;
             if (recorded) ++s_evalOk; else ++s_evalSkip;
+
+            // ACK: tell ASI the signal is enqueued (protocol v2)
+            {
+                DWORD wr2 = 0;
+                WriteFile(pipe, &v, sizeof(v), &wr2, nullptr);
+            }
 
             DWORD nowT = GetTickCount();
             if ((nowT - lastReport) > 5000) {

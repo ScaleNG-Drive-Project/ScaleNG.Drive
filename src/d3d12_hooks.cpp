@@ -2250,46 +2250,61 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     s_clA->Close();
     ID3D12CommandList* l1[] = { s_clA };
     s_gq->ExecuteCommandLists(1, l1);
-    s_gq->Signal(g_b2FenceInG, v);
 
-    // STAGE 2: helper-owned (cross-process NGX) or local clean-device fallback.
+    // STAGE 2 (protocol v2): tell helper this frame is ready; it evaluates and
+    // signals fOut, then acks. We never read fence values cross-process.
+    bool helperAcked = false;
+    if (g_b2UseHelper && g_b2Pipe) {
+        DWORD wr = 0;
+        WriteFile(g_b2Pipe, &v, sizeof(v), &wr, nullptr);
+        unsigned long long ack = 0;
+        DWORD rd = 0;
+        // ack with bounded CPU wait (helper typically replies in <2ms)
+        for (int spin = 0; spin < 50; ++spin) {
+            if (PeekNamedPipe(g_b2Pipe, nullptr, 0, nullptr, &rd, nullptr) && rd >= sizeof(ack))
+                break;
+            Sleep(1);
+        }
+        if (ReadFile(g_b2Pipe, &ack, sizeof(ack), &rd, nullptr) &&
+            rd == sizeof(ack) && ack == v)
+            helperAcked = true;
+    }
+
+    // STAGE 3 (game): only blit when helper CONFIRMED fOut signal enqueue.
     bool recorded = false;
-    if (g_b2UseHelper) {
-        recorded = true; // helper watches fIn(v), runs NGX, signals fOut itself
-    } else if (g_b2Q && SUCCEEDED(g_b2List->Reset(g_b2Alloc, nullptr))) {
-        UpscalerEvaluateParams ep = {};
-        ep.commandList = g_b2List;
-        ep.color = g_b2ColorO;
-        ep.depth = g_b2Depth;
-        ep.motionVectors = g_b2Mv;
-        ep.output = g_b2OutO;
-        ep.jitterX = 0; ep.jitterY = 0;
-        ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
-        ep.sharpness = g_cfg.sharpness;
-        recorded = g_upscaler->Evaluate(ep);
-        if (recorded && SUCCEEDED(g_b2List->Close())) {
-            ID3D12CommandList* l2[] = { g_b2List };
-            g_b2Q->ExecuteCommandLists(1, l2);
-        } else recorded = false;
+    if (!g_b2UseHelper) {
+        // LOCAL-MODE fallback: evaluate on our own clean device.
+        if (g_b2Q && SUCCEEDED(g_b2List->Reset(g_b2Alloc, nullptr))) {
+            UpscalerEvaluateParams ep = {};
+            ep.commandList = g_b2List;
+            ep.color = g_b2ColorO;
+            ep.depth = g_b2Depth;
+            ep.motionVectors = g_b2Mv;
+            ep.output = g_b2OutO;
+            ep.jitterX = 0; ep.jitterY = 0;
+            ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
+            ep.sharpness = g_cfg.sharpness;
+            recorded = g_upscaler->Evaluate(ep);
+            if (recorded && SUCCEEDED(g_b2List->Close())) {
+                ID3D12CommandList* l2[] = { g_b2List };
+                g_b2Q->ExecuteCommandLists(1, l2);
+                g_b2Q->Signal(g_b2FOO, v);
+            } else recorded = false;
+        }
     }
-    if (!g_b2UseHelper) g_b2Q->Signal(g_b2FOO, v); // local mode: we own fOut
 
-    // STAGE 3 (game): CPU-side patience. A GPU Wait on the GAME's queue that
-    // never completes starves BeamNG's renderer -> crash. Instead: poll fOut
-    // briefly; if helper lags, SKIP this blit entirely (bb untouched).
-    {
-        UINT64 done = g_b2FenceOutG->GetCompletedValue();
-        if (done < v) {
-            for (int spin = 0; spin < 8 && g_b2FenceOutG->GetCompletedValue() < v; ++spin)
-                Sleep(1);
-        }
-        if (g_b2FenceOutG->GetCompletedValue() < v) {
-            static unsigned s_skips = 0;
-            if ((++s_skips % 120) == 1) Log("ngx-b2: helper lagging - blit skipped x%u", s_skips);
-            bb->Release();
-            return; // bb stays PRESENT-clean; game frame unaffected
-        }
+    if (!recorded) {
+        // Helper didn't ack (or local failed): skip blit, bb untouched.
+        static unsigned s_skips = 0;
+        if ((++s_skips % 120) == 1)
+            Log("ngx-b2: frame %llu skipped (no ack/eval) x%u",
+                (unsigned long long)v, s_skips);
+        bb->Release();
+        return;
     }
+    // GPU-side ordering vs helper's writes is safe now: the ack proves the
+    // Signal(fOut,v) was ENQUEUED on the helper queue before we submit this.
+    s_gq->Wait(g_b2FenceOutG, v);
     s_clB->Reset(s_alB, nullptr);
     D3D12_RESOURCE_BARRIER b3 = {};
     b3.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
