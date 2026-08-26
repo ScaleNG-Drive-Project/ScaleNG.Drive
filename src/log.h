@@ -110,6 +110,7 @@ inline void LogV(const char* fmt, va_list ap)
     SYSTEMTIME st;
     GetLocalTime(&st);
     PutStr(p, end, "[");
+    PutStr(p, end, "p"); PutUInt(p, end, GetCurrentProcessId(), 0); PutStr(p, end, "] ");
     PutUInt(p, end, st.wHour, 2); PutStr(p, end, ":");
     PutUInt(p, end, st.wMinute, 2); PutStr(p, end, ":");
     PutUInt(p, end, st.wSecond, 2); PutStr(p, end, ".");
