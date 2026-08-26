@@ -1756,10 +1756,12 @@ static void CreateNgxTextures(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxDepth));
 
     rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; // explicit: no stale carry-over
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxMv));
 
     rd.Format = fmt;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxOut));
 

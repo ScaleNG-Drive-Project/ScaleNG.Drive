@@ -223,21 +223,7 @@ extern "C" __declspec(dllexport) void InitializeASI()
         // Only the D3D12CreateDevice detour captures g_device.
         // A deferred thread then runs a synthetic NGX smoke test on that device.
         {
-            Log("init: spawning deferred NGX smoke test thread");
-                        HANDLE hThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-                Sleep(8000); // wait for game to create device and start rendering
-                Log("SMOKE: deferred test firing now");
-                extern void RunNgxSyntheticTest();
-                extern void HooksSetSmokeBusy(int v);
-                HooksSetSmokeBusy(1);
-                RunNgxSyntheticTest();
-                HooksSetSmokeBusy(0);
-                extern void HooksKickEGSH();
-                HooksKickEGSH(); // install Present hook now that driver is idle
-                Log("SMOKE: test complete");
-                return 0;
-            }, nullptr, 0, nullptr);
-            if (hThread) CloseHandle(hThread);
+            Log("init: smoke test DISABLED - live pipeline owns NGX now (concurrency caused DEVICE_RESET)");
         }
         Log("ScaleNG.asi initialization complete");
     } __except (SehFilter(GetExceptionCode(), GetExceptionInformation())) {
