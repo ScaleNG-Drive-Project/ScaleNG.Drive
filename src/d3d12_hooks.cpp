@@ -3208,33 +3208,6 @@ void EnsureGlobalSwapchainHookImpl()
                 }
             }
 
-            // BELT-AND-BRACES: also swap the shared-table slot pointers.
-            // If the game's (wrapped) swapchain shares THIS table, the raw
-            // slot write routes it to us even if MinHook's function patch
-            // somehow misses. Harmless double coverage otherwise.
-            {
-                MEMORY_BASIC_INFORMATION vmbi = {};
-                VirtualQuery(dvt, &vmbi, sizeof(vmbi));
-                DWORD vold = 0;
-                if (VirtualProtect(vmbi.BaseAddress, vmbi.RegionSize, PAGE_READWRITE, &vold)) {
-                    if (!Real_Present && dvt[8]) {
-                        Real_Present = (PFN_Present)dvt[8];
-                        dvt[8] = (void*)&Hook_Present;
-                        Log("hooks: shared-table slot8 SWAPPED -> Hook_Present");
-                    }
-                    if (!Real_Present1 && dvt[22]) {
-                        Real_Present1 = (PFN_Present1)dvt[22];
-                        dvt[22] = (void*)&Hook_Present1;
-                        Log("hooks: shared-table slot22 SWAPPED -> Hook_Present1");
-                    }
-                    VirtualProtect(vmbi.BaseAddress, vmbi.RegionSize, vold, &vold);
-                } else {
-                    Log("hooks: shared-table swap skipped (VirtualProtect denied)");
-                }
-                void* vt[2] = { (void*)Hook_Present, (void*)Hook_Present1 };
-                CfgMarkValid(vt, 2);
-            }
-
             // SELF-TEST: present our own dummy swapchain. If Hook_Present
             // fires (flag flips), the patch is live and ANY real-dxgi
             // presenter would be caught. If it does NOT fire, the game's
