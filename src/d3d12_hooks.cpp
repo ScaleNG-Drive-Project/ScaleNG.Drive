@@ -2131,6 +2131,7 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
             FAILED(g_device->CreateSharedHandle(g_b2OutG,   nullptr, GENERIC_ALL, nullptr, &g_b2HOut))) {
             Log("ngx-b2: CreateSharedHandle(color/out) FAILED"); return false;
         }
+        Log("ngx-b2: created NT handles: color=%p out=%p", (void*)g_b2HColor, (void*)g_b2HOut);
         // shared fences: DIMENSION-INDEPENDENT -> create ONCE, never on resize.
         // Rebuilding desyncs the helper (it waits on the old object).
         if (!g_b2FenceInG) {

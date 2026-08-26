@@ -162,6 +162,9 @@ static bool OpenByValue(unsigned long long hv, REFIID iid, void** out)
 
 static bool ApplySetup(const SetupMsg& m)
 {
+    LogLine("helper: wire vals color=%llu out=%llu fIn=%llu fOut=%llu w=%u",
+        (unsigned long long)m.hColor, (unsigned long long)m.hOut,
+        (unsigned long long)m.hFIn, (unsigned long long)m.hFOut, m.w);
     IUnknown* olds[4] = { g_color, g_out, g_fIn, g_fOut };
     for (IUnknown* p : olds)
         if (p) p->Release();
