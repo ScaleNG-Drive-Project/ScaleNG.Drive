@@ -1818,13 +1818,11 @@ static bool B2OpenShared(ID3D12Device* dev, ID3D12DeviceChild* obj, T** out)
 
 static void B2ReleasePair()
 {
+    // NOTE: fences are intentionally NOT released here - they persist across
+    // resizes so the helper never desyncs (dimension-independent objects).
     for (auto** p : { &g_b2ColorG, &g_b2ColorO, &g_b2OutG, &g_b2OutO,
                       &g_b2Depth, &g_b2Mv })
         if (*p) { (*p)->Release(); *p = nullptr; }
-    for (auto** p : { &g_b2FIO, &g_b2FOO })
-        if (*p) { (*p)->Release(); *p = nullptr; }
-    if (g_b2FenceInG)  { g_b2FenceInG->Release();  g_b2FenceInG  = nullptr; }
-    if (g_b2FenceOutG) { g_b2FenceOutG->Release(); g_b2FenceOutG = nullptr; }
 }
 
 static void B2EnsureDummyInputs(UINT w, UINT h)
@@ -2123,22 +2121,26 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
             FAILED(g_device->CreateSharedHandle(g_b2OutG,   nullptr, GENERIC_ALL, nullptr, &g_b2HOut))) {
             Log("ngx-b2: CreateSharedHandle(color/out) FAILED"); return false;
         }
-        // shared fences
-        ID3D12Fence *fiG=nullptr,*foG=nullptr,*fiO=nullptr,*foO=nullptr;
-        bool ok =
-            SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fiG))) &&
-            SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&foG)));
-        if (ok && !g_b2UseHelper)
-            ok = B2OpenShared(g_b2Dev, fiG, &fiO) && B2OpenShared(g_b2Dev, foG, &foO);
-        if (ok)
-            ok = SUCCEEDED(g_device->CreateSharedHandle(fiG, nullptr, GENERIC_ALL, nullptr, &g_b2HFIn)) &&
-                 SUCCEEDED(g_device->CreateSharedHandle(foG, nullptr, GENERIC_ALL, nullptr, &g_b2HFOut));
-        if (!ok) {
-            Log("ngx-b2: shared fence FAILED");
-            if(fiG)fiG->Release(); if(foG)foG->Release(); if(fiO)fiO->Release(); if(foO)foO->Release();
-            return false;
+        // shared fences: DIMENSION-INDEPENDENT -> create ONCE, never on resize.
+        // Rebuilding desyncs the helper (it waits on the old object).
+        if (!g_b2FenceInG) {
+            ID3D12Fence *fiG=nullptr,*foG=nullptr,*fiO=nullptr,*foO=nullptr;
+            bool ok =
+                SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fiG))) &&
+                SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&foG)));
+            if (ok && !g_b2UseHelper)
+                ok = B2OpenShared(g_b2Dev, fiG, &fiO) && B2OpenShared(g_b2Dev, foG, &foO);
+            if (ok)
+                ok = SUCCEEDED(g_device->CreateSharedHandle(fiG, nullptr, GENERIC_ALL, nullptr, &g_b2HFIn)) &&
+                     SUCCEEDED(g_device->CreateSharedHandle(foG, nullptr, GENERIC_ALL, nullptr, &g_b2HFOut));
+            if (!ok) {
+                Log("ngx-b2: shared fence FAILED");
+                if(fiG)fiG->Release(); if(foG)foG->Release(); if(fiO)fiO->Release(); if(foO)foO->Release();
+                return false;
+            }
+            g_b2FenceInG = fiG; g_b2FenceOutG = foG; g_b2FIO = fiO; g_b2FOO = foO;
+            Log("ngx-b2: fences created once (persistent across resizes)");
         }
-        g_b2FenceInG = fiG; g_b2FenceOutG = foG; g_b2FIO = fiO; g_b2FOO = foO;
     }
 
     if (g_b2UseHelper) {
@@ -2272,8 +2274,22 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     }
     if (!g_b2UseHelper) g_b2Q->Signal(g_b2FOO, v); // local mode: we own fOut
 
-    // STAGE 3 (game): wait fOut -> sharedOut -> bb
-    s_gq->Wait(g_b2FenceOutG, v);
+    // STAGE 3 (game): CPU-side patience. A GPU Wait on the GAME's queue that
+    // never completes starves BeamNG's renderer -> crash. Instead: poll fOut
+    // briefly; if helper lags, SKIP this blit entirely (bb untouched).
+    {
+        UINT64 done = g_b2FenceOutG->GetCompletedValue();
+        if (done < v) {
+            for (int spin = 0; spin < 8 && g_b2FenceOutG->GetCompletedValue() < v; ++spin)
+                Sleep(1);
+        }
+        if (g_b2FenceOutG->GetCompletedValue() < v) {
+            static unsigned s_skips = 0;
+            if ((++s_skips % 120) == 1) Log("ngx-b2: helper lagging - blit skipped x%u", s_skips);
+            bb->Release();
+            return; // bb stays PRESENT-clean; game frame unaffected
+        }
+    }
     s_clB->Reset(s_alB, nullptr);
     D3D12_RESOURCE_BARRIER b3 = {};
     b3.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

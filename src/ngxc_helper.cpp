@@ -376,16 +376,19 @@ int main(int argc, char** argv)
                 v = completed + 1;
             }
             if (FAILED(g_fIn->SetEventOnCompletion(v, g_fInEv))) break;
-            // Interruptible wait: poll pipe during wait so a resize SetupMsg
-            // can be consumed even while no frames are arriving.
+            // Interruptible wait: ALWAYS poll the pipe each pass. When a new
+            // setup arrives, old fences may already be satisfied -> without
+            // this check we spin forever and never consume the message.
             bool signaled = false;
             for (;;) {
-                DWORD wr2 = WaitForSingleObject(g_fInEv, 250);
+                if (v == 0 || g_fIn->GetCompletedValue() >= v) { signaled = true; break; }
+                DWORD wr2 = WaitForSingleObject(g_fInEv, 100);
                 if (wr2 == WAIT_OBJECT_0) { signaled = true; break; }
                 if (wr2 != WAIT_TIMEOUT) break;
                 DWORD avail2 = 0;
-                if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail2, nullptr) || avail2 >= sizeof(SetupMsg))
-                    break; // pipe dead or setup pending -> exit to outer handling
+                if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail2, nullptr))
+                    break; // pipe dead
+                if (avail2 >= sizeof(SetupMsg)) break; // setup pending -> outer
             }
             if (!signaled) break;
             ++frames;
