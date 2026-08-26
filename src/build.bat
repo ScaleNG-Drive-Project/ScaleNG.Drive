@@ -75,8 +75,10 @@ if exist "%OUT%\ScaleNG.asi" (
 rem ---- NGX helper exe (cross-process bridge worker) ----
 (
     echo /nologo /O2 /EHsc /std:c++17 /MT /Zi /D_CRT_SECURE_NO_WARNINGS
-    echo /Fo"%OBJDIR%/helper_"
+    echo /Fo"%OBJDIR%\\"
     echo "%SRC%ngxc_helper.cpp"
+    echo "%SRC%dlss_ngx.cpp"
+    echo /I"%SRC%vendor\nvngx"
     echo user32.lib shell32.lib advapi32.lib
     echo /link /DEBUG
     echo /Fe:"%OUT%\ScaleNG_NGX_helper.exe"

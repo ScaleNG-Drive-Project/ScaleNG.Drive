@@ -29,6 +29,21 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "psapi.lib")
+// ---- dlss_ngx.cpp linkage stubs (helper has no hook layer) -----------------
+#include "upscaler.h"
+#include "d3d12_hooks.h"
+void HooksGetDescriptorHeaps(UINT* count, ID3D12DescriptorHeap** heaps)
+{
+    if (count) *count = 0;
+}
+void HooksRestoreDescriptorHeaps(ID3D12GraphicsCommandList*, UINT,
+                                 ID3D12DescriptorHeap* const*) {}
+
+// remaining dlss_ngx externals
+wchar_t g_logPath[MAX_PATH] = {}; // log.h global (helper: unused, LogLine writes its own file)
+PFN_ScaleNG_CreateDevice Real_D3D12CreateDevice_Tramp = nullptr;
+void HooksDumpDRED(const char*) {}
+
 
 static void LogLine(const char* fmt, ...)
 {
@@ -153,8 +168,136 @@ static bool ApplySetup(const SetupMsg& m)
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// --selftest: standalone NGX validation. No game, no pipe.
+// Measures commit at each stage and runs 100 real EvaluateFeature calls on
+// 512x512 own-device textures. Exit code 0 = all pass.
+// ----------------------------------------------------------------------------
+static SIZE_T CommitMB()
+{
+    PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    return (SIZE_T)(pmc.PagefileUsage / 1048576ULL);
+}
+
+static int RunSelfTest()
+{
+    LogLine("=== SELFTEST begin ===");
+    SIZE_T c0 = CommitMB();
+    if (!InitDevice()) return 2;
+    SIZE_T c1 = CommitMB();
+    LogLine("selftest: commit after device: %llu MB (+%llu)", (unsigned long long)c1, (unsigned long long)(c1 - c0));
+
+    // 512x512 own textures
+    const UINT W = 512, H = 512;
+    ID3D12Resource *color=nullptr, *depth=nullptr, *mv=nullptr, *out=nullptr;
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = W; rd.Height = H; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color));
+        rd.Format = DXGI_FORMAT_R32_FLOAT;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth));
+        rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mv));
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&out));
+        if (!color || !depth || !mv || !out) { LogLine("selftest: tex create FAILED"); return 3; }
+    }
+
+    if (!g_alloc && FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_alloc))))
+        return 3;
+    if (!g_list && FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc, nullptr,
+                                                   IID_PPV_ARGS(&g_list)))) return 3;
+
+    // NGX init via production code path
+    IUpscaler* up = CreateUpscaler(UPSCALER_DLSS);
+    if (!up) { LogLine("selftest: upscaler create FAILED"); return 4; }
+    UpscalerInitParams ip = {};
+    ip.device = g_dev;
+    ip.renderWidth = W;  ip.renderHeight = H;
+    ip.displayWidth = W; ip.displayHeight = H;
+    ip.appId = 241534720;
+    ip.perfQuality = 0;
+    ip.mvJittered = true;
+    ip.autoExposure = true;
+    {
+        static wchar_t dllPath[MAX_PATH];
+        char selfPathA[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, selfPathA, MAX_PATH);
+        char* s = strrchr(selfPathA, '\\');
+        if (s) *(s + 1) = 0;
+        int n = MultiByteToWideChar(CP_ACP, 0, selfPathA, -1, dllPath, MAX_PATH);
+        if (n > 0) lstrcatW(dllPath, L"nvngx_dlss.dll");
+        ip.dlssDllPath = dllPath;
+        LogLine("selftest: dlssDllPath=%ls", dllPath);
+    }
+    if (!up->Init(ip) || !up->IsReady()) { LogLine("selftest: NGX Init FAILED"); return 5; }
+    SIZE_T c2 = CommitMB();
+    LogLine("selftest: commit after NGX init: %llu MB (+%llu)", (unsigned long long)c2, (unsigned long long)(c2 - c1));
+
+    ID3D12Fence* fence = nullptr;
+    g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+
+    int pass = 0;
+    unsigned long long v = 0;
+    for (int i = 0; i < 100; ++i) {
+        UpscalerEvaluateParams ep = {};
+        ep.commandList = g_list;
+        ep.color = color; ep.depth = depth; ep.motionVectors = mv; ep.output = out;
+        ep.jitterX = 0; ep.jitterY = 0;
+        ep.mvScaleX = (float)W; ep.mvScaleY = (float)H;
+        ep.sharpness = 0.0f;
+
+        bool ok = false;
+        if (SUCCEEDED(g_list->Reset(g_alloc, nullptr))) {
+            D3D12_RESOURCE_BARRIER b[3] = {};
+            for (int k = 0; k < 3; ++k) { b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+            const D3D12_RESOURCE_STATES SRV = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            b[0].Transition.pResource = color; b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[0].Transition.StateAfter = SRV;
+            b[1].Transition.pResource = depth; b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[1].Transition.StateAfter = SRV;
+            b[2].Transition.pResource = mv;    b[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[2].Transition.StateAfter = SRV;
+            g_list->ResourceBarrier(3, b);
+            ok = up->Evaluate(ep);
+            HRESULT chr = g_list->Close();
+            if (SUCCEEDED(chr)) {
+                ID3D12CommandList* l[] = { g_list };
+                g_q->ExecuteCommandLists(1, l);
+                fence->SetEventOnCompletion(++v, evt);
+                g_q->Signal(fence, v);
+                if (WaitForSingleObject(evt, 10000) == WAIT_OBJECT_0 && ok) ++pass;
+            } else ok = false;
+        }
+        if (!ok && i < 5) LogLine("selftest: iter %d FAILED", i);
+        Sleep(8); // pacing
+    }
+
+    SIZE_T c3 = CommitMB();
+    LogLine("selftest: RESULT %d/100 pass. commit after eval: %llu MB (+%llu)",
+        pass, (unsigned long long)c3, (unsigned long long)(c3 - c2));
+    LogLine("=== SELFTEST end ===");
+    CloseHandle(evt); fence->Release();
+    return pass == 100 ? 0 : 6;
+}
+
 int main(int argc, char** argv)
 {
+    if (argc > 1 && !lstrcmpiA(argv[1], "--selftest")) {
+        int rc = RunSelfTest();
+        LogLine("selftest: exit=%d", rc);
+        return rc;
+    }
     LogLine("helper: start pid=%lu parentArg=%s", GetCurrentProcessId(),
             argc > 1 ? argv[1] : "-");
 
