@@ -1843,6 +1843,21 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
 
     if (!g_ngxColor || !g_ngxDepth || !g_ngxMv || !g_ngxOut) { bb->Release(); return; }
 
+    // Resolution change (menu -> game -> resize): recreate textures + feature.
+    // Allocator/list/queue are size-agnostic - only textures and the NGX
+    // feature need refreshing.
+    {
+        static UINT s_ngxW = 0, s_ngxH = 0;
+        if (s_ngxW != w || s_ngxH != h) {
+            Log("ngx-pipe: size change %ux%u -> %ux%u", s_ngxW, s_ngxH, w, h);
+            s_ngxW = w; s_ngxH = h;
+            if (g_device && g_upscaler && g_upscaler->IsReady()) {
+                CreateNgxTextures(g_device, w, h, bbd.Format);
+                g_upscaler->UpdateSizes(w, h, w, h);
+            }
+        }
+    }
+
     ++g_ngxFrameCount;
     if (g_ngxFrameCount < 30 || (g_ngxFrameCount % 300) == 0)
         Log("ngx-pipe: frame %u evaluating", g_ngxFrameCount);
@@ -2868,17 +2883,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
+            // SELF-CONTAINED NGX PIPELINE ENTRY: the ECL hook is build-disabled,
+            // so Present IS the per-frame driver.
+            if (g_dlaaMode && !g_passiveMode && g_swapchain) {
+                __try {
+                    InjectAtPresentImpl(nullptr);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    static int s_presFault = 0;
+                    if (++s_presFault <= 5)
+                        Log("ngx-pipe: present-path guarded fault #%d", s_presFault);
+                }
+            }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("hooks: present handling guarded (code %08X)", (unsigned)GetExceptionCode());
@@ -2898,17 +2913,16 @@ HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT syncInterval, 
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
-                // Heavy work moved to ExecuteCommandLists (game-queue ordering).
+            // SELF-CONTAINED NGX PIPELINE ENTRY (Present1 variant)
+            if (g_dlaaMode && !g_passiveMode && g_swapchain) {
+                __try {
+                    InjectAtPresentImpl(nullptr);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    static int s_pres1Fault = 0;
+                    if (++s_pres1Fault <= 5)
+                        Log("ngx-pipe: present1-path guarded fault #%d", s_pres1Fault);
+                }
+            }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("hooks: present1 handling guarded (code %08X)", (unsigned)GetExceptionCode());
