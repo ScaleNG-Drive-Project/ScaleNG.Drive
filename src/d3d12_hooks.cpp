@@ -1850,6 +1850,13 @@ static bool EnsureNgxBridgeB2(UINT w, UINT h, DXGI_FORMAT fmt)
 {
     if (g_b2Ready && g_b2W == w && g_b2H == h && g_b2Fmt == fmt)
         return true;
+    // THROTTLE before any logging - failed init retried every frame once (9k lines).
+    {
+        static DWORD s_lastFailMs = 0;
+        DWORD nowMs = GetTickCount();
+        if (!g_b2Dev && s_lastFailMs && (nowMs - s_lastFailMs) < 3000) return false;
+        if (!g_b2Dev) s_lastFailMs = nowMs; // arm on first attempt of this burst
+    }
     Log("ngx-b2: init %ux%u fmt=%u", w, h, (unsigned)fmt);
     if (!g_b2Ready && !g_b2Dev) {
         // THROTTLE: failed init retried every frame spammed 9k lines once.
