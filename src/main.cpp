@@ -228,7 +228,10 @@ extern "C" __declspec(dllexport) void InitializeASI()
                 Sleep(8000); // wait for game to create device and start rendering
                 Log("SMOKE: deferred test firing now");
                 extern void RunNgxSyntheticTest();
+                extern void HooksSetSmokeBusy(int v);
+                HooksSetSmokeBusy(1);
                 RunNgxSyntheticTest();
+                HooksSetSmokeBusy(0);
                 Log("SMOKE: test complete");
                 return 0;
             }, nullptr, 0, nullptr);

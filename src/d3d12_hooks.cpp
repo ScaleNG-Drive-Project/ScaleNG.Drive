@@ -41,6 +41,7 @@ constexpr size_t kVelocityCbSize = 176;
 ScaleNgConfig g_cfg;
 bool g_cfgSet = false;
 
+volatile LONG g_smokeBusy = 0; // nonzero while smoke test owns the driver
 ID3D12Device* g_device = nullptr;
 ID3D12Resource* g_cameraRing = nullptr;
 
@@ -3057,6 +3058,9 @@ void EnsureGlobalSwapchainHookImpl()
     // the nested pass faults (observed C0000005 right after "EGSH device ok").
     static volatile LONG s_inEGSH = 0;
     if (InterlockedCompareExchange(&s_inEGSH, 1, 0) != 0) return;
+    // Defer while the smoke test owns the driver: its device churn + our
+    // factory hooks racing game-thread factory creation faulted here once.
+    if (g_smokeBusy != 0 || g_device == nullptr) { InterlockedExchange(&s_inEGSH, 0); return; }
     static int s_tries = 0;
     if (g_scanDone || s_tries >= 10) { InterlockedExchange(&s_inEGSH, 0); return; }
     ++s_tries;
@@ -3064,37 +3068,45 @@ void EnsureGlobalSwapchainHookImpl()
     __try {
         // ================================================================
         // STEP 1: Create dummy device + swapchain CLEANLY (no hooks yet!)
+        // Each sub-step individually guarded: one fault must not prevent
+        // the Present-hook installation stage.
         // ================================================================
         HWND dummyWnd = EnsureDummyWindow();
         ID3D12Device* ddev = nullptr;
         HRESULT dhr = E_FAIL;
-        {
+        __try {
             typedef HRESULT(WINAPI* PFN_D3D12Create)(IUnknown*, D3D_FEATURE_LEVEL, const IID&, void**);
             HMODULE d3dMod = GetModuleHandleA("d3d12.dll");
             PFN_D3D12Create mkDev = d3dMod ? (PFN_D3D12Create)GetProcAddress(d3dMod, "D3D12CreateDevice") : nullptr;
             if (mkDev) dhr = mkDev(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&ddev);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("hooks: EGSH mkDev FAULTED");
+            dhr = E_FAIL;
         }
         if (FAILED(dhr) || !ddev) {
             Log("hooks: EGSH fresh device FAILED hr=%08X", (unsigned)dhr);
+            InterlockedExchange(&s_inEGSH, 0);
             return;
         }
         Log("hooks: EGSH device ok %p", (void*)ddev);
 
         ID3D12CommandQueue* dq = nullptr;
-        { D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-          ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&dq)); }
-        if (!dq) { ddev->Release(); return; }
+        __try {
+            D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&dq));
+        } __except (EXCEPTION_EXECUTE_HANDLER) { Log("hooks: EGSH mkQueue FAULTED"); }
+        if (!dq) { ddev->Release(); InterlockedExchange(&s_inEGSH, 0); return; }
 
         // Create swapchain DIRECTLY via export (no hooks active yet!)
         IDXGIFactory4* f4 = nullptr;
         IDXGISwapChain1* dummy = nullptr;
-        {
+        __try {
             typedef HRESULT(WINAPI* PFN_CreateDXGI)(const IID&, void**);
             HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
             PFN_CreateDXGI mkF = dxgiMod ? (PFN_CreateDXGI)GetProcAddress(dxgiMod, "CreateDXGIFactory1") : nullptr;
             if (mkF) mkF(__uuidof(IDXGIFactory4), (void**)&f4);
-        }
-        if (!f4) { dq->Release(); ddev->Release(); return; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { Log("hooks: EGSH mkFactory FAULTED"); }
+        if (!f4) { dq->Release(); ddev->Release(); InterlockedExchange(&s_inEGSH, 0); return; }
 
         DXGI_SWAP_CHAIN_DESC1 sd = {};
         sd.BufferCount = 2; sd.Width = 8; sd.Height = 8;
@@ -3102,7 +3114,12 @@ void EnsureGlobalSwapchainHookImpl()
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.SampleDesc.Count = 1; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
+        __try {
+            dhr = f4->CreateSwapChainForHwnd(dq, dummyWnd, &sd, nullptr, nullptr, &dummy);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("hooks: EGSH CreateSwapChainForHwnd FAULTED");
+            dhr = E_FAIL;
+        }
         Log("hooks: EGSH clean swapchain hr=0x%08X sc=%p", (unsigned)dhr, (void*)dummy);
 
         // ================================================================
@@ -4288,6 +4305,7 @@ void RunNgxSyntheticTest()
 {
     static volatile long s_smokeRan = 0;
     if (InterlockedCompareExchange(&s_smokeRan, 1, 0) != 0) return;
+    InterlockedExchange(&g_smokeBusy, 1);
 
     Log("SMOKE: starting synthetic NGX test");
     // If game device not captured (ASI loaded after device creation), create our own
@@ -4526,6 +4544,7 @@ unsigned HooksGetQuietFrames() {
     // 600f gate pass instantly and let nvngx load mid-churn.)
     return g_lastNewChainFrame ? (g_frameCounter - g_lastNewChainFrame) : 0;
 }
+void HooksSetSmokeBusy(int v) { InterlockedExchange(&g_smokeBusy, (LONG)v); }
 
 // CPU-side microscope: VEH logs EVERY first-chance AV with module+offset as
 // it happens. Rotation-burst deaths show no SEH catch and no device-removed,
