@@ -3052,8 +3052,13 @@ static HWND EnsureDummyWindow()
 
 void EnsureGlobalSwapchainHookImpl()
 {
+    // RE-ENTRANCY GUARD: Hook_D3D12CreateDevice tail-calls us; step 1 below
+    // calls D3D12CreateDevice -> detour -> back into here. Without this ICAS
+    // the nested pass faults (observed C0000005 right after "EGSH device ok").
+    static volatile LONG s_inEGSH = 0;
+    if (InterlockedCompareExchange(&s_inEGSH, 1, 0) != 0) return;
     static int s_tries = 0;
-    if (g_scanDone || s_tries >= 10) return;
+    if (g_scanDone || s_tries >= 10) { InterlockedExchange(&s_inEGSH, 0); return; }
     ++s_tries;
 
     __try {
@@ -3101,18 +3106,46 @@ void EnsureGlobalSwapchainHookImpl()
         Log("hooks: EGSH clean swapchain hr=0x%08X sc=%p", (unsigned)dhr, (void*)dummy);
 
         // ================================================================
-        // STEP 2: DO NOT HOOK PRESENT.
-        // Present vtable modification causes: solid-color artifacts,
-        // freezes, missing game window, nvwgf2umx crashes, and
-        // STATUS_STACK_BUFFER_OVERRUN. Confirmed across every variant
-        // (MinHook patching AND pure vtable pointer swapping).
+        // STEP 2: Hook PRESENT at FUNCTION LEVEL via the dummy swapchain.
         //
-        // Instead: NGX will be triggered by ExecuteCommandLists (queue
-        // level) or by a timer thread that detects active rendering via
-        // discovery state. Present forwarding stays untouched.
+        // Every real DXGI swapchain shares ONE static vtable inside dxgi.dll,
+        // so the function address in vt[8]/vt[22] is THE implementation every
+        // game Present funnels through. MinHook patches that function's
+        // prologue once - no vtable writes, no per-object state. The old
+        // artifacts/freezes came from the cmdlist-hook era (since removed);
+        // a single cold Present detour is the standard Reshade-style model.
+        //
+        // Our pipeline REQUIRES Present-time execution: its barriers assume
+        // the backbuffer sits in PRESENT state at entry.
         // ================================================================
         if (SUCCEEDED(dhr) && dummy) {
-            Log("hooks: EGSH swapchain created (Present NOT hooked - stability)");
+            void** dvt = *(void***)dummy;
+            void* pPresent = dvt[8];
+            void* pPresent1 = dvt[22];
+            Log("hooks: EGSH dummy sc=%p vt8=%p vt22=%p", (void*)dummy, pPresent, pPresent1);
+            if (pPresent && IsExecutableImagePtr(pPresent)) {
+                MH_STATUS st = MH_CreateHook(pPresent, &Hook_Present, (void**)&Real_Present);
+                if (st == MH_OK && MH_EnableHook(pPresent) == MH_OK) {
+                    void* targets[1] = { (void*)Hook_Present };
+                    CfgMarkValid(targets, 1);
+                    Log("hooks: PRESENT fn-level hook INSTALLED (%p)", pPresent);
+                } else if (st != MH_ERROR_ALREADY_CREATED) {
+                    Log("hooks: PRESENT fn-level hook FAILED st=%d", (int)st);
+                } else {
+                    Log("hooks: PRESENT fn-level hook already created");
+                    Real_Present = (PFN_Present)pPresent; // not exact trampoline but non-null sentinel
+                }
+            }
+            if (!Real_Present1 && pPresent1 && IsExecutableImagePtr(pPresent1)) {
+                MH_STATUS st1 = MH_CreateHook(pPresent1, &Hook_Present1, (void**)&Real_Present1);
+                if (st1 == MH_OK && MH_EnableHook(pPresent1) == MH_OK) {
+                    void* t1[1] = { (void*)Hook_Present1 };
+                    CfgMarkValid(t1, 1);
+                    Log("hooks: PRESENT1 fn-level hook INSTALLED (%p)", pPresent1);
+                } else if (st1 != MH_ERROR_ALREADY_CREATED) {
+                    Log("hooks: PRESENT1 fn-level hook FAILED st=%d", (int)st1);
+                }
+            }
         }
 
         // Cleanup temp objects
@@ -3154,9 +3187,11 @@ void EnsureGlobalSwapchainHookImpl()
 
         g_swapchain = nullptr; // real one adopted at first present via Hook_Present self-heal
         g_scanDone = true;
+        InterlockedExchange(&s_inEGSH, 0);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("hooks: EGSH guarded (code %08X)", (unsigned)GetExceptionCode());
+        InterlockedExchange(&s_inEGSH, 0);
     }
 }
 
@@ -4171,7 +4206,7 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                 Log("hooks: queue vtable SWAPPED (slot 10)");
             } // end disabled queue swap
             } else {
-                Log("hooks: VirtualProtect on queue vtable failed");
+                Log("hooks: queue ECL hook disabled by build (pipeline uses Present entry)");
             }
         }
         if (queue) g_graphicsQueue = queue;
