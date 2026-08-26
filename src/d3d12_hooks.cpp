@@ -1727,37 +1727,40 @@ static unsigned g_ngxFrameCount = 0;
 
 static void CreateNgxTextures(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt)
 {
+    // Release any previous set (size change / re-init) - prevents leak.
+    if (g_ngxColor) { g_ngxColor->Release(); g_ngxColor = nullptr; }
+    if (g_ngxDepth) { g_ngxDepth->Release(); g_ngxDepth = nullptr; }
+    if (g_ngxMv)    { g_ngxMv->Release();    g_ngxMv = nullptr; }
+    if (g_ngxOut)   { g_ngxOut->Release();   g_ngxOut = nullptr; }
+
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
     rd.SampleDesc.Count = 1;
 
-    // Color: same format as backbuffer + UAV for NGX output
+    // ALL textures created in COMMON: the per-frame pipeline transitions from
+    // COMMON explicitly and restores to COMMON at the end. Single source of
+    // truth - no state drift (proven device-killer in the smoke test).
     rd.Format = fmt;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_ngxColor));
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxColor));
 
-    // Depth: R32_FLOAT
     rd.Format = DXGI_FORMAT_R32_FLOAT;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        nullptr, IID_PPV_ARGS(&g_ngxDepth));
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxDepth));
 
-    // MV: R16G16_FLOAT
     rd.Format = DXGI_FORMAT_R16G16_FLOAT;
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        nullptr, IID_PPV_ARGS(&g_ngxMv));
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxMv));
 
-    // Output: same as color but UAV-only
     rd.Format = fmt;
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_ngxOut));
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_ngxOut));
 
-    Log("ngx-pipe: textures created %ux%u (color=%p depth=%p mv=%p out=%p)",
+    Log("ngx-pipe: textures created %ux%u COMMON (color=%p depth=%p mv=%p out=%p)",
         w, h, (void*)g_ngxColor, (void*)g_ngxDepth, (void*)g_ngxMv, (void*)g_ngxOut);
 }
 
@@ -1818,6 +1821,10 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         }
 
         CreateNgxTextures(g_device, w, h, bbd.Format);
+        // Sync feature dims to real backbuffer (smoke test may have left a
+        // 512x512 feature behind). DestroyFeature happens inside; next
+        // Evaluate re-creates at these sizes.
+        g_upscaler->UpdateSizes(w, h, w, h);
         g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_ngxAlloc));
         g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_ngxAlloc, nullptr,
                                     IID_PPV_ARGS(&g_ngxList));
@@ -1841,7 +1848,24 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
     // Reset and record NGX work
     g_ngxList->Reset(g_ngxAlloc, nullptr);
 
-    // Transition backbuffer → COPY_SOURCE
+    // All NGX textures live in COMMON at frame boundaries (creation + restore).
+    D3D12_RESOURCE_BARRIER bars[4] = {};
+    for (int i = 0; i < 4; ++i) { bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+    bars[0].Transition.pResource = g_ngxColor;
+    bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    bars[1].Transition.pResource = g_ngxDepth;
+    bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bars[2].Transition.pResource = g_ngxMv;
+    bars[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bars[3].Transition.pResource = g_ngxOut;
+    bars[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bars[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_ngxList->ResourceBarrier(4, bars);
+
+    // Backbuffer PRESENT -> COPY_SOURCE, copy into color input
     D3D12_RESOURCE_BARRIER bar = {};
     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     bar.Transition.pResource = bb;
@@ -1850,31 +1874,25 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
     bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g_ngxList->ResourceBarrier(1, &bar);
 
-    // Copy backbuffer → our color texture
     D3D12_TEXTURE_COPY_LOCATION cdst = {}; cdst.pResource = g_ngxColor; cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION csrc = {}; csrc.pResource = bb; csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     g_ngxList->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
 
-    // Transition backbuffer → PRESENT (restore)
+    // color COPY_DEST -> SRV for NGX read
+    D3D12_RESOURCE_BARRIER cbar = {};
+    cbar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    cbar.Transition.pResource = g_ngxColor;
+    cbar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    cbar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cbar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_ngxList->ResourceBarrier(1, &cbar);
+
+    // Restore backbuffer to PRESENT before evaluate
     bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_ngxList->ResourceBarrier(1, &bar);
 
-    // Barrier NGX inputs to readable states
-    D3D12_RESOURCE_BARRIER ib[3] = {};
-    for (int i = 0; i < 3; ++i) { ib[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; ib[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
-    ib[0].Transition.pResource = g_ngxColor;
-    ib[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    ib[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    ib[1].Transition.pResource = g_ngxDepth;
-    ib[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    ib[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    ib[2].Transition.pResource = g_ngxMv;
-    ib[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    ib[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    g_ngxList->ResourceBarrier(3, ib);
-
-    // NGX Evaluate
+    // NGX Evaluate (descriptor heap bound internally by dlss_ngx.cpp)
     UpscalerEvaluateParams ep = {};
     ep.commandList = g_ngxList;
     ep.color = g_ngxColor;
@@ -1885,10 +1903,16 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
     ep.mvScaleX = (float)w; ep.mvScaleY = (float)h;
     ep.sharpness = g_cfg.sharpness;
     bool ok = g_upscaler->Evaluate(ep);
-    if (!ok && g_ngxFrameCount <= 5)
-        Log("ngx-pipe: Evaluate FAILED at frame %u", g_ngxFrameCount);
+    if (!ok) {
+        // NEVER submit a list NGX recorded garbage into (proven device-killer).
+        // Nothing executed -> all textures still COMMON -> next frame is clean.
+        if (g_ngxFrameCount <= 30 || (g_ngxFrameCount % 300) == 0)
+            Log("ngx-pipe: Evaluate FAILED frame %u - discarding cmd list", g_ngxFrameCount);
+        bb->Release();
+        return;
+    }
 
-    // Barrier output + color to COPY_SOURCE
+    // out UAV -> COPY_SOURCE; backbuffer PRESENT -> COPY_DEST; copy result up
     D3D12_RESOURCE_BARRIER ob[2] = {};
     for (int i = 0; i < 2; ++i) { ob[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; ob[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
     ob[0].Transition.pResource = g_ngxOut;
@@ -1899,23 +1923,33 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
     ob[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     g_ngxList->ResourceBarrier(2, ob);
 
-    // Copy NGX output → backbuffer
     D3D12_TEXTURE_COPY_LOCATION odst = {}; odst.pResource = bb; odst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION osrc = {}; osrc.pResource = g_ngxOut; osrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     g_ngxList->CopyTextureRegion(&odst, 0, 0, 0, &osrc, nullptr);
 
-    // Restore backbuffer → PRESENT
-    D3D12_RESOURCE_BARRIER rbar = {};
-    rbar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    rbar.Transition.pResource = bb;
-    rbar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    rbar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    rbar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    g_ngxList->ResourceBarrier(1, &rbar);
+    // Restore EVERYTHING for next frame: out/color/depth/mv -> COMMON,
+    // backbuffer COPY_DEST -> PRESENT.
+    D3D12_RESOURCE_BARRIER rs[5] = {};
+    for (int i = 0; i < 5; ++i) { rs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; rs[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+    rs[0].Transition.pResource = g_ngxOut;
+    rs[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    rs[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    rs[1].Transition.pResource = g_ngxColor;
+    rs[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    rs[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    rs[2].Transition.pResource = g_ngxDepth;
+    rs[2].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    rs[2].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    rs[3].Transition.pResource = g_ngxMv;
+    rs[3].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    rs[3].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    rs[4].Transition.pResource = bb;
+    rs[4].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    rs[4].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g_ngxList->ResourceBarrier(5, rs);
 
     g_ngxList->Close();
 
-    // Submit on OUR queue
     ID3D12CommandList* cls[] = { g_ngxList };
     g_ngxQueue->ExecuteCommandLists(1, cls);
 
