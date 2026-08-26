@@ -149,9 +149,13 @@ static bool OpenByValue(unsigned long long hv, REFIID iid, void** out)
 {
     HANDLE dup = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)(uintptr_t)hv,
-                         GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                         GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        LogLine("helper: DupHandle self FAILED err=%lu val=%llu", GetLastError(), hv);
         return false;
+    }
     HRESULT hr = g_dev->OpenSharedHandle(dup, iid, out);
+    if (FAILED(hr))
+        LogLine("helper: OpenSharedHandle FAILED hr=0x%08X val=%llu", (unsigned)hr, hv);
     CloseHandle(dup);
     return SUCCEEDED(hr) && *out;
 }

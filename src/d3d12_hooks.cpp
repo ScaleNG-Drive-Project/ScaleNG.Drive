@@ -1979,6 +1979,7 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
         return true;
     };
     static unsigned long long s_fInVal = 0, s_fOutVal = 0;
+    static bool s_valsLogged = false;
     B2SetupMsg m = {};
     if (!dupInto(g_b2HColor, &m.hColor) || !dupInto(g_b2HOut, &m.hOut)) {
         Log("ngx-b2: DuplicateHandle(color/out) FAILED err=%lu", GetLastError());
