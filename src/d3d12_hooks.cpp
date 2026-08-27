@@ -1965,6 +1965,7 @@ struct B2SetupMsg {
     unsigned int pad = 0;
     unsigned long long startVal = 0; // epoch-sync for helper fence loop
 };
+static_assert(sizeof(B2SetupMsg) == 56, "B2SetupMsg size mismatch - must be 56 bytes");
 
 static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
 {

@@ -78,6 +78,7 @@ struct SetupMsg {
     unsigned int pad;
     unsigned long long startVal; // ASI's next expected fence value
 };
+static_assert(sizeof(SetupMsg) == 56, "SetupMsg size mismatch - must be 56 bytes");
 
 static ID3D12Device*              g_dev    = nullptr;
 static ID3D12CommandQueue*        g_q      = nullptr;
@@ -147,16 +148,13 @@ static bool InitDevice()
 
 static bool OpenByValue(unsigned long long hv, REFIID iid, void** out)
 {
-    HANDLE dup = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)(uintptr_t)hv,
-                         GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-        LogLine("helper: DupHandle self FAILED err=%lu val=%llu", GetLastError(), hv);
-        return false;
-    }
-    HRESULT hr = g_dev->OpenSharedHandle(dup, iid, out);
+    // The handle `hv` is ALREADY a valid handle in this process (duplicated
+    // from the game process during setup). No need to self-duplicate —
+    // that was failing with ERROR_INVALID_HANDLE because the handle is
+    // already valid and self-duplication of certain handle types can fail.
+    HRESULT hr = g_dev->OpenSharedHandle((HANDLE)(uintptr_t)hv, iid, out);
     if (FAILED(hr))
         LogLine("helper: OpenSharedHandle FAILED hr=0x%08X val=%llu", (unsigned)hr, hv);
-    CloseHandle(dup);
     return SUCCEEDED(hr) && *out;
 }
 
