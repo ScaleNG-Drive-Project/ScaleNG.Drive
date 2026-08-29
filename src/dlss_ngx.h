@@ -119,6 +119,8 @@ public:
     bool IsEnabled() const override { return m_enabled; }
     void SetEnabled(bool enabled) override { m_enabled = enabled; }
     bool IsReady() const override { return m_initialized && m_enabled; }
+    int LastEvaluateResult() const { return m_lastEvaluateResult; }
+    int LastCreateResult() const { return m_lastCreateResult; }
     void UpdateSizes(unsigned int rw, unsigned int rh,
                      unsigned int dw, unsigned int dh) override;
 
@@ -163,6 +165,8 @@ private:
     bool m_initialized = false;
     bool m_featureCreated = false;
     bool m_firstEvaluate = true;
+    int m_lastEvaluateResult = 0;
+    int m_lastCreateResult = 0;
 
     wchar_t m_ngxDataPath[MAX_PATH] = {};
     wchar_t m_dlssPath[MAX_PATH] = {};

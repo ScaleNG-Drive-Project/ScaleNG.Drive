@@ -97,3 +97,21 @@ if exist "%OUT%\ScaleNG_NGX_helper.exe" (
     echo [ERROR] Helper output missing.
     exit /b 1
 )
+
+rem ---- DLSS feature snippet required by the NGX core ------------------------
+rem The helper runs from Bin64\plugins, so the snippet must be packaged beside
+rem it. Prefer the repository's validated 310.6.0 copy; fall back to BeamNG's
+rem Bin64 copy when the repository research asset is not present.
+set "DLSS_SNIPPET=%SRC%..\research\dlss_sdk_370\nvngx_dlss.dll"
+if not exist "%DLSS_SNIPPET%" set "DLSS_SNIPPET=C:\games\BeamNG.drive\Bin64\nvngx_dlss.dll"
+if exist "%DLSS_SNIPPET%" (
+    copy /y "%DLSS_SNIPPET%" "%OUT%\nvngx_dlss.dll" >nul
+    if errorlevel 1 (
+        echo [ERROR] Could not package nvngx_dlss.dll.
+        exit /b 1
+    )
+    echo [OK] Packaged %OUT%\nvngx_dlss.dll
+) else (
+    echo [ERROR] Validated nvngx_dlss.dll not found.
+    exit /b 1
+)

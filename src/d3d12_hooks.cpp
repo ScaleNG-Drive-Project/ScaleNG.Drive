@@ -319,6 +319,8 @@ unsigned int g_renderH = 0;
 Jitter2D g_currJitter = { 0.0f, 0.0f };
 Jitter2D g_prevJitter = { 0.0f, 0.0f };
 unsigned int g_frameCounter = 0;
+static volatile LONG64 g_eclSerial = 0;
+static volatile LONG64 g_presentSerial = 0;
 // Renderer-transition quarantine: when the scene-color identity changes the
 // engine is rebuilding its render graph - resource identities churn and
 // adopting new candidates here races teardown (deterministic engine-side AV).
@@ -475,6 +477,187 @@ static const bool g_diagBridge = GetEnvironmentVariableA("SCALENG_DIAG_BRIDGE", 
 
 static void* g_topoLastSrc = nullptr;
 static unsigned g_topoLastFmt = 0;
+
+// Bounded registry for cold-path native resource discovery.  This registry
+// deliberately owns no COM references: it is evidence only, and every later
+// descriptor read remains guarded because BeamNG can retire a resource after
+// creation.  Roles: 1=RTV, 2=SRV.
+struct NativeCandidate {
+    ID3D12Resource* resource;
+    UINT64 width;
+    UINT height;
+    UINT format;
+    UINT flags;
+    UINT samples;
+    unsigned roles;
+    unsigned rtvCreates;
+    unsigned srvCreates;
+    unsigned long long firstPresent;
+    unsigned long long lastCreatePresent;
+};
+static NativeCandidate g_nativeCandidates[96] = {};
+static unsigned g_nativeCandidateCount = 0;
+static SRWLOCK g_nativeCandidateLock = SRWLOCK_INIT;
+
+static void ObserveNativeCandidate(ID3D12Resource* resource,
+                                   const D3D12_RESOURCE_DESC& desc,
+                                   unsigned role)
+{
+    if (!resource || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.MipLevels != 1 || desc.Width < 1000 || desc.Height < 500 ||
+        desc.SampleDesc.Count != 1)
+        return;
+    const unsigned fmt = (unsigned)desc.Format;
+    if (fmt != (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        fmt != (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM &&
+        fmt != (unsigned)DXGI_FORMAT_R16G16_FLOAT &&
+        fmt != (unsigned)DXGI_FORMAT_R32_TYPELESS &&
+        fmt != (unsigned)DXGI_FORMAT_R32_FLOAT &&
+        fmt != (unsigned)DXGI_FORMAT_R10G10B10A2_UNORM)
+        return;
+    const unsigned long long present =
+        (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    AcquireSRWLockExclusive(&g_nativeCandidateLock);
+    NativeCandidate* found = nullptr;
+    for (unsigned i = 0; i < g_nativeCandidateCount; ++i) {
+        if (g_nativeCandidates[i].resource == resource) {
+            found = &g_nativeCandidates[i];
+            break;
+        }
+    }
+    bool evicted = false;
+    if (!found) {
+        if (g_nativeCandidateCount < 96) {
+            found = &g_nativeCandidates[g_nativeCandidateCount++];
+        } else {
+            // Keep the registry bounded while following renderer churn. The
+            // oldest creation-context entry is evidence we no longer need for
+            // the active presentation window; replacing it lets long runs
+            // continue to expose current candidates.
+            unsigned oldest = 0;
+            for (unsigned i = 1; i < g_nativeCandidateCount; ++i) {
+                if (g_nativeCandidates[i].lastCreatePresent <
+                    g_nativeCandidates[oldest].lastCreatePresent)
+                    oldest = i;
+            }
+            found = &g_nativeCandidates[oldest];
+            evicted = true;
+            *found = {};
+        }
+        found->resource = resource;
+        found->width = desc.Width;
+        found->height = (UINT)desc.Height;
+        found->format = fmt;
+        found->flags = (UINT)desc.Flags;
+        found->samples = (UINT)desc.SampleDesc.Count;
+        found->firstPresent = present;
+    }
+    if (found) {
+        const bool newRole = (found->roles & role) == 0;
+        found->roles |= role;
+        found->lastCreatePresent = present;
+        if (role == 1) ++found->rtvCreates;
+        if (role == 2) ++found->srvCreates;
+        if (newRole) {
+            if (evicted)
+                Log("native-candidate: registry evicted oldest entry for resource=%p",
+                    (void*)resource);
+            Log("native-candidate: resource=%p role=%s size=%llux%u fmt=%u flags=%u present=%llu",
+                (void*)resource, role == 1 ? "RTV" : "SRV",
+                (unsigned long long)desc.Width, (unsigned)desc.Height,
+                fmt, (unsigned)desc.Flags, present);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_nativeCandidateLock);
+}
+
+static void LogNativeCandidateSummary(unsigned long long presentSerial)
+{
+    static unsigned long long s_lastSummary = 0;
+    if (presentSerial > 5 && presentSerial - s_lastSummary < 600)
+        return;
+    s_lastSummary = presentSerial;
+    AcquireSRWLockShared(&g_nativeCandidateLock);
+    bool used[96] = {};
+    unsigned emitted = 0;
+    while (emitted < 8) {
+        unsigned best = 96;
+        for (unsigned i = 0; i < g_nativeCandidateCount; ++i) {
+            if (!used[i] && g_nativeCandidates[i].resource &&
+                (best == 96 || g_nativeCandidates[i].lastCreatePresent >
+                 g_nativeCandidates[best].lastCreatePresent))
+                best = i;
+        }
+        if (best == 96) break;
+        used[best] = true;
+        const NativeCandidate& c = g_nativeCandidates[best];
+        Log("native-candidate: summary resource=%p size=%llux%u fmt=%u roles=%u rtv=%u srv=%u firstPresent=%llu lastCreatePresent=%llu",
+            (void*)c.resource, (unsigned long long)c.width, c.height,
+            c.format, c.roles, c.rtvCreates, c.srvCreates,
+            c.firstPresent, c.lastCreatePresent);
+        ++emitted;
+    }
+    Log("native-candidate: registry count=%u emitted=%u present=%llu",
+        g_nativeCandidateCount, emitted, presentSerial);
+    ReleaseSRWLockShared(&g_nativeCandidateLock);
+}
+
+// These objects are declared below with external linkage; forward declarations
+// keep the diagnostic helpers adjacent to the topology state they describe.
+extern ID3D12CommandQueue* g_graphicsQueue;
+extern ID3D12Resource* g_bbCached;
+extern ID3D12Resource* g_boundRtvResource;
+
+// Compact, read-only topology evidence.  Resource pointers are weak because
+// BeamNG retires render targets during resize/map transitions, so every
+// descriptor read is guarded.  This is intentionally sampled from Present
+// rather than emitted from hot command-list paths; it gives one useful record
+// per render interval instead of megabytes of repetitive logging.
+static void LogTopoResource(const char* label, ID3D12Resource* res)
+{
+    if (!res) {
+        Log("topo-state: %s=null", label);
+        return;
+    }
+    __try {
+        D3D12_RESOURCE_DESC d = res->GetDesc();
+        Log("topo-state: %s=%p %llux%llu fmt=%u flags=%u samples=%u",
+            label, (void*)res,
+            (unsigned long long)d.Width, (unsigned long long)d.Height,
+            (unsigned)d.Format, (unsigned)d.Flags,
+            (unsigned)d.SampleDesc.Count);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("topo-state: %s=%p desc-fault code=%08X", label, (void*)res,
+            (unsigned)GetExceptionCode());
+    }
+}
+
+static void LogTopoSnapshot(unsigned long long presentSerial,
+                            ID3D12Resource* bridgePresentBb,
+                            ID3D12Resource* bridgeOutput,
+                            bool bridgeReady,
+                            int deferredPending)
+{
+    static unsigned long long s_lastSnapshot = 0;
+    if (presentSerial > 5 && presentSerial - s_lastSnapshot < 120)
+        return;
+    s_lastSnapshot = presentSerial;
+    Log("topo-state: snapshot present=%llu ecl=%llu queue=%p bb=%p scene=%p alt=%p bound=%p lastCopySrc=%p lastCopyFmt=%u bridgeReady=%d deferred=%d bridgeBb=%p bridgeOut=%p",
+        presentSerial,
+        (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0),
+        (void*)g_graphicsQueue, (void*)g_bbCached, (void*)g_sceneColor,
+        (void*)g_sceneColorAlt, (void*)g_boundRtvResource, g_topoLastSrc,
+        g_topoLastFmt, (int)bridgeReady, deferredPending,
+        (void*)bridgePresentBb, (void*)bridgeOutput);
+    LogTopoResource("bb", g_bbCached);
+    LogTopoResource("scene", g_sceneColor);
+    LogTopoResource("sceneAlt", g_sceneColorAlt);
+    LogTopoResource("bound", g_boundRtvResource);
+    LogTopoResource("lastCopySrc", (ID3D12Resource*)g_topoLastSrc);
+    LogTopoResource("bridgeBb", bridgePresentBb);
+    LogTopoResource("bridgeOut", bridgeOutput);
+    LogNativeCandidateSummary(presentSerial);
+}
 // Patching self-limits: if the engine never produces a scene copy (e.g. the game
 // is backgrounded and only renders the menu), patching the viewport to the render
 // size forever leaves the frame stretched/black and has been observed alongside
@@ -545,6 +728,14 @@ ID3D12Resource* g_boundRtvResource = nullptr;
 // resolve "what is currently bound as an RTV" to a resource even when the
 // view was created at a moment we later lost (plugin re-init, view re-creation).
 std::map<SIZE_T, ID3D12Resource*> g_rtvMap;
+static std::map<SIZE_T, ID3D12Resource*> g_displayRTVMap; // persistent display-sized, not overwritten on handle reuse
+// Last display-sized RTV creation for provenance
+static D3D12_CPU_DESCRIPTOR_HANDLE g_lastDisplayRTVHandle = {};
+static ID3D12Resource* g_lastDisplayRTVResource = nullptr;
+static unsigned long long g_lastDisplayRTVPresent = 0;
+struct DisplayRTVRecord { D3D12_CPU_DESCRIPTOR_HANDLE handle; ID3D12Resource* resource; unsigned width; unsigned height; unsigned format; unsigned long long present; };
+static DisplayRTVRecord g_displayRTVHistory[8] = {};
+static unsigned g_displayRTVHistoryNext = 0;
 
 std::map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_resourceStates;
 
@@ -559,6 +750,8 @@ static SRWLOCK g_heapStateLock = SRWLOCK_INIT;
 
 typedef void (STDMETHODCALLTYPE* PFN_CreateRenderTargetView)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 typedef void (STDMETHODCALLTYPE* PFN_CreateShaderResourceView)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandQueue)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandList)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
 typedef void (STDMETHODCALLTYPE* PFN_ExecuteCommandLists)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 typedef void (STDMETHODCALLTYPE* PFN_CopyBufferRegion)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
 typedef void (STDMETHODCALLTYPE* PFN_CopyTextureRegion)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
@@ -569,13 +762,562 @@ typedef void (STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(ID3D12GraphicsCommandLi
 
 PFN_CreateRenderTargetView Real_CreateRenderTargetView = nullptr;
 PFN_CreateShaderResourceView Real_CreateShaderResourceView = nullptr;
+PFN_CreateCommandQueue Real_CreateCommandQueue = nullptr;
+PFN_CreateCommandList Real_CreateCommandList = nullptr;
 PFN_ExecuteCommandLists Real_ExecuteCommandLists = nullptr;
+static volatile LONG g_realQueueHookInstalled = 0;
+static volatile LONG g_realListHookInstalled = 0;
+static volatile LONG g_gameQueueObserved = 0;
 PFN_CopyBufferRegion Real_CopyBufferRegion = nullptr;
 PFN_CopyTextureRegion Real_CopyTextureRegion = nullptr;
 PFN_RSSetViewports Real_RSSetViewports = nullptr;
 PFN_RSSetScissorRects Real_RSSetScissorRects = nullptr;
 PFN_ResourceBarrier Real_ResourceBarrier = nullptr;
 PFN_OMSetRenderTargets Real_OMSetRenderTargets = nullptr;
+
+// Per-object read-only command-list wrappers.  BeamNG exposes more than one
+// command-list implementation/vtable (direct and copy lists), so one global
+// MinHook trampoline is not sufficient.  We clone each real list's vtable and
+// replace only the three observation slots below; every other method and all
+// intercepted methods are forwarded to the original vtable entry.
+struct CommandListShim {
+    ID3D12GraphicsCommandList* list;
+    UINT listType;
+    unsigned long long createdPresent;
+    unsigned long long createdEcl;
+    unsigned copyCount;
+    void** originalVtbl;
+    void** clonedVtbl;
+    PFN_CopyTextureRegion copyTexture;
+    PFN_ResourceBarrier resourceBarrier;
+    PFN_OMSetRenderTargets omSetRenderTargets;
+};
+static CommandListShim g_commandListShims[64] = {};
+static SRWLOCK g_commandListShimLock = SRWLOCK_INIT;
+static volatile LONG64 g_shimCopyCalls = 0;
+static volatile LONG64 g_shimOmCalls = 0;
+static volatile LONG64 g_shimBarrierCalls = 0;
+struct NativeCorrelation {
+    void* copySrc;
+    void* copyDst;
+    UINT copySrcFormat;
+    UINT copyDstFormat;
+    void* omColor;
+    UINT omColorFormat;
+    void* barrierResource;
+    UINT barrierFormat;
+    UINT barrierBefore;
+    UINT barrierAfter;
+    unsigned long long present;
+    unsigned long long ecl;
+    unsigned long long generation;
+    unsigned long long batchPresent;
+    unsigned long long batchLastPresent;
+    unsigned long long batchEcl;
+    unsigned long long batchLastEcl;
+    void* batchColor;
+    UINT batchColorFormat;
+    void* batchCopySrc;
+    void* batchCopyDst;
+    UINT batchCopySrcFormat;
+    UINT batchCopyDstFormat;
+    void* batchBarrierResource;
+    UINT batchBarrierFormat;
+    UINT batchBarrierBefore;
+    UINT batchBarrierAfter;
+    unsigned batchCopySeen;
+    unsigned batchOmSeen;
+    unsigned batchBarrierSeen;
+    unsigned long long batchReportedGeneration;
+};
+static NativeCorrelation g_nativeCorrelation = {};
+static SRWLOCK g_nativeCorrelationLock = SRWLOCK_INIT;
+
+struct NativeBatchTargetHistory {
+    void* resource;
+    UINT format;
+    unsigned hits;
+    unsigned long long firstPresent;
+    unsigned long long lastPresent;
+};
+static NativeBatchTargetHistory g_nativeBatchTargets[16] = {};
+
+// Read-only lifetime evidence for the display-sized scene-color resource.
+// This deliberately stores only weak identities: no COM reference is held and
+// no command list or resource state is changed. The resource can therefore be
+// observed safely while BeamNG rotates/rebuilds its render graph.
+struct SceneColorCandidateHistory {
+    void* resource;
+    UINT format;
+    UINT width;
+    UINT height;
+    unsigned samples;
+    unsigned long long firstPresent;
+    unsigned long long lastPresent;
+    unsigned long long lastSamplePresent;
+};
+static SceneColorCandidateHistory g_sceneColorCandidates[8] = {};
+static SRWLOCK g_sceneColorCandidateLock = SRWLOCK_INIT;
+static volatile LONG64 g_sceneColorCandidateLastLog = 0;
+
+static void BeginNativeBatchLocked(NativeCorrelation& c,
+                                   unsigned long long present,
+                                   unsigned long long ecl)
+{
+    // BeamNG records one renderer frame over several ECL submissions and the
+    // observed native work can straddle a small Present boundary. Keep a
+    // bounded four-Present window, then require recurrence separately.
+    if (c.batchPresent != 0 && present >= c.batchPresent &&
+        present - c.batchPresent <= 3) {
+        if (present > c.batchLastPresent) c.batchLastPresent = present;
+        c.batchLastEcl = ecl;
+        return;
+    }
+    c.batchPresent = present;
+    c.batchLastPresent = present;
+    c.batchEcl = ecl;
+    c.batchLastEcl = ecl;
+    c.batchColor = nullptr;
+    c.batchColorFormat = 0;
+    c.batchCopySrc = nullptr;
+    c.batchCopyDst = nullptr;
+    c.batchCopySrcFormat = 0;
+    c.batchCopyDstFormat = 0;
+    c.batchBarrierResource = nullptr;
+    c.batchBarrierFormat = 0;
+    c.batchBarrierBefore = 0;
+    c.batchBarrierAfter = 0;
+    c.batchCopySeen = 0;
+    c.batchOmSeen = 0;
+    c.batchBarrierSeen = 0;
+}
+
+static void MaybeLogCoherentNativeBatchLocked(NativeCorrelation& c)
+{
+    // This is a diagnostic eligibility record only. It deliberately excludes
+    // the cached swapchain backbuffer and never enables output mutation.
+    if (!c.batchCopySeen || !c.batchOmSeen || !c.batchBarrierSeen ||
+        !c.batchColor || c.batchColor == (void*)g_bbCached ||
+        c.batchReportedGeneration == c.generation ||
+        // Present 1 is BeamNG startup composition. Require a later gameplay
+        // interval before allowing a target into the handoff candidate set.
+        c.batchPresent < 120)
+        return;
+    if (c.batchColorFormat != (UINT)DXGI_FORMAT_R16G16B16A16_UNORM &&
+        c.batchColorFormat != (UINT)DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        c.batchColorFormat != (UINT)DXGI_FORMAT_R10G10B10A2_UNORM)
+        return;
+    NativeBatchTargetHistory* history = nullptr;
+    for (auto& h : g_nativeBatchTargets) {
+        if (h.resource == c.batchColor && h.format == c.batchColorFormat) {
+            history = &h;
+            break;
+        }
+    }
+    if (!history) {
+        for (auto& h : g_nativeBatchTargets) {
+            if (!h.resource) { history = &h; break; }
+        }
+    }
+    if (!history)
+        return;
+    if (history->lastPresent != c.batchPresent) {
+        if (!history->resource) {
+            history->resource = c.batchColor;
+            history->format = c.batchColorFormat;
+            history->firstPresent = c.batchPresent;
+        }
+        history->lastPresent = c.batchPresent;
+        ++history->hits;
+    }
+    c.batchReportedGeneration = c.generation;
+    Log("native-batch: coherent=1 repeatable=%u hits=%u target=%p targetFmt=%u batchPresent=%llu-%llu batchEcl=%llu-%llu copySrc=%p copyDst=%p copyFmt=%u/%u barrier=%p barrierFmt=%u states=%u/%u generation=%llu",
+        history->hits >= 3 ? 1u : 0u, history->hits,
+        c.batchColor, c.batchColorFormat, c.batchPresent, c.batchLastPresent,
+        c.batchEcl, c.batchLastEcl,
+        c.batchCopySrc, c.batchCopyDst, c.batchCopySrcFormat, c.batchCopyDstFormat,
+        c.batchBarrierResource, c.batchBarrierFormat,
+        c.batchBarrierBefore, c.batchBarrierAfter, c.generation);
+}
+
+static void LogNativeCorrelation(const char* reason, unsigned long long value)
+{
+    NativeCorrelation c = {};
+    AcquireSRWLockShared(&g_nativeCorrelationLock);
+    c = g_nativeCorrelation;
+    ReleaseSRWLockShared(&g_nativeCorrelationLock);
+    unsigned long long currentPresent = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    unsigned long long currentEcl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    unsigned long long presentAge = currentPresent >= c.present ? currentPresent - c.present : 0;
+    unsigned long long eclAge = currentEcl >= c.ecl ? currentEcl - c.ecl : 0;
+    bool fresh = c.generation != 0 && presentAge <= 120 && eclAge <= 1200;
+    Log("native-correlation: reason=%s value=%llu fresh=%u generation=%llu presentAge=%llu eclAge=%llu copySrc=%p copyDst=%p copyFmt=%u/%u omColor=%p omFmt=%u barrier=%p barrierFmt=%u states=%u/%u nativePresent=%llu nativeEcl=%llu currentPresent=%llu currentEcl=%llu",
+        reason, value, fresh ? 1u : 0u, c.generation, presentAge, eclAge,
+        c.copySrc, c.copyDst, c.copySrcFormat, c.copyDstFormat,
+        c.omColor, c.omColorFormat, c.barrierResource, c.barrierFormat,
+        c.barrierBefore, c.barrierAfter, c.present, c.ecl,
+        currentPresent, currentEcl);
+}
+
+static void LogCommandListShimCounter(const char* method, LONG64 count,
+                                      ID3D12GraphicsCommandList* list,
+                                      CommandListShim* shim)
+{
+    if (count <= 5 || (count % 100000) == 0)
+        Log("native-usage: invocation method=%s count=%lld list=%p type=%u originalVtbl=%p clonedVtbl=%p present=%llu ecl=%llu",
+            method, (long long)count, (void*)list,
+            shim ? (unsigned)shim->listType : 0xFFFFFFFFu,
+            shim ? (void*)shim->originalVtbl : nullptr,
+            shim ? (void*)shim->clonedVtbl : nullptr,
+            (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+}
+
+static CommandListShim* FindCommandListShim(ID3D12GraphicsCommandList* list)
+{
+    if (!list) return nullptr;
+    void** vtbl = nullptr;
+    __try { vtbl = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    AcquireSRWLockShared(&g_commandListShimLock);
+    CommandListShim* result = nullptr;
+    for (auto& shim : g_commandListShims) {
+        if (shim.list == list && shim.clonedVtbl == vtbl) { result = &shim; break; }
+    }
+    ReleaseSRWLockShared(&g_commandListShimLock);
+    return result;
+}
+
+static bool IsNativeUsageSize(ID3D12Resource* resource, D3D12_RESOURCE_DESC* outDesc)
+{
+    if (!resource) return false;
+    __try {
+        D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        if (outDesc) *outDesc = desc;
+        return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+               desc.MipLevels == 1 && desc.SampleDesc.Count == 1 &&
+               desc.Width >= 1000 && desc.Height >= 500;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool SafeGetDesc(ID3D12Resource* r, D3D12_RESOURCE_DESC* out)
+{
+    if (!r || !out) return false;
+    __try { *out = r->GetDesc(); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static UINT64 SafeGetFenceCompleted(ID3D12Fence* f)
+{
+    if (!f) return 0;
+    __try { return f->GetCompletedValue(); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static bool SafeOverwriteRTV(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+    if (!res || !g_device) return false;
+    __try { g_device->CreateRenderTargetView(res, nullptr, handle); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void ObservePersistentSceneColor(unsigned long long presentSerial)
+{
+    // Sampling once per 60 Presents gives us lifetime/recurrence evidence
+    // without adding a meaningful amount of work to the Present path.
+    if (presentSerial == 0 || (presentSerial % 60) != 1)
+        return;
+
+    ID3D12Resource* resources[2] = { g_sceneColor, g_sceneColorAlt };
+    for (ID3D12Resource* resource : resources) {
+        if (!resource || resource == g_bbCached)
+            continue;
+
+        D3D12_RESOURCE_DESC desc = {};
+        if (!IsNativeUsageSize(resource, &desc))
+            continue;
+        if (desc.Format != DXGI_FORMAT_R16G16B16A16_UNORM &&
+            desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+            continue;
+        if (g_displayW && g_displayH &&
+            (desc.Width != g_displayW || desc.Height != g_displayH))
+            continue;
+
+        AcquireSRWLockExclusive(&g_sceneColorCandidateLock);
+        SceneColorCandidateHistory* history = nullptr;
+        for (auto& candidate : g_sceneColorCandidates) {
+            if (candidate.resource == resource && candidate.format == (UINT)desc.Format) {
+                history = &candidate;
+                break;
+            }
+        }
+        if (!history) {
+            for (auto& candidate : g_sceneColorCandidates) {
+                if (!candidate.resource) {
+                    history = &candidate;
+                    candidate.resource = resource;
+                    candidate.format = (UINT)desc.Format;
+                    candidate.width = (UINT)desc.Width;
+                    candidate.height = (UINT)desc.Height;
+                    candidate.firstPresent = presentSerial;
+                    break;
+                }
+            }
+        }
+        if (history && history->lastSamplePresent != presentSerial) {
+            history->lastSamplePresent = presentSerial;
+            history->lastPresent = presentSerial;
+            ++history->samples;
+            unsigned persistent = history->samples >= 3 ? 1u : 0u;
+            LONG64 previous = InterlockedExchange64(&g_sceneColorCandidateLastLog,
+                                                    (LONG64)presentSerial);
+            // Always report the first observation and promotion to persistent;
+            // afterward report at most once per 600 Presents globally.
+            bool important = history->samples <= 3 || previous == 0 ||
+                             presentSerial >= (unsigned long long)previous + 600;
+            if (important) {
+                Log("native-target: scene-color-observed persistent=%u samples=%u resource=%p size=%ux%u fmt=%u firstPresent=%llu lastPresent=%llu display=%ux%u backbuffer=%p",
+                    persistent, history->samples, resource,
+                    history->width, history->height, history->format,
+                    history->firstPresent, history->lastPresent,
+                    g_displayW, g_displayH, (void*)g_bbCached);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_sceneColorCandidateLock);
+    }
+}
+
+static void ObserveNativeCopyUsage(ID3D12GraphicsCommandList* list,
+                                   CommandListShim* shim,
+                                   const D3D12_TEXTURE_COPY_LOCATION* dst,
+                                   const D3D12_TEXTURE_COPY_LOCATION* src)
+{
+    if (!dst || !src || !dst->pResource || !src->pResource) return;
+    D3D12_RESOURCE_DESC dd = {}, sd = {};
+    bool dstLarge = IsNativeUsageSize(dst->pResource, &dd);
+    bool srcLarge = IsNativeUsageSize(src->pResource, &sd);
+    if (!dstLarge && !srcLarge) return;
+    static LONG s_logs = 0;
+    LONG n = InterlockedIncrement(&s_logs);
+    unsigned copyOnList = shim ? ++shim->copyCount : 0;
+    unsigned long long present = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    unsigned long long ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    AcquireSRWLockExclusive(&g_nativeCorrelationLock);
+    BeginNativeBatchLocked(g_nativeCorrelation, present, ecl);
+    g_nativeCorrelation.copySrc = (void*)src->pResource;
+    g_nativeCorrelation.copyDst = (void*)dst->pResource;
+    g_nativeCorrelation.copySrcFormat = (UINT)sd.Format;
+    g_nativeCorrelation.copyDstFormat = (UINT)dd.Format;
+    g_nativeCorrelation.present = present;
+    g_nativeCorrelation.ecl = ecl;
+    ++g_nativeCorrelation.generation;
+    g_nativeCorrelation.batchCopySrc = (void*)src->pResource;
+    g_nativeCorrelation.batchCopyDst = (void*)dst->pResource;
+    g_nativeCorrelation.batchCopySrcFormat = (UINT)sd.Format;
+    g_nativeCorrelation.batchCopyDstFormat = (UINT)dd.Format;
+    g_nativeCorrelation.batchCopySeen = 1;
+    MaybeLogCoherentNativeBatchLocked(g_nativeCorrelation);
+    ReleaseSRWLockExclusive(&g_nativeCorrelationLock);
+    if (n <= 80 || (n % 600) == 0)
+        Log("native-usage: copy #%d list=%p type=%u listCopy=%u createdPresent=%llu createdEcl=%llu src=%p %llux%u fmt=%u dst=%p %llux%u fmt=%u present=%llu ecl=%llu presentMinusCreate=%lld",
+            (int)n, (void*)list,
+            shim ? (unsigned)shim->listType : 0xFFFFFFFFu, copyOnList,
+            shim ? shim->createdPresent : 0, shim ? shim->createdEcl : 0,
+            (void*)src->pResource,
+            (unsigned long long)sd.Width, (unsigned)sd.Height, (unsigned)sd.Format,
+            (void*)dst->pResource, (unsigned long long)dd.Width, (unsigned)dd.Height,
+            (unsigned)dd.Format,
+            present, ecl, (long long)(present - (shim ? shim->createdPresent : present)));
+}
+
+static void ObserveNativeOmUsage(ID3D12GraphicsCommandList* list, UINT count,
+                                 const D3D12_CPU_DESCRIPTOR_HANDLE* handles,
+                                 BOOL singleRange,
+                                 const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
+{
+    if (!handles || count == 0) return;
+    for (UINT i = 0; i < count && i < 8; ++i) {
+        ID3D12Resource* resource = nullptr;
+        bool mapped = false;
+        { BookGuard guard; auto it = g_rtvMap.find(handles[i].ptr); if (it != g_rtvMap.end()) { resource = it->second; mapped = true; } }
+        static LONG s_rawLogs = 0;
+        static LONG s_colorLogs = 0;
+        LONG raw = InterlockedIncrement(&s_rawLogs);
+        LONG color = handles[i].ptr ? InterlockedIncrement(&s_colorLogs) : 0;
+        if (raw <= 80 || (handles[i].ptr && color <= 160))
+            Log("native-usage: om-raw #%d colorSample=%d list=%p slot=%u count=%u singleRange=%u handle=%llX mapped=%u depth=%llX present=%llu ecl=%llu",
+                (int)raw, (int)color, (void*)list, (unsigned)i, (unsigned)count,
+                singleRange ? 1u : 0u,
+                (unsigned long long)handles[i].ptr, mapped ? 1u : 0u,
+                (unsigned long long)(depth ? depth->ptr : 0),
+                (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+        D3D12_RESOURCE_DESC desc = {};
+        if (!IsNativeUsageSize(resource, &desc)) continue;
+        unsigned long long present = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+        unsigned long long ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+        AcquireSRWLockExclusive(&g_nativeCorrelationLock);
+        BeginNativeBatchLocked(g_nativeCorrelation, present, ecl);
+        g_nativeCorrelation.omColor = (void*)resource;
+        g_nativeCorrelation.omColorFormat = (UINT)desc.Format;
+        g_nativeCorrelation.present = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+        g_nativeCorrelation.ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+        ++g_nativeCorrelation.generation;
+        g_nativeCorrelation.batchColor = (void*)resource;
+        g_nativeCorrelation.batchColorFormat = (UINT)desc.Format;
+        g_nativeCorrelation.batchOmSeen = 1;
+        MaybeLogCoherentNativeBatchLocked(g_nativeCorrelation);
+        ReleaseSRWLockExclusive(&g_nativeCorrelationLock);
+        static LONG s_logs = 0;
+        LONG n = InterlockedIncrement(&s_logs);
+        if (n <= 80 || (n % 600) == 0)
+            Log("native-usage: om #%d list=%p slot=%u handle=%llX resource=%p %llux%u fmt=%u present=%llu",
+                (int)n, (void*)list, (unsigned)i,
+                (unsigned long long)handles[i].ptr, (void*)resource,
+                (unsigned long long)desc.Width, (unsigned)desc.Height,
+                (unsigned)desc.Format,
+                (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+    }
+}
+
+static void ObserveNativeBarrierUsage(ID3D12GraphicsCommandList* list, UINT count,
+                                      const D3D12_RESOURCE_BARRIER* barriers)
+{
+    if (!barriers) return;
+    for (UINT i = 0; i < count; ++i) {
+        if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+        ID3D12Resource* resource = barriers[i].Transition.pResource;
+        D3D12_RESOURCE_DESC desc = {};
+        if (!IsNativeUsageSize(resource, &desc)) continue;
+        unsigned long long present = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+        unsigned long long ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+        AcquireSRWLockExclusive(&g_nativeCorrelationLock);
+        BeginNativeBatchLocked(g_nativeCorrelation, present, ecl);
+        g_nativeCorrelation.barrierResource = (void*)resource;
+        g_nativeCorrelation.barrierFormat = (UINT)desc.Format;
+        g_nativeCorrelation.barrierBefore = (UINT)barriers[i].Transition.StateBefore;
+        g_nativeCorrelation.barrierAfter = (UINT)barriers[i].Transition.StateAfter;
+        g_nativeCorrelation.present = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+        g_nativeCorrelation.ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+        ++g_nativeCorrelation.generation;
+        g_nativeCorrelation.batchBarrierResource = (void*)resource;
+        g_nativeCorrelation.batchBarrierFormat = (UINT)desc.Format;
+        g_nativeCorrelation.batchBarrierBefore = (UINT)barriers[i].Transition.StateBefore;
+        g_nativeCorrelation.batchBarrierAfter = (UINT)barriers[i].Transition.StateAfter;
+        g_nativeCorrelation.batchBarrierSeen = 1;
+        MaybeLogCoherentNativeBatchLocked(g_nativeCorrelation);
+        ReleaseSRWLockExclusive(&g_nativeCorrelationLock);
+        static LONG s_logs = 0;
+        LONG n = InterlockedIncrement(&s_logs);
+        if (n <= 80 || (n % 600) == 0)
+            Log("native-usage: barrier #%d list=%p resource=%p %llux%u fmt=%u before=%u after=%u present=%llu",
+                (int)n, (void*)list, (void*)resource,
+                (unsigned long long)desc.Width, (unsigned)desc.Height,
+                (unsigned)desc.Format,
+                (unsigned)barriers[i].Transition.StateBefore,
+                (unsigned)barriers[i].Transition.StateAfter,
+                (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+    }
+}
+
+static bool TryVectorA(ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY, UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* srcBox, CommandListShim* shim);
+static bool TryVectorB(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL singleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* depth, CommandListShim* shim);
+
+static void STDMETHODCALLTYPE Shim_CopyTextureRegion(
+    ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dst,
+    UINT dstX, UINT dstY, UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
+    const D3D12_BOX* srcBox)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimCopyCalls);
+    LogCommandListShimCounter("CopyTextureRegion", invocation, list, shim);
+    ObserveNativeCopyUsage(list, shim, dst, src);
+    if (TryVectorA(list, dst, dstX, dstY, dstZ, src, srcBox, shim)) return;
+    if (shim && shim->copyTexture)
+        shim->copyTexture(list, dst, dstX, dstY, dstZ, src, srcBox);
+}
+
+static void STDMETHODCALLTYPE Shim_ResourceBarrier(ID3D12GraphicsCommandList* list,
+                                                   UINT count, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimBarrierCalls);
+    LogCommandListShimCounter("ResourceBarrier", invocation, list, shim);
+    ObserveNativeBarrierUsage(list, count, barriers);
+    if (shim && shim->resourceBarrier)
+        shim->resourceBarrier(list, count, barriers);
+}
+
+static void STDMETHODCALLTYPE Shim_OMSetRenderTargets(
+    ID3D12GraphicsCommandList* list, UINT count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL singleRange,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimOmCalls);
+    LogCommandListShimCounter("OMSetRenderTargets", invocation, list, shim);
+    ObserveNativeOmUsage(list, count, handles, singleRange, depth);
+    // Targeted diagnostic: prove whether main gameplay OM is observed
+    {
+        bool isTargeted = false;
+        for (UINT i = 0; i < count && i < 8; ++i) {
+            if (!handles[i].ptr) continue;
+            ID3D12Resource* res = nullptr;
+            {
+                BookGuard guard;
+                auto it = g_rtvMap.find(handles[i].ptr);
+                if (it != g_rtvMap.end()) res = it->second;
+            }
+            if (!res) continue;
+            D3D12_RESOURCE_DESC d = {};
+            if (!SafeGetDesc(res, &d)) continue;
+            bool isDisplay = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_displayW && d.Height == g_displayH && (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (!isDisplay) continue;
+            bool isTracked = false;
+            AcquireSRWLockShared(&g_sceneColorCandidateLock);
+            for (auto &c : g_sceneColorCandidates) {
+                if (c.resource == (void*)res && c.width == g_displayW && c.height == g_displayH) { isTracked = true; break; }
+            }
+            ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+            if (!isTracked) {
+                for (unsigned h = 0; h < 8; ++h) {
+                    if (g_displayRTVHistory[h].resource == res) { isTracked = true; break; }
+                }
+            }
+            if (isTracked) { isTargeted = true; break; }
+        }
+        if (isTargeted) {
+            Log("vectorB: targeted OM list=%p queue=%p count=%u present=%llu ecl=%llu", (void*)list, (void*)g_graphicsQueue, count, (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0), (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+            for (UINT i = 0; i < count && i < 8; ++i) {
+                if (!handles[i].ptr) continue;
+                ID3D12Resource* res = nullptr;
+                {
+                    BookGuard guard;
+                    auto it = g_rtvMap.find(handles[i].ptr);
+                    if (it != g_rtvMap.end()) res = it->second;
+                }
+                D3D12_RESOURCE_DESC d = {};
+                bool gotDesc = res ? SafeGetDesc(res, &d) : false;
+                bool isDisplay = gotDesc && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_displayW && d.Height == g_displayH && (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                unsigned samples = 0;
+                if (res) {
+                    AcquireSRWLockShared(&g_sceneColorCandidateLock);
+                    for (auto &c : g_sceneColorCandidates) {
+                        if (c.resource == (void*)res && c.width == g_displayW && c.height == g_displayH) { samples = c.samples; break; }
+                    }
+                    ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+                }
+                Log("vectorB: targeted slot=%u handle=%llX resource=%p size=%ux%u fmt=%u samples=%u isDisplay=%u", i, (unsigned long long)handles[i].ptr, (void*)res, gotDesc ? (unsigned)d.Width : 0u, gotDesc ? (unsigned)d.Height : 0u, gotDesc ? (unsigned)d.Format : 0u, samples, isDisplay ? 1u : 0u);
+            }
+        }
+        if (!shim) {
+            Log("vectorB: miss shim null list=%p count=%u present=%llu", (void*)list, count, (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+        } else if (!shim->omSetRenderTargets) {
+            Log("vectorB: miss shim->omSetRenderTargets null list=%p", (void*)list);
+        }
+    }
+    if (TryVectorB(list, count, handles, singleRange, depth, shim)) return;
+    if (shim && shim->omSetRenderTargets)
+        shim->omSetRenderTargets(list, count, handles, singleRange, depth);
+}
 
 
 
@@ -602,7 +1344,10 @@ void CfgMarkValid(void* const* targets, size_t count)
     pfn(GetCurrentProcess(), (PVOID)base, (SIZE_T)(maxOff + 1), (ULONG)count, info);
 }
 
-void InstallCommandListHooks(ID3D12GraphicsCommandList* list);
+void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType = 0xFFFFFFFFu);
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList(
+    ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*,
+    ID3D12PipelineState*, REFIID, void**);
 
 void StartFrame()
 {
@@ -933,6 +1678,40 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
     // to enable discovery).
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
+        ObserveNativeCandidate(res, rd, 1);
+        // Provenance diagnostic: log every qualifying display-sized RTV creation with exact handle
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 && rd.SampleDesc.Count == 1) {
+            Log("rtv-provenance: create handle=%llX resource=%p size=%ux%u fmt=%u flags=%u", (unsigned long long)handle.ptr, (void*)res, (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)rd.Format, (unsigned)rd.Flags);
+        }
+        // Track handle reuse and last display RTV for OM correlation
+        {
+            BookGuard _bg;
+            auto it = g_rtvMap.find(handle.ptr);
+            if (it != g_rtvMap.end() && it->second != res) {
+                Log("rtv-provenance: handle reuse handle=%llX oldRes=%p newRes=%p", (unsigned long long)handle.ptr, (void*)it->second, (void*)res);
+            }
+        }
+        if (rd.Width == g_displayW && rd.Height == g_displayH && (rd.Format == DXGI_FORMAT_R16G16B16A16_UNORM || rd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            g_lastDisplayRTVHandle = handle;
+            g_lastDisplayRTVResource = res;
+            g_lastDisplayRTVPresent = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+            // Record in history for resource-level correlation
+            DisplayRTVRecord &rec = g_displayRTVHistory[g_displayRTVHistoryNext % 8];
+            rec.handle = handle;
+            rec.resource = res;
+            rec.width = (unsigned)rd.Width;
+            rec.height = (unsigned)rd.Height;
+            rec.format = (unsigned)rd.Format;
+            rec.present = g_lastDisplayRTVPresent;
+            g_displayRTVHistoryNext++;
+            Log("rtv-provenance: display history idx=%u handle=%llX resource=%p present=%llu", (g_displayRTVHistoryNext-1)%8, (unsigned long long)handle.ptr, (void*)res, g_lastDisplayRTVPresent);
+            // Persistent display map not overwritten on handle reuse
+            {
+                BookGuard _bg;
+                auto it = g_displayRTVMap.find(handle.ptr);
+                if (it == g_displayRTVMap.end()) g_displayRTVMap[handle.ptr] = res;
+            }
+        }
         // BACKBUFFER CAPTURE (polite): flip-model swapchain buffers carry
         // ALLOW_RENDER_TARGET + DISPLAY_SWAP? and are RTV'd right after swap
         // creation. Capture display-sized candidates here so the injection
@@ -1101,6 +1880,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
     if (device == g_device && res && desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
         desc->Texture2D.MipLevels == 1) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
+        ObserveNativeCandidate(res, rd, 2);
         // Creation-time ref for depth-family targets (same safety rationale).
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
             rd.Width == g_displayW && rd.Height == g_displayH &&
@@ -1121,6 +1901,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
 
 void TryDeferredInject(ID3D12CommandQueue* injQueue);
 void InjectAtPresentImpl(ID3D12CommandQueue* injQueue);
+void TryQueueOutputCopy(ID3D12CommandQueue* queue);
 void InjectAtPresent();
 bool g_inInject = false;
 
@@ -1129,7 +1910,10 @@ void EnsureGlobalSwapchainHookImpl();
 void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                               ID3D12CommandList* const* lists)
 {
-    if (queue)
+    // Keep the first real direct queue captured by CreateCommandQueue. BeamNG
+    // exposes several direct queue interfaces; replacing this pointer on each
+    // callback makes queue-to-Present correlation meaningless.
+    if (queue && !g_graphicsQueue)
         g_graphicsQueue = queue;
     EnsureGlobalSwapchainHookImpl();
     static int s_execCalls = 0;
@@ -1159,11 +1943,100 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
 
     // Deferred injection: run our DLAA+HUD work on THE GAME'S OWN QUEUE,
     // immediately after its lists - perfect ordering, zero cross-queue races.
-    if (!g_inInject && queue) {
+    // Discovery phase: the real queue hook is intentionally observation-only.
+    // Injection remains Present-owned until the queue identity and submission
+    // cadence are proven against BeamNG's actual graphics queue.
+    if (!g_inInject && queue && queue == g_graphicsQueue &&
+        InterlockedCompareExchange(&g_gameQueueObserved, 0, 0)) {
         g_inInject = true;
-        TryDeferredInject(queue);
+        static unsigned s_gameEcl = 0;
+        ++s_gameEcl;
+        const unsigned long long eclSerial = (unsigned long long)InterlockedIncrement64(&g_eclSerial);
+        if (s_gameEcl <= 8 || (s_gameEcl % 600) == 0)
+            Log("hooks: GAME ExecuteCommandLists observed #%u queue=%p lists=%u frame=%u",
+                s_gameEcl, (void*)queue, numLists, g_frameCounter);
+        if (s_gameEcl <= 8 || (s_gameEcl % 600) == 0)
+            Log("hooks: ECL correlation serial=%llu queue=%p presentSerial=%llu",
+                eclSerial, (void*)queue,
+                (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+        TryQueueOutputCopy(queue);
+        // Observation-only for now. Calling the full pipeline from every ECL
+        // submission enters BeamNG during render-graph construction and
+        // crashes before the first helper acknowledgement. The confirmed
+        // queue identity is retained for a later, narrowly gated copy pass.
         g_inInject = false;
     }
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommandQueue(
+    ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC* desc,
+    REFIID riid, void** outQueue)
+{
+    if (!Real_CreateCommandQueue)
+        return E_POINTER;
+    HRESULT hr = Real_CreateCommandQueue(device, desc, riid, outQueue);
+    if (SUCCEEDED(hr) && outQueue && *outQueue && device == g_device && desc &&
+        desc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        ID3D12CommandQueue* q = nullptr;
+        IUnknown* returned = reinterpret_cast<IUnknown*>(*outQueue);
+        if (returned && SUCCEEDED(returned->QueryInterface(IID_PPV_ARGS(&q))) && q) {
+            if (InterlockedCompareExchange(&g_gameQueueObserved, 1, 0) == 0) {
+                g_graphicsQueue = q;
+                Log("hooks: GAME direct queue captured=%p", (void*)q);
+            }
+            void** qv = *(void***)q;
+            void* ecl = qv[10];
+            if (InterlockedCompareExchange(&g_realQueueHookInstalled, 1, 0) == 0) {
+                MH_STATUS st = MH_CreateHook(ecl, (void*)&Hook_ExecuteCommandLists,
+                                             (void**)&Real_ExecuteCommandLists);
+                if (st == MH_OK || st == MH_ERROR_ALREADY_CREATED) {
+                    MH_STATUS en = MH_EnableHook(ecl);
+                    Log("hooks: real queue ECL hook %s target=%p st=%d enable=%d",
+                        en == MH_OK ? "INSTALLED" : "FAILED", ecl, (int)st, (int)en);
+                } else {
+                    InterlockedExchange(&g_realQueueHookInstalled, 0);
+                    Log("hooks: real queue ECL hook create FAILED target=%p st=%d", ecl, (int)st);
+                }
+            }
+            q->Release();
+        }
+    }
+    return hr;
+}
+
+// Cold-path observer only.  Do not patch any command-list method here: the
+// renderer's hot methods run through driver/wrapper state where MinHook caused
+// artifacts and crashes in earlier experiments.  This hook only records that a
+// real game command list was created and exposes its vtable identity for the
+// next read-only observation step.
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList(
+    ID3D12Device* device, UINT nodeMask, D3D12_COMMAND_LIST_TYPE type,
+    ID3D12CommandAllocator* allocator, ID3D12PipelineState* initialState,
+    REFIID riid, void** outList)
+{
+    if (!Real_CreateCommandList)
+        return E_POINTER;
+    HRESULT hr = Real_CreateCommandList(device, nodeMask, type, allocator,
+                                        initialState, riid, outList);
+    if (SUCCEEDED(hr) && outList && *outList && device == g_device) {
+        static LONG s_created = 0;
+        LONG n = InterlockedIncrement(&s_created);
+        if (n <= 12 || (n % 500) == 0) {
+            void* list = *outList;
+            void** vtbl = nullptr;
+            __try { vtbl = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            Log("hooks: GAME CreateCommandList #%d list=%p type=%u vtbl=%p allocator=%p riid=%08X:%04X:%04X",
+                (int)n, list, (unsigned)type, (void*)vtbl, (void*)allocator,
+                (unsigned)riid.Data1,
+                (unsigned)riid.Data2,
+                (unsigned)riid.Data3);
+        }
+        // Attach before BeamNG records any work into the newly-created list.
+        // Installing at ExecuteCommandLists is too late: all Copy/OM/Barrier
+        // calls for that submission have already happened by then.
+        InstallCommandListHooks((ID3D12GraphicsCommandList*)*outList, (UINT)type);
+    }
+    return hr;
 }
 
 // ---------------- Swapchain Present injection (DLAA mode) ----------------
@@ -1798,12 +2671,33 @@ static ID3D12Fence*               g_b2FenceOutG = nullptr;
 static ID3D12Fence*               g_b2FIO  = nullptr;
 static ID3D12Fence*               g_b2FOO  = nullptr;
 static UINT64                     g_b2Val  = 0;
+static volatile LONG              g_b2DeferredPending = 0;
+static UINT64                     g_b2DeferredVal = 0;
+static ID3D12Resource*            g_b2PresentBb = nullptr; // weak, current Present backbuffer
 static bool                       g_b2Ready = false;
 static bool                       g_ngxBlocked = false; // wrapper detected -> bridge mode
 static UINT                       g_b2W = 0, g_b2H = 0;
 static DXGI_FORMAT                g_b2Fmt = DXGI_FORMAT_UNKNOWN;
 static ID3D12Resource*            g_b2Depth = nullptr;
 static ID3D12Resource*            g_b2Mv    = nullptr;
+static ID3D12CommandAllocator*    g_b2CopyAlloc = nullptr;
+static ID3D12GraphicsCommandList* g_b2CopyList = nullptr;
+static bool                       g_b2QueueCopy = false;
+static volatile LONG              g_vectorAOneShot = 0; // Vector A aggressive one-shot handoff
+static bool                       g_vectorAEnabled = false; // disabled for provenance diagnostic
+static volatile LONG              g_vectorBOneShot = 0; // Vector B OM hijack one-shot
+static bool                       g_vectorBEnabled = true;
+static volatile LONG              g_vectorBArmed = 0;
+static ID3D12Resource*            g_vectorBArmedRes = nullptr;
+static D3D12_CPU_DESCRIPTOR_HANDLE g_vectorBArmedHandle = {};
+static unsigned                   g_vectorBArmedSamples = 0;
+static UINT64                     g_vectorBArmedPending = 0;
+static bool                       g_vectorBTestActive = false;
+static unsigned                   g_vectorBTestFrames = 0;
+static const unsigned             g_vectorBTestTotal = 1000;
+static unsigned long long         g_vectorBTestStartPresent = 0;
+static D3D12_CPU_DESCRIPTOR_HANDLE g_vectorBTestHandle = {};
+static ID3D12Resource*            g_vectorBTestResource = nullptr;
 
 template <typename T>
 static bool B2OpenShared(ID3D12Device* dev, ID3D12DeviceChild* obj, T** out)
@@ -1849,8 +2743,24 @@ static void B2EnsureDummyInputs(UINT w, UINT h)
 static HANDLE g_b2Helper  = nullptr; // child process
 static HANDLE g_b2Pipe    = nullptr;
 static bool   g_b2UseHelper = false; // opt-in via ScaleNG.ini [bridge] helper=1
+static bool   g_b2ReplaceOutput = true; // copy DLSS result back into game bb
+static bool   g_b2DeferredOutput = false; // hand off through engine copy hook
+static SRWLOCK g_b2PipeLock = SRWLOCK_INIT; // Present can enter concurrently
+// The bridge reuses two allocators/lists and the current backbuffer. Present
+// may be re-entered during queue submission (and can arrive from another
+// render thread during resize), so only one bridge transaction may record or
+// submit at a time. A skipped transaction leaves the engine's Present path
+// untouched and the caller releases its GetBuffer reference.
+static SRWLOCK g_b2FrameLock = SRWLOCK_INIT;
 static HANDLE g_b2HColor  = nullptr, g_b2HOut = nullptr;
 static HANDLE g_b2HFIn    = nullptr, g_b2HFOut = nullptr;
+// These are handle values in the CURRENT helper process. They must be cleared
+// whenever that process is replaced; numeric HANDLE values are not portable
+// across processes or helper restarts.
+static unsigned long long g_b2FInDup = 0, g_b2FOutDup = 0;
+struct B2FrameAck { unsigned long long value; unsigned int recorded; unsigned int reserved; };
+static bool g_b2FramePending = false;
+static unsigned long long g_b2PendingValue = 0;
 
 static void B2KillOrphans()
 {
@@ -1878,6 +2788,8 @@ static void B2KillHelper()
 {
     if (g_b2Pipe)    { CloseHandle(g_b2Pipe);   g_b2Pipe = nullptr; }
     if (g_b2Helper)  { TerminateProcess(g_b2Helper, 0); CloseHandle(g_b2Helper); g_b2Helper = nullptr; }
+    g_b2FInDup = 0;
+    g_b2FOutDup = 0;
 }
 
 static void B2CheckIniFlag()
@@ -1893,15 +2805,444 @@ static void B2CheckIniFlag()
     wchar_t buf[16] = {};
     GetPrivateProfileStringW(L"bridge", L"helper", L"0", buf, 15, p);
     g_b2UseHelper = _wtoi(buf) != 0;
-    Log("ngx-b2: helper mode %s (ini [bridge] helper)", g_b2UseHelper ? "ENABLED" : "off");
+    GetPrivateProfileStringW(L"bridge", L"replaceOutput", L"1", buf, 15, p);
+    g_b2ReplaceOutput = _wtoi(buf) != 0;
+    GetPrivateProfileStringW(L"bridge", L"deferredOutput", L"0", buf, 15, p);
+    g_b2DeferredOutput = _wtoi(buf) != 0;
+    GetPrivateProfileStringW(L"bridge", L"queueCopy", L"0", buf, 15, p);
+    g_b2QueueCopy = _wtoi(buf) != 0;
+    Log("ngx-b2: helper mode %s (ini [bridge] helper), output replacement %s, deferred handoff %s, queue copy %s",
+        g_b2UseHelper ? "ENABLED" : "off", g_b2ReplaceOutput ? "ENABLED" : "disabled",
+        g_b2DeferredOutput ? "ENABLED" : "off", g_b2QueueCopy ? "ENABLED" : "off");
 }
+
+static bool TryVectorA(ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY, UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* srcBox, CommandListShim* shim)
+{
+    if (!g_vectorAEnabled || !g_b2DeferredOutput || !g_b2DeferredPending || !list || !dst || !src ||
+        !dst->pResource || !src->pResource ||
+        dst->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ||
+        src->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ||
+        dst->SubresourceIndex != 0 || src->SubresourceIndex != 0 ||
+        dstX != 0 || dstY != 0 || dstZ != 0 ||
+        dst->pResource == g_b2ColorG || dst->pResource == g_b2OutG ||
+        src->pResource == g_b2ColorG || src->pResource == g_b2OutG ||
+        !g_b2OutG || !g_b2FenceOutG)
+        return false;
+    unsigned long long presentSerial = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    if (presentSerial <= 300) return false;
+    if (InterlockedCompareExchange(&g_vectorAOneShot, 0, 1) != 0) return false;
+    bool doIt = false;
+    D3D12_RESOURCE_DESC dd = {};
+    D3D12_RESOURCE_DESC od = {};
+    D3D12_RESOURCE_DESC sd = {};
+    SafeGetDesc(dst->pResource, &dd);
+    SafeGetDesc(g_b2OutG, &od);
+    SafeGetDesc(src->pResource, &sd);
+    const UINT copyW = srcBox ? (UINT)(srcBox->right - srcBox->left) : (UINT)sd.Width;
+    const UINT copyH = srcBox ? (UINT)(srcBox->bottom - srcBox->top) : (UINT)sd.Height;
+    const UINT64 pending = g_b2DeferredVal;
+    UINT64 completed = SafeGetFenceCompleted(g_b2FenceOutG);
+    bool dstIsDisplay = dd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        dd.Width == od.Width && dd.Height == od.Height &&
+                        dd.Format == od.Format && od.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                        dd.Width == g_displayW && dd.Height == g_displayH;
+    bool srcIsDisplaySized = sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                             sd.Width == g_displayW && sd.Height == g_displayH &&
+                             sd.Width >= 1000 && sd.Height >= 500;
+    bool fullFrame = copyW == (UINT)dd.Width && copyH == (UINT)dd.Height && sd.Width == dd.Width && sd.Height == dd.Height;
+    if (dstIsDisplay && srcIsDisplaySized && fullFrame && completed >= pending && pending != 0) {
+        bool isPersistent = false;
+        AcquireSRWLockShared(&g_sceneColorCandidateLock);
+        for (auto &c : g_sceneColorCandidates) {
+            if (c.resource == (void*)src->pResource && c.samples >= 3 && c.width == g_displayW && c.height == g_displayH) { isPersistent = true; break; }
+        }
+        ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+        doIt = true;
+        Log("vectorA: attempting handoff dst=%p %ux%u fmt=%u src=%p %ux%u fmt=%u od=%ux%u fmt=%u pending=%llu completed=%llu persistent=%u present=%llu",
+            (void*)dst->pResource, (unsigned)dd.Width, (unsigned)dd.Height, (unsigned)dd.Format,
+            (void*)src->pResource, (unsigned)sd.Width, (unsigned)sd.Height, (unsigned)sd.Format,
+            (unsigned)od.Width, (unsigned)od.Height, (unsigned)od.Format,
+            (unsigned long long)pending, (unsigned long long)completed, isPersistent ? 1u : 0u, presentSerial);
+    }
+    if (doIt && InterlockedCompareExchange(&g_b2DeferredPending, 0, 1) == 1) {
+        D3D12_TEXTURE_COPY_LOCATION replacement = { g_b2OutG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = g_b2OutG;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (shim && shim->resourceBarrier) shim->resourceBarrier(list, 1, &b);
+        else if (Real_ResourceBarrier) Real_ResourceBarrier(list, 1, &b);
+        if (shim && shim->copyTexture) shim->copyTexture(list, dst, dstX, dstY, dstZ, &replacement, srcBox);
+        else if (Real_CopyTextureRegion) Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, &replacement, srcBox);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        if (shim && shim->resourceBarrier) shim->resourceBarrier(list, 1, &b);
+        else if (Real_ResourceBarrier) Real_ResourceBarrier(list, 1, &b);
+        Log("vectorA: DLSS output substituted frame=%llu dst=%p srcOrig=%p persistent=%u", (unsigned long long)pending, (void*)dst->pResource, (void*)src->pResource, doIt ? 1u : 0u);
+        return true;
+    } else {
+        InterlockedExchange(&g_vectorAOneShot, 0);
+        return false;
+    }
+}
+
+static bool TryVectorB(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL singleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* depth, CommandListShim* shim)
+{
+    if (!g_vectorBEnabled || !list || !handles || count == 0)
+        return false;
+    unsigned long long presentSerial = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    unsigned long long eclSerial = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    UINT64 pending = g_b2DeferredVal;
+    UINT64 completed = SafeGetFenceCompleted(g_b2FenceOutG);
+    bool fenceReady = pending != 0 && completed >= pending && g_b2DeferredPending;
+    bool sawDisplaySized = false;
+    for (UINT i = 0; i < count && i < 8; ++i) {
+        if (!handles[i].ptr) continue;
+        ID3D12Resource* res = nullptr;
+        {
+            BookGuard guard;
+            auto it = g_rtvMap.find(handles[i].ptr);
+            if (it != g_rtvMap.end()) res = it->second;
+        }
+        if (!res) continue;
+        D3D12_RESOURCE_DESC d = {};
+        if (!SafeGetDesc(res, &d)) continue;
+        bool isDisplay = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_displayW && d.Height == g_displayH && (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (isDisplay) { sawDisplaySized = true; break; }
+    }
+    bool shouldLogDetails = sawDisplaySized || fenceReady;
+    if (shouldLogDetails) {
+        for (UINT i = 0; i < count && i < 8; ++i) {
+            if (!handles[i].ptr) continue;
+            ID3D12Resource* res = nullptr;
+            bool foundInMap = false;
+            {
+                BookGuard guard;
+                auto it = g_rtvMap.find(handles[i].ptr);
+                if (it != g_rtvMap.end()) { res = it->second; foundInMap = true; }
+            }
+        D3D12_RESOURCE_DESC d = {};
+        bool gotDesc = res ? SafeGetDesc(res, &d) : false;
+        bool isDisplay = gotDesc && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_displayW && d.Height == g_displayH && (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (handles[i].ptr == g_lastDisplayRTVHandle.ptr && handles[i].ptr != 0) {
+            Log("vectorB: lastDisplay bound handle=%llX resource=%p present=%llu ecl=%llu", (unsigned long long)handles[i].ptr, (void*)res, presentSerial, eclSerial);
+        }
+        // Resource-level correlation: same resource even if handle recycled
+        {
+            bool isTrackedRes = false;
+            D3D12_CPU_DESCRIPTOR_HANDLE creationHandle = {};
+            unsigned long long creationPresent = 0;
+            unsigned trackedSamples = 0;
+            AcquireSRWLockShared(&g_sceneColorCandidateLock);
+            for (auto &c : g_sceneColorCandidates) {
+                if (c.resource == (void*)res && c.width == g_displayW && c.height == g_displayH) { isTrackedRes = true; trackedSamples = c.samples; break; }
+            }
+            ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+            if (!isTrackedRes) {
+                for (unsigned h = 0; h < 8; ++h) {
+                    if (g_displayRTVHistory[h].resource == res) {
+                        isTrackedRes = true;
+                        creationHandle = g_displayRTVHistory[h].handle;
+                        creationPresent = g_displayRTVHistory[h].present;
+                        trackedSamples = 1;
+                        break;
+                    }
+                }
+            } else {
+                for (unsigned h = 0; h < 8; ++h) {
+                    if (g_displayRTVHistory[h].resource == res) { creationHandle = g_displayRTVHistory[h].handle; creationPresent = g_displayRTVHistory[h].present; break; }
+                }
+                if (!creationHandle.ptr) { creationHandle = handles[i]; creationPresent = presentSerial; }
+            }
+            if (res && isTrackedRes) {
+                bool isPersistent = trackedSamples >= 1;
+                bool recycled = creationHandle.ptr != handles[i].ptr && creationHandle.ptr != 0;
+                UINT64 pendingRes = g_b2DeferredVal;
+                UINT64 completedRes = SafeGetFenceCompleted(g_b2FenceOutG);
+                Log("vectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu size=%ux%u fmt=%u samples=%u pending=%llu completed=%llu persistent=%u recycled=%u", (unsigned long long)creationHandle.ptr, (void*)res, creationPresent, (unsigned long long)handles[i].ptr, (void*)res, presentSerial, gotDesc ? (unsigned)d.Width : 0, gotDesc ? (unsigned)d.Height : 0, gotDesc ? (unsigned)d.Format : 0, trackedSamples, (unsigned long long)pendingRes, (unsigned long long)completedRes, isPersistent ? 1u : 0u, recycled ? 1u : 0u);
+            }
+        }
+        if (isDisplay) sawDisplaySized = true;
+        unsigned samples = 0;
+            if (foundInMap && gotDesc) {
+                AcquireSRWLockShared(&g_sceneColorCandidateLock);
+                for (auto &c : g_sceneColorCandidates) {
+                    if (c.resource == (void*)res && c.width == g_displayW && c.height == g_displayH) { samples = c.samples; break; }
+                }
+                ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+            }
+            Log("vectorB: slot=%u handle=%llX foundInMap=%u resource=%p size=%ux%u fmt=%u samples=%u present=%llu ecl=%llu pending=%llu completed=%llu isDisplay=%u", i, (unsigned long long)handles[i].ptr, foundInMap ? 1u : 0u, (void*)res, gotDesc ? (unsigned)d.Width : 0u, gotDesc ? (unsigned)d.Height : 0u, gotDesc ? (unsigned)d.Format : 0u, samples, presentSerial, eclSerial, (unsigned long long)pending, (unsigned long long)completed, isDisplay ? 1u : 0u);
+        }
+        if (sawDisplaySized) {
+            Log("vectorB: omCall count=%u singleRange=%u present=%llu ecl=%llu handles=%llX %llX %llX %llX", count, singleRange ? 1u : 0u, presentSerial, eclSerial, count>0 ? (unsigned long long)handles[0].ptr : 0, count>1 ? (unsigned long long)handles[1].ptr : 0, count>2 ? (unsigned long long)handles[2].ptr : 0, count>3 ? (unsigned long long)handles[3].ptr : 0);
+            BookGuard guard;
+            unsigned dumped = 0;
+            for (auto &kv : g_rtvMap) {
+                if (dumped >= 16) break;
+                D3D12_RESOURCE_DESC d = {};
+                bool got = kv.second ? SafeGetDesc(kv.second, &d) : false;
+                Log("vectorB: rtvMap handle=%llX resource=%p size=%ux%u fmt=%u", (unsigned long long)kv.first, (void*)kv.second, got ? (unsigned)d.Width : 0u, got ? (unsigned)d.Height : 0u, got ? (unsigned)d.Format : 0u);
+                ++dumped;
+            }
+            if (dumped == 0) Log("vectorB: rtvMap empty at present=%llu", presentSerial);
+        }
+    }
+    // Resource-level correlation for every OM that binds a tracked display resource — unconditional, handle-independent
+    for (UINT i = 0; i < count && i < 8; ++i) {
+        if (!handles[i].ptr) continue;
+        ID3D12Resource* res = nullptr;
+        {
+            BookGuard guard;
+            auto it = g_rtvMap.find(handles[i].ptr);
+            if (it != g_rtvMap.end()) res = it->second;
+            else {
+                auto it2 = g_displayRTVMap.find(handles[i].ptr);
+                if (it2 != g_displayRTVMap.end()) res = it2->second;
+            }
+        }
+        if (!res) {
+            // Also try reverse lookup via display history resource handle
+            for (unsigned h = 0; h < 8; ++h) {
+                if (g_displayRTVHistory[h].handle.ptr == handles[i].ptr) { res = g_displayRTVHistory[h].resource; break; }
+            }
+        }
+        if (!res) continue;
+        bool isTracked = false;
+        D3D12_CPU_DESCRIPTOR_HANDLE creationHandle = {};
+        unsigned long long creationPresent = 0;
+        unsigned trackedSamples = 0;
+        AcquireSRWLockShared(&g_sceneColorCandidateLock);
+        for (auto &c : g_sceneColorCandidates) {
+            if (c.resource == (void*)res && c.width == g_displayW && c.height == g_displayH) { isTracked = true; trackedSamples = c.samples; break; }
+        }
+        ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+        if (!isTracked) {
+            for (unsigned h = 0; h < 8; ++h) {
+                if (g_displayRTVHistory[h].resource == res) {
+                    isTracked = true;
+                    creationHandle = g_displayRTVHistory[h].handle;
+                    creationPresent = g_displayRTVHistory[h].present;
+                    trackedSamples = 1;
+                    break;
+                }
+            }
+        } else {
+            for (unsigned h = 0; h < 8; ++h) {
+                if (g_displayRTVHistory[h].resource == res) { creationHandle = g_displayRTVHistory[h].handle; creationPresent = g_displayRTVHistory[h].present; break; }
+            }
+            if (!creationHandle.ptr) { creationHandle = handles[i]; creationPresent = presentSerial; }
+        }
+        if (res && isTracked) {
+            D3D12_RESOURCE_DESC d = {};
+            bool gotDesc = SafeGetDesc(res, &d);
+            bool isPersistent = trackedSamples >= 1;
+            Log("vectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu size=%ux%u fmt=%u samples=%u pending=%llu completed=%llu persistent=%u recycled=%u", (unsigned long long)creationHandle.ptr, (void*)res, creationPresent, (unsigned long long)handles[i].ptr, (void*)res, presentSerial, gotDesc ? (unsigned)d.Width : 0, gotDesc ? (unsigned)d.Height : 0, gotDesc ? (unsigned)d.Format : 0, trackedSamples, (unsigned long long)pending, (unsigned long long)completed, isPersistent ? 1u : 0u);
+        }
+    }
+    // 1000-frame test: if test active, handle continued substitution
+    if (g_vectorBTestActive) {
+        if (presentSerial > g_vectorBTestStartPresent + g_vectorBTestTotal) {
+            Log("vectorB: TEST END after %u frames startPresent=%llu endPresent=%llu", g_vectorBTestFrames, g_vectorBTestStartPresent, presentSerial);
+            g_vectorBTestActive = false;
+            g_vectorBTestFrames = 0;
+            InterlockedExchange(&g_vectorBArmed, 0);
+            InterlockedExchange(&g_vectorBOneShot, 0);
+            return false;
+        }
+        for (UINT i = 0; i < count && i < 8; ++i) {
+            if (!handles[i].ptr) continue;
+            if (handles[i].ptr != g_vectorBTestHandle.ptr) continue;
+            ID3D12Resource* resCheck = nullptr;
+            {
+                BookGuard guard;
+                auto it = g_rtvMap.find(handles[i].ptr);
+                if (it != g_rtvMap.end()) resCheck = it->second;
+                else {
+                    auto it2 = g_displayRTVMap.find(handles[i].ptr);
+                    if (it2 != g_displayRTVMap.end()) resCheck = it2->second;
+                }
+            }
+            if (!resCheck || resCheck != g_vectorBTestResource) {
+                Log("vectorB: TEST STOP resource mismatch handle=%llX", (unsigned long long)handles[i].ptr);
+                g_vectorBTestActive = false;
+                InterlockedExchange(&g_vectorBArmed, 0);
+                return false;
+            }
+            if (!g_b2DeferredPending || g_b2DeferredVal == 0 || SafeGetFenceCompleted(g_b2FenceOutG) < g_b2DeferredVal) {
+                Log("vectorB: TEST STOP fence not ready");
+                g_vectorBTestActive = false;
+                InterlockedExchange(&g_vectorBArmed, 0);
+                return false;
+            }
+            if (InterlockedCompareExchange(&g_b2DeferredPending, 0, 1) != 1) {
+                Log("vectorB: TEST skip pending race");
+                return false;
+            }
+            bool ok = SafeOverwriteRTV(g_b2OutG, handles[i]);
+            if (ok) {
+                D3D12_RESOURCE_DESC d = {};
+                SafeGetDesc(g_vectorBTestResource, &d);
+                g_vectorBTestFrames++;
+                if (g_vectorBTestFrames == 1 || (g_vectorBTestFrames % 60) == 0) {
+                    Log("vectorB: TEST FRAME %u/%u handle=%llX resource=%p present=%llu ecl=%llu pending=%llu", g_vectorBTestFrames, g_vectorBTestTotal, (unsigned long long)handles[i].ptr, (void*)g_vectorBTestResource, presentSerial, eclSerial, (unsigned long long)g_b2DeferredVal);
+                }
+                if (shim && shim->omSetRenderTargets) shim->omSetRenderTargets(list, count, handles, singleRange, depth);
+                return true;
+            } else {
+                Log("vectorB: TEST STOP CreateRTV failed");
+                InterlockedExchange(&g_b2DeferredPending, 1);
+                g_vectorBTestActive = false;
+                InterlockedExchange(&g_vectorBArmed, 0);
+                return false;
+            }
+        }
+        return false;
+    }
+    if (presentSerial > 300 && g_b2DeferredPending && pending != 0 && completed >= pending) {
+        ID3D12Resource* bestRes = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE bestHandle = {};
+        unsigned bestSamples = 0;
+        {
+            AcquireSRWLockShared(&g_sceneColorCandidateLock);
+            for (auto &c : g_sceneColorCandidates) {
+                if (!c.resource || c.width != g_displayW || c.height != g_displayH) continue;
+                if (c.samples < 1) continue;
+                if (c.resource == (void*)g_bbCached) continue;
+                BookGuard guard;
+                for (auto &kv : g_rtvMap) {
+                    if (kv.second == (ID3D12Resource*)c.resource) {
+                        bestRes = (ID3D12Resource*)c.resource;
+                        bestHandle.ptr = kv.first;
+                        bestSamples = c.samples;
+                        break;
+                    }
+                }
+                if (bestRes) break;
+            }
+            ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+        }
+        // Use actual OM resource that matches tracked display resource (resource identity authoritative, format 10/11 both accepted)
+        ID3D12Resource* omMatchedRes = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE omMatchedHandle = {};
+        unsigned omMatchedSamples = 0;
+        for (UINT i2 = 0; i2 < count && i2 < 8; ++i2) {
+            if (!handles[i2].ptr) continue;
+            ID3D12Resource* resCheck2 = nullptr;
+            {
+                BookGuard guard2;
+                auto it2 = g_rtvMap.find(handles[i2].ptr);
+                if (it2 != g_rtvMap.end()) resCheck2 = it2->second;
+                else {
+                    auto it3 = g_displayRTVMap.find(handles[i2].ptr);
+                    if (it3 != g_displayRTVMap.end()) resCheck2 = it3->second;
+                }
+            }
+            if (!resCheck2) continue;
+            D3D12_RESOURCE_DESC d2 = {};
+            if (!SafeGetDesc(resCheck2, &d2)) continue;
+            bool isDisplay2 = d2.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d2.Width == g_displayW && d2.Height == g_displayH && (d2.Format == DXGI_FORMAT_R16G16B16A16_UNORM || d2.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (!isDisplay2) continue;
+            unsigned samples2 = 0;
+            AcquireSRWLockShared(&g_sceneColorCandidateLock);
+            for (auto &c2 : g_sceneColorCandidates) {
+                if (c2.resource == (void*)resCheck2 && c2.width == g_displayW && c2.height == g_displayH) { samples2 = c2.samples; break; }
+            }
+            ReleaseSRWLockShared(&g_sceneColorCandidateLock);
+            if (samples2 < 1) {
+                for (unsigned h2 = 0; h2 < 8; ++h2) {
+                    if (g_displayRTVHistory[h2].resource == resCheck2) { samples2 = 1; break; }
+                }
+            }
+            if (samples2 < 1) continue;
+            if (resCheck2 == g_bbCached) continue;
+            omMatchedRes = resCheck2;
+            omMatchedHandle = handles[i2];
+            omMatchedSamples = samples2;
+            break;
+        }
+        if (!omMatchedRes) {
+            // No OM in this call matches a tracked display resource — keep armed for later OM if any bestRes exists
+            if (bestRes && !g_vectorBArmed) {
+                if (!g_vectorBArmed) {
+                    g_vectorBArmedRes = bestRes;
+                    g_vectorBArmedHandle = bestHandle;
+                    g_vectorBArmedSamples = bestSamples;
+                    g_vectorBArmedPending = pending;
+                    InterlockedExchange(&g_vectorBArmed, 1);
+                    Log("vectorB: armed handle=%llX resource=%p size=%ux%u fmt=%u samples=%u present=%llu pending=%llu completed=%llu", (unsigned long long)bestHandle.ptr, (void*)bestRes, g_displayW, g_displayH, 11, bestSamples, presentSerial, (unsigned long long)pending, (unsigned long long)completed);
+                }
+            } else {
+                Log("vectorB: omMatched found handle=%llX resource=%p present=%llu", (unsigned long long)omMatchedHandle.ptr, (void*)omMatchedRes, presentSerial);
+                // omRes == tracked display resource is authoritative — start test for this exact OM resource, not bestRes
+                if (!g_vectorBTestActive && omMatchedHandle.ptr != 0 && omMatchedRes) {
+                    g_vectorBTestActive = true;
+                    g_vectorBTestFrames = 0;
+                    g_vectorBTestStartPresent = presentSerial;
+                    g_vectorBTestHandle = omMatchedHandle;
+                    g_vectorBTestResource = omMatchedRes;
+                    D3D12_CPU_DESCRIPTOR_HANDLE creationHandle2 = {};
+                    unsigned long long creationPresent2 = 0;
+                    for (unsigned h = 0; h < 8; ++h) {
+                        if (g_displayRTVHistory[h].resource == omMatchedRes) { creationHandle2 = g_displayRTVHistory[h].handle; creationPresent2 = g_displayRTVHistory[h].present; break; }
+                    }
+                    if (!creationHandle2.ptr) { creationHandle2 = omMatchedHandle; creationPresent2 = presentSerial; }
+                    bool recycled2 = creationHandle2.ptr != omMatchedHandle.ptr && creationHandle2.ptr != 0;
+                    Log("vectorB: TEST START reason=OM_RESOURCE_MATCH handle=%llX resource=%p creationHandle=%llX creationRes=%p creationPresent=%llu omPresent=%llu ecl=%llu size=%ux%u fmt=%u samples=%u pending=%llu completed=%llu recycled=%u", (unsigned long long)omMatchedHandle.ptr, (void*)omMatchedRes, (unsigned long long)creationHandle2.ptr, (void*)omMatchedRes, creationPresent2, presentSerial, eclSerial, g_displayW, g_displayH, 11, omMatchedSamples, (unsigned long long)pending, (unsigned long long)completed, recycled2 ? 1u : 0u);
+                    g_vectorBArmedRes = omMatchedRes;
+                    g_vectorBArmedHandle = omMatchedHandle;
+                    g_vectorBArmedSamples = omMatchedSamples;
+                    g_vectorBArmedPending = pending;
+                    InterlockedExchange(&g_vectorBArmed, 1);
+                }
+            }
+        }
+    }
+    if (g_vectorBArmed && presentSerial > 300) {
+        for (UINT i = 0; i < count && i < 8; ++i) {
+            if (!handles[i].ptr) continue;
+            if (handles[i].ptr != g_vectorBArmedHandle.ptr) continue;
+            Log("vectorB: armed-match handle=%llX resource=%p samples=%u present=%llu ecl=%llu pending=%llu completed=%llu", (unsigned long long)handles[i].ptr, (void*)g_vectorBArmedRes, g_vectorBArmedSamples, presentSerial, eclSerial, (unsigned long long)g_vectorBArmedPending, (unsigned long long)SafeGetFenceCompleted(g_b2FenceOutG));
+            if (InterlockedCompareExchange(&g_vectorBOneShot, 0, 1) != 0) {
+                Log("vectorB: skipped one-shot already consumed");
+                return false;
+            }
+            if (!g_b2DeferredPending || g_vectorBArmedPending != g_b2DeferredVal || SafeGetFenceCompleted(g_b2FenceOutG) < g_b2DeferredVal) {
+                Log("vectorB: skipped fence not ready at match");
+                InterlockedExchange(&g_vectorBOneShot, 0);
+                return false;
+            }
+            if (InterlockedCompareExchange(&g_b2DeferredPending, 0, 1) != 1) {
+                Log("vectorB: skipped pending race at match");
+                InterlockedExchange(&g_vectorBOneShot, 0);
+                return false;
+            }
+            bool ok = SafeOverwriteRTV(g_b2OutG, handles[i]);
+            if (ok) {
+                D3D12_RESOURCE_DESC d = {};
+                SafeGetDesc(g_vectorBArmedRes, &d);
+                Log("vectorB: substituted handle=%llX origRes=%p size=%ux%u fmt=%u present=%llu ecl=%llu pending=%llu repl=%p", (unsigned long long)handles[i].ptr, (void*)g_vectorBArmedRes, (unsigned)d.Width, (unsigned)d.Height, (unsigned)d.Format, presentSerial, eclSerial, (unsigned long long)g_vectorBArmedPending, (void*)g_b2OutG);
+                if (shim && shim->omSetRenderTargets) shim->omSetRenderTargets(list, count, handles, singleRange, depth);
+                InterlockedExchange(&g_vectorBArmed, 0);
+                return true;
+            } else {
+                Log("vectorB: skipped CreateRTV failed at match handle=%llX", (unsigned long long)handles[i].ptr);
+                InterlockedExchange(&g_b2DeferredPending, 1);
+                InterlockedExchange(&g_vectorBOneShot, 0);
+                InterlockedExchange(&g_vectorBArmed, 0);
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 
 static bool B2StartHelper()
 {
     if (!g_b2UseHelper) return false;
     if (g_b2Pipe) return true;
-    B2KillOrphans(); // stale helpers hold the pipe name -> ERROR_PIPE_BUSY
-
     wchar_t self[MAX_PATH] = {};
     HMODULE mod = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1918,30 +3259,39 @@ static bool B2StartHelper()
     }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-    g_b2Pipe = CreateNamedPipeA("\\\\.\\pipe\\ScaleNG_NGX",
+    char pipeName[128] = {};
+    // Include a launch nonce. A PID-only endpoint can remain occupied by a
+    // stale server instance or collide with a second module instance during
+    // renderer restart, producing ERROR_PIPE_BUSY forever.
+    _snprintf_s(pipeName, _TRUNCATE, "\\\\.\\pipe\\ScaleNG_NGX_%lu_%lu",
+                GetCurrentProcessId(), GetTickCount());
+    g_b2Pipe = CreateNamedPipeA(pipeName,
         PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1, sizeof(unsigned long long) * 8, sizeof(unsigned long long) * 8, 0, &sa);
     if (g_b2Pipe == INVALID_HANDLE_VALUE) {
         Log("ngx-b2: CreateNamedPipe FAILED err=%lu", GetLastError());
-        g_b2Pipe = nullptr; g_b2UseHelper = false;
+        // Helper mode is an explicit safety requirement for BeamNG's wrapped
+        // device. Keep it enabled so a transient endpoint collision cannot
+        // send the frame into the incompatible in-process fallback.
+        g_b2Pipe = nullptr;
         return false;
     }
 
     wchar_t cmd[MAX_PATH * 2];
-    _snwprintf_s(cmd, _TRUNCATE, L"\"%ls\" %lu", exe, GetCurrentProcessId());
+    _snwprintf_s(cmd, _TRUNCATE, L"\"%ls\" %hs %lu", exe, pipeName, GetCurrentProcessId());
     PROCESS_INFORMATION pi = {};
     STARTUPINFOW si = {}; si.cb = sizeof(si);
     if (!CreateProcessW(exe, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         Log("ngx-b2: spawn FAILED err=%lu", GetLastError());
-        CloseHandle(g_b2Pipe); g_b2Pipe = nullptr; g_b2UseHelper = false;
+        CloseHandle(g_b2Pipe); g_b2Pipe = nullptr;
         return false;
     }
     g_b2Helper = pi.hProcess; CloseHandle(pi.hThread);
 
     if (!ConnectNamedPipe(g_b2Pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) {
         Log("ngx-b2: ConnectNamedPipe FAILED err=%lu", GetLastError());
-        B2KillHelper(); g_b2UseHelper = false;
+        B2KillHelper();
         return false;
     }
 
@@ -1952,13 +3302,14 @@ static bool B2StartHelper()
         !ReadFile(g_b2Pipe, ack, sizeof(ack), &rd, nullptr) ||
         ack[0] != 0x58474E48) {
         Log("ngx-b2: handshake FAILED (ack=%08X)", ack[0]);
-        B2KillHelper(); g_b2UseHelper = false;
+        B2KillHelper();
         return false;
     }
-    Log("ngx-b2: helper connected pid=%lu", GetProcessId(g_b2Helper));
+Log("ngx-b2: helper connected pid=%lu", GetProcessId(g_b2Helper));
     return true;
 }
 
+#pragma pack(push, 1)
 struct B2SetupMsg {
     unsigned long long hColor, hOut, hFIn, hFOut;
     unsigned int w, h, fmt;
@@ -1966,10 +3317,69 @@ struct B2SetupMsg {
     unsigned long long startVal = 0; // epoch-sync for helper fence loop
 };
 static_assert(sizeof(B2SetupMsg) == 56, "B2SetupMsg size mismatch - must be 56 bytes");
+#pragma pack(pop)
 
 static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
 {
+    AcquireSRWLockExclusive(&g_b2PipeLock);
+    struct PipeUnlock { SRWLOCK* lock; ~PipeUnlock() { ReleaseSRWLockExclusive(lock); } } pipeUnlock{ &g_b2PipeLock };
     if (!B2StartHelper()) return false;
+
+    // A resize setup message must not overtake the acknowledgement for the
+    // one frame currently in flight. The pipe is byte-oriented; if setup is
+    // sent first, its four-byte response can consume the first four bytes of
+    // a pending frame acknowledgement and permanently desynchronize the
+    // protocol. Wait only for this single outstanding frame, never for a
+    // backlog (the frame path enforces one-frame backpressure).
+    {
+        const DWORD deadline = GetTickCount() + 5000;
+        for (;;) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(g_b2Pipe, nullptr, 0, nullptr, &avail, nullptr))
+                return false;
+            if (avail >= sizeof(B2FrameAck)) {
+                B2FrameAck pendingAck = {};
+                DWORD got = 0;
+                if (!ReadFile(g_b2Pipe, &pendingAck, sizeof(pendingAck), &got, nullptr) ||
+                    got != sizeof(pendingAck)) return false;
+                if (g_b2FramePending && pendingAck.value == g_b2PendingValue)
+                    g_b2FramePending = false;
+                else if (pendingAck.value != g_b2PendingValue)
+                    Log("ngx-b2: resize drained unexpected ack v=%llu expected=%llu",
+                        (unsigned long long)pendingAck.value,
+                        (unsigned long long)g_b2PendingValue);
+                // Drain every complete ACK already queued. This also covers
+                // a stale ACK left behind when the pending flag was cleared
+                // on a previous Present re-entry.
+                continue;
+            }
+            if (avail != 0) {
+                // A partial ACK must be completed before setup is written;
+                // otherwise the setup response can consume its remaining
+                // bytes and become a value such as 0x000005B9.
+                if (avail < sizeof(B2FrameAck)) {
+                    if ((LONG)(GetTickCount() - deadline) >= 0) return false;
+                    Sleep(1);
+                    continue;
+                }
+            }
+            if (g_b2Helper && WaitForSingleObject(g_b2Helper, 0) == WAIT_OBJECT_0)
+                return false;
+            if (g_b2FramePending) {
+                if ((LONG)(GetTickCount() - deadline) >= 0) {
+                    Log("ngx-b2: resize waited too long for frame ack v=%llu",
+                        (unsigned long long)g_b2PendingValue);
+                    return false;
+                }
+                Sleep(1);
+                continue;
+            }
+            if ((LONG)(GetTickCount() - deadline) >= 0) {
+                break;
+            }
+            break;
+        }
+    }
 
     auto dupInto = [](HANDLE nt, unsigned long long* outVal) -> bool {
         if (!nt) return false;
@@ -1979,7 +3389,6 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
         *outVal = (unsigned long long)(uintptr_t)val;
         return true;
     };
-    static unsigned long long s_fInVal = 0, s_fOutVal = 0;
     static bool s_valsLogged = false;
     B2SetupMsg m = {};
     if (!dupInto(g_b2HColor, &m.hColor) || !dupInto(g_b2HOut, &m.hOut)) {
@@ -1987,12 +3396,12 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
         return false;
     }
     // Fences persist across resizes: duplicate ONCE, reuse values after.
-    if (s_fInVal && s_fOutVal) {
-        m.hFIn = s_fInVal; m.hFOut = s_fOutVal;
+    if (g_b2FInDup && g_b2FOutDup) {
+        m.hFIn = g_b2FInDup; m.hFOut = g_b2FOutDup;
     } else if (!dupInto(g_b2HFIn, &m.hFIn) || !dupInto(g_b2HFOut, &m.hFOut)) {
         Log("ngx-b2: DuplicateHandle(fences) FAILED err=%lu", GetLastError());
         return false;
-    } else { s_fInVal = m.hFIn; s_fOutVal = m.hFOut; }
+    } else { g_b2FInDup = m.hFIn; g_b2FOutDup = m.hFOut; }
     m.w = w; m.h = h; m.fmt = (unsigned)fmt;
     m.startVal = g_b2Val + 1; // next frame index helper should expect
     const char tagS = 0x53; // 'S'
@@ -2000,7 +3409,28 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     if (!WriteFile(g_b2Pipe, &tagS, 1, &wa, nullptr) ||
         !WriteFile(g_b2Pipe, &m, sizeof(m), &wb, nullptr)) return false;
     unsigned int resp = 0;
-    if (!ReadFile(g_b2Pipe, &resp, sizeof(resp), &rd, nullptr) || resp != 0x59414B4F) {
+    // Never let a broken/dead helper block the render thread during a resize.
+    // The helper acknowledges setup synchronously, so poll the byte count with
+    // a bounded deadline before doing the final read.
+    const DWORD deadline = GetTickCount() + 5000;
+    bool responseReady = false;
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(g_b2Pipe, nullptr, 0, nullptr, &avail, nullptr))
+            break;
+        if (avail >= sizeof(resp)) {
+            responseReady = true;
+            break;
+        }
+        if (g_b2Helper && WaitForSingleObject(g_b2Helper, 0) == WAIT_OBJECT_0)
+            break;
+        if ((LONG)(GetTickCount() - deadline) >= 0) {
+            Log("ngx-b2: setup acknowledgement timeout");
+            break;
+        }
+        Sleep(1);
+    }
+    if (!responseReady || !ReadFile(g_b2Pipe, &resp, sizeof(resp), &rd, nullptr) || resp != 0x59414B4F) {
         Log("ngx-b2: setup rejected by helper (%08X)", resp);
         return false;
     }
@@ -2105,8 +3535,9 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     // shared texture pair on GAME device -> opened on ours
     if (g_b2HColor) { CloseHandle(g_b2HColor); g_b2HColor = nullptr; }
     if (g_b2HOut)   { CloseHandle(g_b2HOut);   g_b2HOut = nullptr; }
-    if (g_b2HFIn)   { CloseHandle(g_b2HFIn);   g_b2HFIn = nullptr; }
-    if (g_b2HFOut)  { CloseHandle(g_b2HFOut);  g_b2HFOut = nullptr; }
+    // The source shared-fence handles belong to the persistent fences and must
+    // survive resize/setup retries. Only the per-helper duplicates are reset
+    // when the helper process is replaced (inside B2KillHelper).
     B2ReleasePair();
     {
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2158,8 +3589,14 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     if (g_b2UseHelper) {
         // CROSS-PROCESS MODE: helper owns device + NGX entirely.
         if (!B2SendSetup(w, h, fmt)) {
-            Log("ngx-b2: helper setup FAILED - disabling helper this session");
-            g_b2UseHelper = false;
+            // A setup failure can be transient (stale helper, deployment while
+            // the game is still running, or a helper startup race). Tear down
+            // the failed instance and keep helper mode enabled so the existing
+            // retry throttle can start a clean worker on a later frame. The old
+            // behavior permanently forced the unavailable local-device fallback
+            // after one failed attempt, making recovery impossible in-session.
+            Log("ngx-b2: helper setup FAILED - restarting helper on a later frame");
+            B2KillHelper();
             return false;
         }
         g_b2W = w; g_b2H = h; g_b2Fmt = fmt;
@@ -2204,6 +3641,14 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
 
 static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt)
 {
+    if (!TryAcquireSRWLockExclusive(&g_b2FrameLock)) {
+        static unsigned s_busySkips = 0;
+        if ((++s_busySkips % 120) == 1)
+            Log("ngx-b2: frame skipped - bridge transaction already active");
+        return;
+    }
+    struct FrameUnlock { SRWLOCK* lock; ~FrameUnlock() { ReleaseSRWLockExclusive(lock); } } frameUnlock{ &g_b2FrameLock };
+
     if (!EnsureNgxBridgeB2(w, h, fmt)) return;
     if (!g_b2UseHelper) B2EnsureDummyInputs(w, h);
 
@@ -2211,7 +3656,6 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     UINT64 v = g_b2Val;
 
     static ID3D12CommandAllocator*    s_alA = nullptr; static ID3D12GraphicsCommandList* s_clA = nullptr;
-    static ID3D12CommandAllocator*    s_alB = nullptr; static ID3D12GraphicsCommandList* s_clB = nullptr;
     static ID3D12CommandQueue*        s_gq  = nullptr;
     static bool        s_gqTried = false;
     if (!s_gq && !s_gqTried) {
@@ -2235,13 +3679,13 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
         s_listsTried = true;
         if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_alA))) ||
             FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alA, nullptr, IID_PPV_ARGS(&s_clA))) ||
-            FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_alB))) ||
-            FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_alB, nullptr, IID_PPV_ARGS(&s_clB)))) {
+            FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_b2CopyAlloc))) ||
+            FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_b2CopyAlloc, nullptr, IID_PPV_ARGS(&g_b2CopyList)))) {
             Log("ngx-b2: alloc/list creation FAILED");
             s_gq = nullptr;
             return;
         }
-        s_clA->Close(); s_clB->Close();
+        s_clA->Close(); g_b2CopyList->Close();
     }
 
     // STAGE 1 (game): bb -> sharedColor ; signal fIn
@@ -2267,32 +3711,87 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
     // signals fOut, then acks. We never read fence values cross-process.
     bool helperAcked = false;
     if (g_b2UseHelper && g_b2Pipe) {
+        AcquireSRWLockExclusive(&g_b2PipeLock);
+        struct PipeUnlock { SRWLOCK* lock; ~PipeUnlock() { ReleaseSRWLockExclusive(lock); } } pipeUnlock{ &g_b2PipeLock };
         static unsigned s_wDiag = 0;
-        const char tagF = 0x46; // 'F'
-        DWORD wa = 0, wb = 0;
-        bool wrOK = WriteFile(g_b2Pipe, &tagF, 1, &wa, nullptr) &&
-                    WriteFile(g_b2Pipe, &v, sizeof(v), &wb, nullptr);
-        if (++s_wDiag <= 3)
-            Log("ngx-b2: frame msg write v=%llu ok=%d err=%lu",
-                (unsigned long long)v, (int)wrOK, wrOK ? 0UL : GetLastError());
-        unsigned long long ack = 0;
+        B2FrameAck ack = {};
         DWORD rd = 0, have = 0;
-        for (int spin = 0; spin < 250 && have < sizeof(ack); ++spin) {
+
+        // Drain the one acknowledgement that may already be queued. The
+        // helper can take longer than one frame during NGX initialization, so
+        // this must remain non-blocking.
+        for (int spin = 0; spin < 2 && have < sizeof(ack); ++spin) {
             if (!PeekNamedPipe(g_b2Pipe, nullptr, 0, nullptr, &rd, nullptr)) break;
-            if (rd > have) {
-                DWORD want = sizeof(ack) - have;
+            if (rd) {
+                DWORD want = rd;
+                if (want > sizeof(ack) - have) want = sizeof(ack) - have;
                 if (!ReadFile(g_b2Pipe, ((BYTE*)&ack) + have, want, &rd, nullptr)) break;
                 have += rd;
                 if (have >= sizeof(ack)) break;
             }
-            Sleep(1);
         }
-        if (have == sizeof(ack) && ack == v)
-            helperAcked = true;
+if (have == sizeof(ack) && ack.value == g_b2PendingValue) {
+            g_b2FramePending = false;
+            // The ACK is for the pending frame (g_b2PendingValue). Its recorded
+            // status tells us whether NGX produced a valid result for that frame.
+            // Do NOT compare with current frame v - the ACK arrives one frame late.
+            helperAcked = (ack.recorded != 0);
+            if (ack.recorded && g_b2DeferredOutput) {
+                g_b2DeferredVal = ack.value;
+                InterlockedExchange(&g_b2DeferredPending, 1);
+                static unsigned s_deferredAcks = 0;
+                if (++s_deferredAcks <= 5 || (s_deferredAcks % 600) == 0)
+                    Log("ngx-b2: helper acknowledged v=%llu; deferred output armed",
+                        (unsigned long long)ack.value);
+                if (s_deferredAcks <= 5 || (s_deferredAcks % 600) == 0)
+                    LogNativeCorrelation("helper-ack", (unsigned long long)ack.value);
+            }
+            if (!ack.recorded) {
+                Log("ngx-b2: helper acknowledged v=%llu but NGX rejected the frame", (unsigned long long)ack.value);
+                static unsigned s_rejectCorrelation = 0;
+                if (++s_rejectCorrelation <= 3 || (s_rejectCorrelation % 600) == 0)
+                    LogNativeCorrelation("helper-reject", (unsigned long long)ack.value);
+            }
+        } else if (have == sizeof(ack) && ack.value != g_b2PendingValue) {
+            Log("ngx-b2: helper acknowledgement out of sequence (got=%llu expected=%llu)",
+                (unsigned long long)ack.value, (unsigned long long)g_b2PendingValue);
+        }
+
+        // Apply backpressure. Without this guard the ASI can enqueue thousands
+        // of frame messages while NGX is still evaluating the first one. A
+        // later resize setup then sits behind that backlog and appears to
+        // freeze the game while waiting for its setup acknowledgement.
+        if (!g_b2FramePending) {
+            const char tagF = 0x46; // 'F'
+            DWORD wa = 0, wb = 0;
+            bool wrOK = WriteFile(g_b2Pipe, &tagF, 1, &wa, nullptr) &&
+                        WriteFile(g_b2Pipe, &v, sizeof(v), &wb, nullptr);
+            if (++s_wDiag <= 3)
+                Log("ngx-b2: frame msg write v=%llu ok=%d err=%lu",
+                    (unsigned long long)v, (int)wrOK, wrOK ? 0UL : GetLastError());
+            if (!wrOK) {
+                Log("ngx-b2: helper pipe write failed at v=%llu", (unsigned long long)v);
+                B2KillHelper();
+                g_b2Ready = false;
+            } else {
+                g_b2FramePending = true;
+                g_b2PendingValue = v;
+            }
+        } else {
+            static unsigned s_ackWaitDiag = 0;
+            if ((++s_ackWaitDiag % 120) == 1)
+                Log("ngx-b2: helper busy at v=%llu; frame skipped (pending=%llu)",
+                    (unsigned long long)v, (unsigned long long)g_b2PendingValue);
+        }
+
     }
 
     // STAGE 3 (game): only blit when helper CONFIRMED fOut signal enqueue.
-    bool recorded = false;
+    // The helper does not return a command-list recording result to this
+    // process; its acknowledgement means it enqueued the fence signal after
+    // its NGX attempt.  Treat that acknowledgement as the successful stage-2
+    // result so stage 3 can wait for and copy the helper's output.
+    bool recorded = helperAcked;
     if (!g_b2UseHelper) {
         // LOCAL-MODE fallback: evaluate on our own clean device.
         if (g_b2Q && SUCCEEDED(g_b2List->Reset(g_b2Alloc, nullptr))) {
@@ -2314,40 +3813,181 @@ static void NgxBridgeFrameB2(ID3D12Resource* bb, UINT w, UINT h, DXGI_FORMAT fmt
         }
     }
 
-    if (!recorded) {
-        // Helper didn't ack (or local failed): skip blit, bb untouched.
-        static unsigned s_skips = 0;
-        if ((++s_skips % 120) == 1)
-            Log("ngx-b2: frame %llu skipped (no ack/eval) x%u",
-                (unsigned long long)v, s_skips);
+if (!recorded) {
+        // Helper didn't ack for the previous frame yet. In deferred output
+        // mode this is normal - the previous frame's deferred output was
+        // already armed when its ACK arrived. Skip stage-3 copy (not needed
+        // in deferred mode) and let the engine copy hook consume the output.
+        if (g_b2DeferredOutput && g_b2DeferredPending) {
+            static unsigned s_deferredFrames = 0;
+            if ((++s_deferredFrames % 120) == 1)
+                Log("ngx-b2: frame %llu deferred (pending=%llu)",
+                    (unsigned long long)v, (unsigned long long)g_b2DeferredVal);
+        } else {
+            static unsigned s_skips = 0;
+            if ((++s_skips % 120) == 1)
+                Log("ngx-b2: frame %llu skipped (no ack/eval) x%u",
+                    (unsigned long long)v, s_skips);
+        }
         bb->Release();
         return;
     }
-    // GPU-side ordering vs helper's writes is safe now: the ack proves the
-    // Signal(fOut,v) was ENQUEUED on the helper queue before we submit this.
-    s_gq->Wait(g_b2FenceOutG, v);
-    s_clB->Reset(s_alB, nullptr);
+    // The helper acknowledgement only proves that its Signal was enqueued.
+    // Calling ID3D12CommandQueue::Wait on the game's queue from inside its
+    // Present callback is unsafe on this renderer and caused an immediate
+    // black-window crash after the first successful NGX frame.  Complete the
+    // shared fence on the CPU first, then submit the copy with no cross-queue
+    // GPU wait while Present is active.
+    static HANDLE s_outEvent = nullptr;
+    if (!s_outEvent) s_outEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!s_outEvent || FAILED(g_b2FenceOutG->SetEventOnCompletion(v, s_outEvent)) ||
+        WaitForSingleObject(s_outEvent, 5000) != WAIT_OBJECT_0) {
+        static unsigned s_waitFails = 0;
+        if ((++s_waitFails % 60) == 1)
+            Log("ngx-b2: frame %llu skipped (helper fence wait failed)", (unsigned long long)v);
+        bb->Release();
+        return;
+    }
+    // Evaluation is useful for validating the helper/NGX path, but copying
+    // the cross-process output into BeamNG's wrapped backbuffer is currently
+    // the only operation that still causes the game to terminate. Keep this
+    // gate configurable so the helper can run in evaluation-only mode while
+    // the game remains on its native presentation path.
+if (!g_b2ReplaceOutput) {
+        if (g_b2DeferredOutput && recorded) {
+            // Deferred output was already armed when the previous frame's ACK
+            // arrived. Do not re-arm here with the current frame value.
+            static unsigned s_deferredArmedLog = 0;
+            if ((++s_deferredArmedLog % 600) == 1)
+                Log("ngx-b2: frame %llu eval=ok (deferred output already pending=%llu) queue=%p presentBb=%p fenceDone=%llu",
+                    (unsigned long long)v, (unsigned long long)g_b2DeferredVal,
+                (void*)g_graphicsQueue, (void*)g_b2PresentBb,
+                    (unsigned long long)(g_b2FenceOutG ? g_b2FenceOutG->GetCompletedValue() : 0));
+        }
+        static unsigned s_evalOnly = 0;
+        if (!g_b2DeferredOutput && (++s_evalOnly <= 5 || (s_evalOnly % 600) == 0))
+            Log("ngx-b2: frame %llu eval=ok (output replacement disabled)",
+                (unsigned long long)v);
+        bb->Release();
+        return;
+    }
+    g_b2CopyList->Reset(g_b2CopyAlloc, nullptr);
     D3D12_RESOURCE_BARRIER b3 = {};
     b3.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b3.Transition.pResource = bb;
     b3.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b3.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     b3.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    s_clB->ResourceBarrier(1, &b3);
+    g_b2CopyList->ResourceBarrier(1, &b3);
     D3D12_TEXTURE_COPY_LOCATION d3 = { bb,       D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
     D3D12_TEXTURE_COPY_LOCATION s3 = { g_b2OutG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-    s_clB->CopyTextureRegion(&d3, 0, 0, 0, &s3, nullptr);
+    g_b2CopyList->CopyTextureRegion(&d3, 0, 0, 0, &s3, nullptr);
     b3.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b3.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    s_clB->ResourceBarrier(1, &b3);
-    s_clB->Close();
-    ID3D12CommandList* l3[] = { s_clB };
+    g_b2CopyList->ResourceBarrier(1, &b3);
+    g_b2CopyList->Close();
+    ID3D12CommandList* l3[] = { g_b2CopyList };
     s_gq->ExecuteCommandLists(1, l3);
 
     static unsigned s_brFrames = 0;
     if (++s_brFrames <= 5 || (s_brFrames % 600) == 0)
         Log("ngx-b2: frame %u eval=%s", s_brFrames, recorded ? "ok" : "SKIP");
+    bb->Release();
 }
+void TryQueueOutputCopy(ID3D12CommandQueue* queue)
+{
+    if (!g_b2QueueCopy || !queue || queue != g_graphicsQueue ||
+        !g_b2Ready || !g_b2DeferredOutput || !g_b2PresentBb ||
+        !g_b2OutG || !g_b2FenceOutG || !g_b2CopyAlloc || !g_b2CopyList)
+        return;
+
+    // Never touch the swapchain during render-graph construction. The first
+    // queue-copy attempt happened during startup and crashed immediately after
+    // the first Present. Require a warmed-up Present stream before arming.
+    const unsigned long long presentSerial =
+        (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    if (presentSerial < 300) {
+        static unsigned s_warmupLog = 0;
+        if (++s_warmupLog == 1)
+            Log("ngx-b2: queue copy held for Present warmup (serial=%llu)", presentSerial);
+        return;
+    }
+
+    const UINT64 pending = g_b2DeferredVal;
+    if (!pending)
+        return;
+    if (g_device && g_device->GetDeviceRemovedReason() != S_OK) {
+        Log("ngx-b2: queue copy disabled - game device removed");
+        g_b2QueueCopy = false;
+        return;
+    }
+    const UINT64 completed = g_b2FenceOutG->GetCompletedValue();
+    if (completed == UINT64_MAX) {
+        Log("ngx-b2: queue copy disabled - invalid output fence completion UINT64_MAX");
+        g_b2QueueCopy = false;
+        return;
+    }
+    if (completed < pending)
+        return;
+    if (InterlockedCompareExchange(&g_b2DeferredPending, 0, 1) != 1)
+        return;
+
+    D3D12_RESOURCE_DESC outDesc = g_b2OutG->GetDesc();
+    D3D12_RESOURCE_DESC bbDesc = g_b2PresentBb->GetDesc();
+    if (outDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        bbDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        outDesc.Width != bbDesc.Width || outDesc.Height != bbDesc.Height ||
+        outDesc.Format != bbDesc.Format) {
+        Log("ngx-b2: queue copy rejected shape out=%llux%u fmt=%u bb=%llux%u fmt=%u present=%llu",
+            (unsigned long long)outDesc.Width, (unsigned)outDesc.Height,
+            (unsigned)outDesc.Format, (unsigned long long)bbDesc.Width,
+            (unsigned)bbDesc.Height, (unsigned)bbDesc.Format, presentSerial);
+        InterlockedExchange(&g_b2DeferredPending, 1);
+        return;
+    }
+
+    HRESULT whr = queue->Wait(g_b2FenceOutG, pending);
+    HRESULT rhr = whr;
+    if (SUCCEEDED(whr)) rhr = g_b2CopyAlloc->Reset();
+    if (SUCCEEDED(rhr)) rhr = g_b2CopyList->Reset(g_b2CopyAlloc, nullptr);
+    if (SUCCEEDED(rhr)) {
+        D3D12_RESOURCE_BARRIER b[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        b[0].Transition.pResource = g_b2OutG;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1].Transition.pResource = g_b2PresentBb;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_b2CopyList->ResourceBarrier(2, b);
+        D3D12_TEXTURE_COPY_LOCATION dst = { g_b2PresentBb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        D3D12_TEXTURE_COPY_LOCATION src = { g_b2OutG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        g_b2CopyList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        g_b2CopyList->ResourceBarrier(2, b);
+        rhr = g_b2CopyList->Close();
+    }
+    if (SUCCEEDED(rhr)) {
+        ID3D12CommandList* lists[] = { g_b2CopyList };
+        queue->ExecuteCommandLists(1, lists);
+        static unsigned s_queueCopies = 0;
+        if (++s_queueCopies <= 5 || (s_queueCopies % 600) == 0)
+            Log("ngx-b2: QUEUE COPY submitted #%u frame=%u fence=%llu queue=%p bb=%p",
+                s_queueCopies, g_frameCounter, (unsigned long long)pending,
+                (void*)queue, (void*)g_b2PresentBb);
+    } else {
+        Log("ngx-b2: queue copy failed hr=0x%08X wait=0x%08X fence=%llu",
+            (unsigned)rhr, (unsigned)whr, (unsigned long long)pending);
+        InterlockedExchange(&g_b2DeferredPending, 1);
+    }
+}
+
 static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandList* cmdList,
                                       ID3D12CommandQueue* queue)
 {
@@ -2368,6 +4008,19 @@ static void NgxSelfContainedPipeline(IDXGISwapChain* sc, ID3D12GraphicsCommandLi
         return;
     }
     static int s_bbLogs = 0; if (++s_bbLogs <= 3) Log("ngx-pipe: bb=%p", (void*)bb);
+    g_b2PresentBb = bb; // weak identity used by deferred output handoff
+    {
+        static unsigned s_b2BbDiag = 0;
+        if (++s_b2BbDiag <= 5 || (s_b2BbDiag % 600) == 0) {
+            D3D12_RESOURCE_DESC bd = bb->GetDesc();
+            Log("ngx-b2: Present backbuffer #%u bb=%p size=%ux%u fmt=%u frame=%u queue=%p ready=%d pending=%d",
+                s_b2BbDiag, (void*)bb, (unsigned)bd.Width, (unsigned)bd.Height,
+                (unsigned)bd.Format, g_frameCounter, (void*)g_graphicsQueue,
+                g_b2Ready ? 1 : 0, (int)g_b2DeferredPending);
+            LogNativeCorrelation("present",
+                (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+        }
+    }
 
     D3D12_RESOURCE_DESC bbd = {};
     __try {
@@ -3268,6 +4921,34 @@ static bool g_scanDone = false;
 
 static bool g_inPresent = false;
 static void* s_presentExAddr = nullptr;
+static IDXGISwapChain* g_startupCandidate = nullptr;
+static unsigned g_startupCandidatePresents = 0;
+static IDXGISwapChain* g_startupCandidates[16] = {};
+static unsigned g_startupCandidateCounts[16] = {};
+
+// BeamNG creates several probe/UI/renderer swapchains before the display
+// swapchain is stable. Do not touch a candidate's backbuffer or device until
+// the same object has presented repeatedly; probing transient surfaces here
+// can stall startup or leave the game with no visible window.
+static bool ObserveStableSwapchain(IDXGISwapChain* sc)
+{
+    if (!sc || sc == g_egshDummySC) return false;
+    int slot = -1;
+    for (int i = 0; i < 16; ++i) {
+        if (g_startupCandidates[i] == sc) { slot = i; break; }
+        if (slot < 0 && !g_startupCandidates[i]) slot = i;
+    }
+    if (slot < 0) return false;
+    if (!g_startupCandidates[slot]) {
+        g_startupCandidates[slot] = sc;
+        g_startupCandidateCounts[slot] = 0;
+        Log("hooks: swapchain candidate %p observed (stabilizing)", (void*)sc);
+    }
+    if (g_startupCandidateCounts[slot] < 8) ++g_startupCandidateCounts[slot];
+    g_startupCandidate = sc;
+    g_startupCandidatePresents = g_startupCandidateCounts[slot];
+    return g_startupCandidateCounts[slot] >= 8;
+}
 
 static void LogPresentGuardDetails(void* exAddr)
 {
@@ -3322,7 +5003,8 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
                     }
                 }
             }
-            if (sc != g_swapchain) {
+            bool stableSwapchain = ObserveStableSwapchain((IDXGISwapChain*)sc);
+            if (stableSwapchain && sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
                 // COMMIT A: capture and log ALL swapchain-derived identities
@@ -3383,7 +5065,7 @@ static HRESULT STDMETHODCALLTYPE PresentCore(IDXGISwapChain* sc, UINT syncInterv
             }
             // SELF-CONTAINED NGX PIPELINE: runs every frame from Present.
             // Gets device/queue/textures internally via swapchain.
-            if (g_dlaaMode && !g_passiveMode) {
+            if (stableSwapchain && g_dlaaMode && !g_passiveMode) {
                 __try {
                     NgxSelfContainedPipeline(sc, nullptr, nullptr);
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -3468,12 +5150,18 @@ static void LogInjectFault(unsigned code)
 
 HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UINT flags)
 {
+    const unsigned long long presentSerial =
+        (unsigned long long)InterlockedIncrement64(&g_presentSerial);
+    ObservePersistentSceneColor(presentSerial);
+    LogTopoSnapshot(presentSerial, g_b2PresentBb, g_b2OutG, g_b2Ready,
+                    (int)InterlockedCompareExchange(&g_b2DeferredPending, 0, 0));
     // Unconditional first-call proof: if THIS never logs, nothing on earth
     // is calling dxgi's public Present in this process.
     {
         static volatile LONG s_first = 0;
         if (InterlockedCompareExchange(&s_first, 1, 0) == 0)
-            Log("Hook_Present ENTER sc=%p sync=%u flags=%u", (void*)sc, syncInterval, flags);
+            Log("Hook_Present ENTER sc=%p sync=%u flags=%u serial=%llu",
+                (void*)sc, syncInterval, flags, presentSerial);
     }
     if (sc) {
         __try {
@@ -3486,13 +5174,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
                     g_topoLastSrc, g_topoLastFmt);
             }
             if (sc == g_egshDummySC) { /* EGSH self-test present: never adopt */ }
-            else if (sc != g_swapchain) {
+            bool stableSwapchain = ObserveStableSwapchain(sc);
+            if (stableSwapchain && sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
             // SELF-CONTAINED NGX PIPELINE ENTRY: the ECL hook is build-disabled,
             // so Present IS the per-frame driver.
-            if (g_dlaaMode && !g_passiveMode && g_swapchain) {
+            if (stableSwapchain && g_dlaaMode && !g_passiveMode && g_swapchain) {
                 __try {
                     InjectAtPresentImpl(nullptr);
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -3514,15 +5203,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
 HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT syncInterval, UINT flags,
     const DXGI_PRESENT_PARAMETERS* params)
 {
+    const unsigned long long presentSerial =
+        (unsigned long long)InterlockedIncrement64(&g_presentSerial);
+    ObservePersistentSceneColor(presentSerial);
     if (sc) {
         __try {
+            static unsigned s_present1Diag = 0;
+            if (++s_present1Diag <= 3)
+                Log("Hook_Present1 observed serial=%llu sc=%p", presentSerial, (void*)sc);
             if (sc == (IDXGISwapChain1*)g_egshDummySC) { /* EGSH self-test present */ }
-            else if (sc != g_swapchain) {
+            bool stableSwapchain = ObserveStableSwapchain((IDXGISwapChain*)sc);
+            if (stableSwapchain && sc != g_swapchain) {
                 g_swapchain = sc;
                 Log("hooks: present on real swapchain %p (format %d)", (void*)sc, (int)g_bbFormat);
             }
             // SELF-CONTAINED NGX PIPELINE ENTRY (Present1 variant)
-            if (g_dlaaMode && !g_passiveMode && g_swapchain) {
+            if (stableSwapchain && g_dlaaMode && !g_passiveMode && g_swapchain) {
                 __try {
                     InjectAtPresentImpl(nullptr);
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4352,6 +6048,174 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
                         const D3D12_BOX* srcBox)
 {
+    // Diagnostic: unconditional entry log to verify hook is called
+    {
+        static unsigned s_entryDiag = 0;
+        if ((++s_entryDiag % 600) == 1) {
+            Log("hooks: CopyTexBody called list=%p dst=%p src=%p deferredOutput=%d pending=%d",
+                (void*)list, (void*)dst, (void*)src, (int)g_b2DeferredOutput, (int)g_b2DeferredPending);
+        }
+    }
+    // Diagnostic: log entry when deferred output is pending
+    if (g_b2DeferredOutput) {
+        static unsigned s_entryDiag2 = 0;
+        if ((++s_entryDiag2 % 240) == 1) {
+            Log("hooks: CopyTexBody entry deferredOutput=%d pending=%d pendingVal=%llu",
+                (int)g_b2DeferredOutput, (int)g_b2DeferredPending, (unsigned long long)g_b2DeferredVal);
+        }
+    }
+    // Deferred output handoff: the helper has already finished NGX on the
+    // previous Present, but Present itself never submits a second list. When
+    // BeamNG records its normal full-frame copy into the current backbuffer,
+    // replace only that copy's source with the shared DLSS result. The copy,
+    // destination state, and queue submission remain part of BeamNG's list.
+    if (g_b2DeferredOutput && g_b2DeferredPending && list && dst && src &&
+        dst->pResource && src->pResource && dst->pResource == g_b2PresentBb &&
+        dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        dst->SubresourceIndex == 0 && src->SubresourceIndex == 0 &&
+        dstX == 0 && dstY == 0 && dstZ == 0 && g_b2OutG && g_b2FenceOutG) {
+        D3D12_RESOURCE_DESC od = {};
+        D3D12_RESOURCE_DESC dd = {};
+        D3D12_RESOURCE_DESC sd = {};
+        od = g_b2OutG->GetDesc();
+        dd = dst->pResource->GetDesc();
+        sd = src->pResource->GetDesc();
+        const UINT64 pending = g_b2DeferredVal;
+        const UINT copyW = srcBox ? (UINT)(srcBox->right - srcBox->left) : (UINT)sd.Width;
+        const UINT copyH = srcBox ? (UINT)(srcBox->bottom - srcBox->top) : (UINT)sd.Height;
+        if (od.Width == dd.Width && od.Height == dd.Height &&
+            od.Format == dd.Format && sd.Width == dd.Width && sd.Height == dd.Height &&
+            copyW == (UINT)dd.Width && copyH == (UINT)dd.Height &&
+            g_b2FenceOutG->GetCompletedValue() >= pending &&
+            InterlockedCompareExchange(&g_b2DeferredPending, 0, 1) == 1) {
+            D3D12_TEXTURE_COPY_LOCATION replacement = { g_b2OutG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = g_b2OutG;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            if (Real_ResourceBarrier) Real_ResourceBarrier(list, 1, &b);
+            if (Real_CopyTextureRegion) Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, &replacement, srcBox);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            if (Real_ResourceBarrier) Real_ResourceBarrier(list, 1, &b);
+            static unsigned s_deferredCopies = 0;
+            if (++s_deferredCopies <= 5 || (s_deferredCopies % 600) == 0)
+                Log("hooks: deferred DLSS output copied in engine list frame=%llu count=%u",
+                    (unsigned long long)pending, s_deferredCopies);
+            return;
+        }
+    }
+    // BeamNG may rotate or wrap the presentation resource between its engine
+    // copy and Present, so exact pointer identity is not always observable in
+    // this hook. Permit a tightly constrained full-frame candidate instead:
+    // matching active display dimensions/format, zero offset, complete source
+    // extent, and a completed helper fence. Never replace copies involving our
+    // bridge resources themselves.
+    if (g_b2DeferredOutput && g_b2DeferredPending && list && dst && src &&
+        dst->pResource && src->pResource &&
+        dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        dst->SubresourceIndex == 0 && src->SubresourceIndex == 0 &&
+        dstX == 0 && dstY == 0 && dstZ == 0 &&
+        dst->pResource != g_b2ColorG && dst->pResource != g_b2OutG &&
+        src->pResource != g_b2ColorG && src->pResource != g_b2OutG &&
+        g_b2OutG && g_b2FenceOutG) {
+        D3D12_RESOURCE_DESC od = g_b2OutG->GetDesc();
+        D3D12_RESOURCE_DESC dd = dst->pResource->GetDesc();
+        D3D12_RESOURCE_DESC sd = src->pResource->GetDesc();
+        const UINT copyW = srcBox ? (UINT)(srcBox->right - srcBox->left) : (UINT)sd.Width;
+        const UINT copyH = srcBox ? (UINT)(srcBox->bottom - srcBox->top) : (UINT)sd.Height;
+        const UINT64 pending = g_b2DeferredVal;
+        const bool fullFrame = dd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            dd.Width == od.Width && dd.Height == od.Height &&
+            sd.Width == dd.Width && sd.Height == dd.Height &&
+            dd.Format == od.Format && sd.Format == dd.Format &&
+            copyW == (UINT)dd.Width && copyH == (UINT)dd.Height &&
+            (g_b2W == 0 || dd.Width == g_b2W) && (g_b2H == 0 || dd.Height == g_b2H) &&
+            g_b2FenceOutG->GetCompletedValue() >= pending;
+        if (fullFrame && InterlockedCompareExchange(&g_b2DeferredPending, 0, 1) == 1) {
+            D3D12_TEXTURE_COPY_LOCATION replacement = { g_b2OutG, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = g_b2OutG;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            if (Real_ResourceBarrier) Real_ResourceBarrier(list, 1, &b);
+            if (Real_CopyTextureRegion) Real_CopyTextureRegion(list, dst, dstX, dstY, dstZ, &replacement, srcBox);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            if (Real_ResourceBarrier) Real_ResourceBarrier(list, 1, &b);
+            static unsigned s_candidateCopies = 0;
+            if (++s_candidateCopies <= 8 || (s_candidateCopies % 600) == 0)
+                Log("hooks: deferred DLSS candidate copied frame=%llu count=%u dst=%p src=%p fmt=%u size=%ux%u",
+                    (unsigned long long)pending, s_candidateCopies,
+                    (void*)dst->pResource, (void*)src->pResource,
+                    (unsigned)dd.Format, (unsigned)dd.Width, (unsigned)dd.Height);
+            return;
+        }
+    }
+// The deferred result is only substituted when the destination/source
+    // shape is proven safe. Record throttled near-misses so the next run can
+    // identify which BeamNG copy condition differs, without modifying the
+    // native command list.
+    if (g_b2DeferredOutput && g_b2DeferredPending && dst && src &&
+        dst->pResource && dst->pResource == g_b2PresentBb) {
+        static unsigned s_deferredNearMiss = 0;
+        if ((++s_deferredNearMiss % 300) == 1) {
+            UINT64 completed = g_b2FenceOutG ? g_b2FenceOutG->GetCompletedValue() : 0;
+            Log("hooks: deferred output near-miss dstType=%u srcType=%u dstSub=%u srcSub=%u xyz=%u/%u/%u pending=%llu completed=%llu src=%p dst=%p",
+                (unsigned)dst->Type, (unsigned)src->Type,
+                (unsigned)dst->SubresourceIndex, (unsigned)src->SubresourceIndex,
+                (unsigned)dstX, (unsigned)dstY, (unsigned)dstZ,
+                (unsigned long long)g_b2DeferredVal,
+                (unsigned long long)completed,
+                (void*)src->pResource, (void*)dst->pResource);
+        }
+    }
+    // Broad diagnostics: log ALL full-frame copies when deferred output is
+    // pending, to correlate with the engine's actual presentation copy chain.
+    if (g_b2DeferredOutput && g_b2DeferredPending && list && dst && src &&
+        dst->pResource && src->pResource &&
+        dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        dst->SubresourceIndex == 0 && src->SubresourceIndex == 0 &&
+        dstX == 0 && dstY == 0 && dstZ == 0) {
+        D3D12_RESOURCE_DESC dd = dst->pResource->GetDesc();
+        D3D12_RESOURCE_DESC sd = src->pResource->GetDesc();
+        const UINT copyW = srcBox ? (UINT)(srcBox->right - srcBox->left) : (UINT)sd.Width;
+        const UINT copyH = srcBox ? (UINT)(srcBox->bottom - srcBox->top) : (UINT)sd.Height;
+        const bool isFullFrame = dd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            copyW == (UINT)dd.Width && copyH == (UINT)dd.Height &&
+            sd.Width == dd.Width && sd.Height == dd.Height;
+        if (isFullFrame) {
+            static unsigned s_broadDiag = 0;
+            if ((++s_broadDiag % 60) == 1) {
+                UINT64 completed = g_b2FenceOutG ? g_b2FenceOutG->GetCompletedValue() : 0;
+                D3D12_RESOURCE_DESC od = g_b2OutG ? g_b2OutG->GetDesc() : D3D12_RESOURCE_DESC{};
+                Log("hooks: deferred diag full-frame copy dst=%p(%ux%u fmt=%u) src=%p(%ux%u fmt=%u) pending=%llu fence=%llu od=%ux%u fmt=%u",
+                    (void*)dst->pResource, (unsigned)dd.Width, (unsigned)dd.Height, (unsigned)dd.Format,
+                    (void*)src->pResource, (unsigned)sd.Width, (unsigned)sd.Height, (unsigned)sd.Format,
+                    (unsigned long long)g_b2DeferredVal,
+                    (unsigned long long)completed,
+                    (unsigned)od.Width, (unsigned)od.Height, (unsigned)od.Format);
+            }
+        }
+    }
+    // Diagnostic: log deferred pending state at every copy to understand timing
+    if (g_b2DeferredOutput && list && dst && src && dst->pResource && src->pResource) {
+        static unsigned s_pendingDiag = 0;
+        if ((++s_pendingDiag % 120) == 1) {
+            Log("hooks: deferred pending state=%d pendingVal=%llu fenceDone=%llu",
+                (int)g_b2DeferredPending, (unsigned long long)g_b2DeferredVal,
+                (unsigned long long)(g_b2FenceOutG ? g_b2FenceOutG->GetCompletedValue() : 0));
+        }
+    }
     // SAFETY: skip ALL analysis when bridge not ready (prevents GetDesc on
     // engine resources during unstable startup / resource churn)
     if (!g_bridgeReady || !g_dlaaMode) return;
@@ -4845,9 +6709,45 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         }
         bool reinstallHooks = (g_device != newDev);
         g_device = newDev;
+        // Hook the cold device factory method so we can observe BeamNG's real
+        // direct graphics queue. The old code only modified a temporary queue
+        // created by ScaleNG, which could never see the game's submissions.
+        if (InterlockedCompareExchange(&g_realQueueHookInstalled, 0, 0) == 0 &&
+            newDev) {
+            void** dv = *(void***)newDev;
+            void* ccq = dv[8]; // ID3D12Device::CreateCommandQueue
+            MH_STATUS qst = MH_CreateHook(ccq, (void*)&Hook_CreateCommandQueue,
+                                          (void**)&Real_CreateCommandQueue);
+            if (qst == MH_OK || qst == MH_ERROR_ALREADY_CREATED) {
+                MH_STATUS qen = MH_EnableHook(ccq);
+                Log("hooks: device CreateCommandQueue hook %s target=%p st=%d enable=%d",
+                    qen == MH_OK ? "INSTALLED" : "FAILED", ccq, (int)qst, (int)qen);
+            } else {
+                Log("hooks: device CreateCommandQueue hook create FAILED target=%p st=%d",
+                    ccq, (int)qst);
+            }
+        }
+        if (InterlockedCompareExchange(&g_realListHookInstalled, 0, 0) == 0 &&
+            newDev) {
+            void** dv = *(void***)newDev;
+            void* ccl = dv[12]; // ID3D12Device::CreateCommandList
+            MH_STATUS lst = MH_CreateHook(ccl, (void*)&Hook_CreateCommandList,
+                                           (void**)&Real_CreateCommandList);
+            if (lst == MH_OK || lst == MH_ERROR_ALREADY_CREATED) {
+                MH_STATUS len = MH_EnableHook(ccl);
+                Log("hooks: device CreateCommandList hook %s target=%p st=%d enable=%d",
+                    len == MH_OK ? "INSTALLED" : "FAILED", ccl, (int)lst, (int)len);
+                if (len == MH_OK)
+                    InterlockedExchange(&g_realListHookInstalled, 1);
+            } else {
+                Log("hooks: device CreateCommandList hook create FAILED target=%p st=%d",
+                    ccl, (int)lst);
+            }
+        }
         if (reinstallHooks) {
-            // DISABLED FOR BISECTION: re-enable one at a time
-            if (false) {
+            // Cold device-level view creation hooks are observation-only. The
+            // hot command-list methods remain untouched below.
+            if (true) {
             // PURE VTABLE SWAP: never patch driver code bytes. Just redirect
             // the vtable pointer to our hook and save the original for
             // forwarding. The original function code is untouched.
@@ -4878,7 +6778,11 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
         ID3D12CommandQueue* queue = nullptr;
         D3D12_COMMAND_QUEUE_DESC qd = {};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (SUCCEEDED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) && queue) {
+        // Do not create a ScaleNG-owned queue here. The real queue factory
+        // hook below must capture BeamNG's first direct queue, not this
+        // temporary queue; otherwise ECL observation is attached to the wrong
+        // submission stream.
+        if (false && SUCCEEDED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) && queue) {
             void** qv = *(void***)queue;
             // DISABLED FOR BISECTION
             if (false) {
@@ -4902,8 +6806,101 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
     return hr;
 }
 
-void InstallCommandListHooks(ID3D12GraphicsCommandList* list)
+void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
 {
+    if (!list) return;
+
+    void** original = nullptr;
+    __try { original = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!original) return;
+
+    AcquireSRWLockExclusive(&g_commandListShimLock);
+    for (auto& existing : g_commandListShims) {
+        if (existing.list == list &&
+            (existing.originalVtbl == original || existing.clonedVtbl == original)) {
+            ReleaseSRWLockExclusive(&g_commandListShimLock);
+            return;
+        }
+    }
+
+    CommandListShim* slot = nullptr;
+    for (auto& candidate : g_commandListShims) {
+        if (!candidate.clonedVtbl) { slot = &candidate; break; }
+    }
+    if (!slot) {
+        ReleaseSRWLockExclusive(&g_commandListShimLock);
+        Log("hooks: command-list shim table full");
+        return;
+    }
+
+    constexpr SIZE_T kCommandListVtableEntries = 64;
+    void** cloned = (void**)VirtualAlloc(nullptr,
+        sizeof(void*) * kCommandListVtableEntries,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!cloned) {
+        ReleaseSRWLockExclusive(&g_commandListShimLock);
+        Log("hooks: command-list shim allocation failed");
+        return;
+    }
+
+    bool copied = true;
+    __try {
+        std::memcpy(cloned, original, sizeof(void*) * kCommandListVtableEntries);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        copied = false;
+    }
+    if (!copied) {
+        VirtualFree(cloned, 0, MEM_RELEASE);
+        ReleaseSRWLockExclusive(&g_commandListShimLock);
+        Log("hooks: command-list shim vtable copy faulted list=%p", (void*)list);
+        return;
+    }
+
+    slot->list = list;
+    slot->listType = listType;
+    slot->createdPresent = (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    slot->createdEcl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    slot->copyCount = 0;
+    slot->originalVtbl = original;
+    slot->clonedVtbl = cloned;
+    slot->copyTexture = (PFN_CopyTextureRegion)original[16];
+    // ID3D12GraphicsCommandList vtable slots from the Windows SDK:
+    // CopyTextureRegion=16, ResourceBarrier=26, OMSetRenderTargets=46.
+    slot->omSetRenderTargets = (PFN_OMSetRenderTargets)original[46];
+    slot->resourceBarrier = (PFN_ResourceBarrier)original[26];
+    cloned[16] = (void*)&Shim_CopyTextureRegion;
+    cloned[46] = (void*)&Shim_OMSetRenderTargets;
+    cloned[26] = (void*)&Shim_ResourceBarrier;
+
+    bool installed = true;
+    __try { *(void***)list = cloned; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { installed = false; }
+    if (!installed) {
+        slot->list = nullptr;
+        slot->listType = 0xFFFFFFFFu;
+        slot->createdPresent = 0;
+        slot->createdEcl = 0;
+        slot->copyCount = 0;
+        slot->originalVtbl = nullptr;
+        slot->clonedVtbl = nullptr;
+        slot->copyTexture = nullptr;
+        slot->omSetRenderTargets = nullptr;
+        slot->resourceBarrier = nullptr;
+        VirtualFree(cloned, 0, MEM_RELEASE);
+        ReleaseSRWLockExclusive(&g_commandListShimLock);
+        Log("hooks: command-list shim install faulted list=%p", (void*)list);
+        return;
+    }
+
+    void* targets[3] = { (void*)&Shim_CopyTextureRegion,
+                         (void*)&Shim_OMSetRenderTargets,
+                         (void*)&Shim_ResourceBarrier };
+    CfgMarkValid(targets, 3);
+    ReleaseSRWLockExclusive(&g_commandListShimLock);
+    Log("hooks: command-list read-only shim installed list=%p original=%p cloned=%p",
+        (void*)list, (void*)original, (void*)cloned);
+    return;
+/*
     // COMMAND-LIST HOOKS REMOVED: MinHook patches on hot ID3D12GraphicsCommandList
     // methods (SetDescriptorHeaps, ResourceBarrier, CopyTextureRegion, etc.) cause
     // solid-color rendering artifacts. These functions run thousands of times per
@@ -4919,6 +6916,7 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list)
     // If per-list hooks become necessary in the future, use a different
     // interception method (e.g., wrapping the command list interface).
     Log("hooks: cmdlist hooks DISABLED (artifact fix - using device-level discovery only)");
+*/
 }
 
 } // namespace

@@ -859,3 +859,944 @@ Build command: `cmd /c build.bat` with workdir `...\ScaleNG.Drive\src`. Output l
 - HONEST STATE: jitter patching/discovery/DLSS init all WORK; DLAA-at-Present eval + HUD NEVER verified in-game (present interception never worked under OptiScaler). UAL switch = the unblock.
 - SWITCH PLAN (no code changes needed for first test; current ASI runs fine under UAL - OptiScaler-workaround paths simply never fire, sentinel guards remain as harmless defense-in-depth): (1) backup Bin64\winmm.dll to User\OptiScaler_winmm_backup.dll; (2) copy User\winmm.dll -> Bin64\winmm.dll; (3) rename Bin64\OptiScaler.ini -> .bak; (4) mkdir Bin64\CrashDumps; (5) launch game -> expect clean-discovery log chain: 'EGSH real factory %p' -> dummy ForHwnd succeeds -> 'Present hooked' -> 'present on real swapchain' -> HUD ready.
 - CODE CLEANUP PLAN (only AFTER first UAL run proves presents flow): delete PatchModuleSwapchainVtables scan + SwapchainTableDumpThread; dummy-swapchain becomes PRIMARY EGSH path (real factory via g_adapter->GetParent -> CreateSwapChainForHwnd FLIP_DISCARD 2x2 on hidden ScaleNGDummyWnd -> InstallSwapchainHooks(vt[8]+vt[22]) -> release dummy; one static shared vtable covers game's swapchain); re-enable GetDesc (OptiScaler's inline hook gone; keep SEH); restore InjectAtPresent + HUD draw + F9/F10 hotkeys (currently log-only stubs). Keep: all SEH guards, IsReadablePtr/IsExecutableImagePtr gates, CfgMarkValid CFG registration, camera CB + velocity CB + viewport patch + copy hooks unchanged (they work and are loader-independent).
+
+## 2026-08-27 — stable runtime log reviewed; helper backend enabled
+
+- The latest `C:\games\BeamNG.drive\Bin64\plugins\ScaleNG.log` reached 01:00:11 with 1,639 lines after an extended user run that included window resizing. No crash, artifact, resize failure, device-removal, or DLSS evaluation failure was observed, and no newer BeamNG crash dump was generated for this run.
+- The live Present path was working, but DLSS was not reached: the log reported `ngx-b2: helper mode off`, then repeatedly reported `NO independent device available`. The in-process fallback returned `0x887E0003` when the private D3D12 copy was attempted.
+- Root cause: `dist\ScaleNG.ini` lacked `[bridge] helper=1`, while the source defaults the helper backend to disabled when the key is absent.
+- Added the explicit helper setting, rebuilt with Visual Studio Community 2026 / VC toolchain, and deployed matching `ScaleNG.asi`, `ScaleNG_NGX_helper.exe`, and `ScaleNG.ini` to the BeamNG plugin directory. Source/deployment SHA-256 hashes match for all three artifacts; previous deployment files were backed up.
+- Next launch is the helper-backend test. Expected evidence is `helper mode ENABLED`, helper connection/setup lines, and frame/evaluate telemetry instead of `NO independent device available`.
+
+## 2026-08-27 — helper framing bug fixed; DLSS path redeployed
+
+- The follow-up run confirmed helper mode was enabled and the helper process launched successfully, completed the handshake, and initialized its D3D12 queue/list.
+- Helper setup then failed at `OpenSharedHandle` with `0x80070057 (E_INVALIDARG)`. Its decoded wire values were shifted by one byte (`w=491520` instead of `1920`), proving a framing mismatch rather than an invalid GPU handle.
+- Root cause: the game-side sender writes the initial setup as `S` tag + 56-byte `SetupMsg`, but the helper’s initial receive path read 56 bytes without consuming the tag. Later mid-stream setup handling already expected the tag.
+- Fixed `src\ngxc_helper.cpp` so the initial setup consumes and validates the `S` tag before reading `SetupMsg`. The helper now uses the same framing for initial and later setup messages.
+- Rebuilt `ScaleNG.asi` and `ScaleNG_NGX_helper.exe` with VC2026 and redeployed them with `ScaleNG.ini`. The INI explicitly keeps DLSS active (`enabled=1`, `upscaler=dlss`, `scale=0.67`, `perfQuality=1`, `mvJittered=1`, `autoExposure=1`) and enables the helper bridge with `[bridge] helper=1`.
+- Source/deployment SHA-256 hashes match for all three deployed artifacts. Next launch should reach shared-handle setup and provide the first meaningful DLSS/helper evaluation result.
+
+## 2026-08-27 — first helper evaluates; stage-3 GPU wait caused instant crash
+
+- The latest run reached `READY via HELPER` and the helper reported `in-loop NGX init ok (1920x992)`. ScaleNG logged `frame 1 eval=ok` and `frame 2 eval=ok`, proving the helper protocol and NGX evaluation path are now active.
+- The game then showed a black window and exited/crashed immediately after the first successful frames. The failure occurred after evaluation, at the game-side output/synchronization stage.
+- The likely unsafe operation was `ID3D12CommandQueue::Wait` on the game's queue from inside the Present callback, waiting on the cross-process output fence. This was changed to `SetEventOnCompletion` plus a bounded CPU wait before submitting the output copy, avoiding a GPU queue wait while Present is active.
+- Rebuilt and redeployed `ScaleNG.asi`, `ScaleNG_NGX_helper.exe`, and `ScaleNG.ini` with matching SHA-256 hashes. Helper mode and DLSS remain explicitly enabled.
+
+## 2026-08-27 — helper reached NGX; black output traced to game-side result handling
+
+- The latest run produced a black game window while the process and Steam overlay remained responsive. A new crash dump/log pair exists at 01:16, but the supplied symptom and runtime log indicate the black-output run itself was not a crash; no new crash occurred during the visible test.
+- The helper path now works through setup: `helper owns NGX now (1920x992)`, `READY via HELPER`, helper wire values decode correctly, and the helper reports `in-loop NGX init ok (1920x992)`.
+- The first frame was nevertheless discarded by the game side: `frame msg write v=1 ok=1` followed by `frame 1 skipped (no ack/eval)`. The helper had processed frame 1 and continued, so the game-side `recorded` flag was never set from `helperAcked`.
+- Fixed `NgxBridgeFrameB2` so a valid helper acknowledgement is treated as a successful stage-2 result and permits the stage-3 output copy. Added an exclusive pipe lock because multiple UAL-loaded ASI instances/Present entries can otherwise race on frame acknowledgements.
+- Removed the helper's post-frame opportunistic pipe read, which could consume and discard the next frame message without evaluating or acknowledging it.
+- Added helper-side passthrough output on NGX rejection: if Evaluate fails, the helper copies shared color to shared output before signaling completion, preventing an uninitialized output texture from producing a black frame.
+- Rebuilt and redeployed `ScaleNG.asi`, `ScaleNG_NGX_helper.exe`, and `ScaleNG.ini` with matching SHA-256 hashes. DLSS remains active at `scale=0.67`, `perfQuality=1`, with helper mode enabled.
+
+## 2026-08-27 — three launch crashes isolated to overlapping bridge transactions
+
+- The newest crash report was `C:\games\BeamNG.drive\Bin64\CrashDumps\BeamNG.drive.x64.exe.20260827012321.log`. It reports a BeamNG access violation reading address `0x0` at executable offset `0xD02EDA`; the ASI log ends immediately after helper frames 1 and 2 both report `eval=ok`.
+- The runtime sequence shows the first Present entering the helper bridge, successfully evaluating frame 1, and then a second Present entering before the first bridge transaction had finished its output copy. The bridge reused the same command allocators/lists and backbuffer across those entries without a transaction lock. That is unsafe during Present re-entry and resize churn and explains why the crash followed successful NGX evaluation.
+- A second ownership defect was also found: `NgxBridgeFrameB2` released the `GetBuffer` reference on early returns even though its caller released that reference unconditionally. Those paths could double-release a swapchain backbuffer.
+- Added an exclusive, non-blocking bridge transaction lock so a concurrent/re-entrant Present skips the bridge and leaves the engine frame untouched. Removed the duplicate backbuffer releases from the bridge function; the caller remains the sole owner of that reference.
+- Rebuilt with Visual Studio Community 2026 and redeployed the updated ASI/helper/INI to `C:\games\BeamNG.drive\Bin64\plugins`. The previously running orphan helper was stopped before replacement, and the deployed helper hash now matches the build output.
+- The next test should prioritize a clean launch with no crash. If stable, the logs should show either serialized `frame ... eval=ok` entries or occasional `frame skipped - bridge transaction already active` entries during re-entry, without black-screen termination.
+
+## 2026-08-27 — re-entry lock insufficient; output-copy isolation build deployed
+
+- The user reported three further crashes. The newest available crash log is still `BeamNG.drive.x64.exe.20260827012321.log`; no additional CrashDumps log pair was emitted for the three latest attempts. The active runtime log does confirm the new build was loaded and again reached helper setup plus `frame 1 eval=ok` and `frame 2 eval=ok`.
+- The added bridge transaction lock did not prevent the failure in practice; the crash still occurs after successful evaluation and before a normal post-copy completion marker. This keeps the game-side stage-3 output copy as the highest-confidence failing operation.
+- Added `[bridge] replaceOutput=0` to the deployed INI and a matching source-controlled gate. The helper and NGX evaluation remain active, but ScaleNG now returns immediately after a confirmed evaluation instead of transitioning BeamNG's wrapped backbuffer and submitting the cross-process result copy.
+- Rebuilt with VC2026 and redeployed the ASI, helper, and INI. Source/deployment hashes match. This is an isolation build intended to establish a stable evaluation-only baseline; it is not yet the final visible-upscaling configuration.
+
+## 2026-08-27 — evaluation-only baseline verified stable
+
+- The user reported no crash and no artifacts with `replaceOutput=0`. The latest `ScaleNG.log` was written through 01:34:49 and the helper log through 01:35:05.
+- The runtime reached approximately 13,200 Present entries and logged repeated `frame ... eval=ok (output replacement disabled)` messages through frame 13,200. The helper processed approximately 13,400 frame messages before the parent exited normally.
+- No new BeamNG crash report appeared after the prior 01:23:21 crash. No device-removal, bridge fault, evaluation failure, or black-output event was present in the new session logs.
+- This verifies that helper startup, shared-resource transport, NGX initialization, repeated evaluation, and the evaluation-only return path can run for an extended session. The remaining instability is isolated to the visible game-side output replacement path.
+
+## 2026-08-27 — deferred engine-list output handoff implemented and deployed
+
+- The stable evaluation-only run established that NGX output is available without touching BeamNG's wrapped backbuffer. The visible path was redesigned so Present no longer records/submits a second command list for the output copy.
+- After a confirmed helper evaluation, Present now marks the completed output as pending. The existing `CopyTextureRegion` hook can consume that output only when BeamNG's own command list is recording a full-size copy into the current Present backbuffer.
+- The hook substitutes the shared DLSS output as the copy source and records source-state transitions into BeamNG's command list. BeamNG retains ownership of the destination transition and queue submission. If the dimensions, format, fence state, destination identity, or copy shape do not match, the original engine copy remains untouched.
+- Added `[bridge] deferredOutput=1` while retaining `replaceOutput=0`; this enables the redesigned handoff without re-enabling the old Present-time stage-3 submission. The helper/NGX evaluation path remains active.
+- Rebuilt with VC2026 and redeployed the ASI, helper, and INI. A stale helper process was stopped before replacement; source/deployment hashes match. This is the first controlled test of visible output through an engine-owned command list.
+
+## 2026-08-27 — black output traced to false-positive helper acknowledgement
+
+- The deferred-output test did not crash, but the game window was black. The runtime log showed `frame 1 eval=ok (deferred output pending)`, while the helper log reported `ok=0 skip=...` for every frame. The game-side message was incorrectly treating a fence acknowledgement as an evaluation success.
+- Root cause: the helper protocol acknowledgement contained only the frame value. It proved that the helper had queued its completion signal, not that `Evaluate` had recorded a valid NGX workload. The deferred path could consequently consume an output that was not a real DLSS result.
+- Changed the acknowledgement to include the frame value and a `recorded` status flag. The game side now accepts a visible-output candidate only when both the frame matches and the helper reports a successful NGX recording. Rejected frames are acknowledged for pacing but cannot become pending output.
+- Re-enabled `deferredOutput=1` with `replaceOutput=0` in the deployed INI so the corrected protocol can test the engine-owned handoff without the old Present-time submission. Rebuilt with VC2026 and redeployed all three runtime artifacts after stopping BeamNG and the helper; source/deployment hashes match.
+
+## 2026-08-27 — corrected rejected-frame boolean and redeployed
+
+- The follow-up log showed `helper acknowledged ... but NGX rejected the frame`, but the game-side `helperAcked` flag was still being set true before checking the new `recorded` field. That left the invalid-output pending path active and explains the black window.
+- Corrected the assignment so `helperAcked` is true only when the frame matches and `recorded != 0`. Rejected helper frames now remain native pass-through frames and cannot trigger deferred output replacement.
+- Rebuilt with VC2026 and redeployed the ASI, helper, and INI after stopping BeamNG/helper processes. All source/deployment hashes match. The next run should remain visible even while NGX input validation is still being solved.
+
+## 2026-08-27 — stable later launches; first Task Manager termination classified as hang
+
+- The user reported that later launches completed without crashes or artifacts; the first launch was terminated with Task Manager after the window became unresponsive during normal close. No new BeamNG crash dump was generated, so that first termination is treated as a shutdown hang rather than a plugin crash.
+- The runtime log shows the corrected build loading and the helper continuing to receive frames. The helper consistently reports `ok=0 skip=...`, confirming that NGX is still rejecting the current input set. The game-side log now correctly reports the rejection and does not mark rejected output as pending.
+- No valid deferred output-copy event was recorded. The stable later runs therefore confirm safe native presentation plus helper diagnostics, but do not yet confirm visible DLSS output. The next engineering focus remains making the helper’s depth/motion-vector/color inputs acceptable to NGX.
+
+## 2026-08-27 — diagnostic result/status instrumentation deployed
+
+- Began the planned implementation cycle by instrumenting the concrete DLSS wrapper and helper. The helper now logs color/output/depth/motion resource descriptors and periodically reports the exact NGX evaluation result alongside its Boolean `recorded` status.
+- The game-side helper acknowledgement already carries the recorded bit; this diagnostic build makes the helper's actual NGX result visible instead of reducing all failures to `ok=0`.
+- The project rebuilt successfully with VC2026. The updated ASI and helper were deployed after stopping active BeamNG/helper processes; the existing safe INI remains in place with `replaceOutput=0` and `deferredOutput=1`.
+- Next evidence required: exact NGX result code plus all four helper resource descriptors. These will determine whether the next change belongs in formats/states, DLSS parameters, or resource contents.
+
+## 2026-08-27 — create-feature result instrumentation deployed
+
+- The two-launch diagnostic showed the helper resources are consistently created as 1920x992 / 1920x1001, color/output `R8G8B8A8_UNORM` with flags `0x24`, depth `D32_FLOAT` (format 41), and motion `R16G16_FLOAT` (format 34). NGX initialization succeeds, but evaluation stops before command recording with `ngxResult=-1002`, our internal marker for `CreateFeature` failure.
+- Added a concrete `LastCreateResult()` diagnostic to the DLSS wrapper and helper telemetry. The next run will expose the actual NGX CreateFeature result rather than reporting only a generic evaluation failure.
+- The user-visible output path remains disabled until CreateFeature and then EvaluateFeature both succeed. Rebuilt with VC2026 and redeployed the diagnostic ASI/helper; source/deployment hashes match.
+
+## 2026-08-27 — resize freeze root cause fixed and deployed
+
+- The four-launch report is consistent with a resize-only hang, not a crash. The runtime log shows normal frame processing at 1920x992, then a resize to 1920x1001 followed by `setup rejected by helper (00000000)`. No new BeamNG crash dump was created.
+- Root cause: the helper's mid-stream `S` setup branch called `ApplySetup` and then continued without writing the 4-byte `OKAY`/`FAIL` response expected by `B2SendSetup`. The game-side `ReadFile` consequently blocked indefinitely during window resize.
+- Fixed the helper to acknowledge every mid-stream setup and to destroy the previous DLSS wrapper before rebuilding size-dependent resources. Added a 5-second game-side acknowledgement timeout and helper-process liveness check so a future helper failure cannot block the render thread.
+- Corrected the shipped `appId` from stale `1` to the validated `241534720` in `dist/ScaleNG.ini` and deployed it. Rebuilt with VC2026. The ASI, helper, and INI now match between `dist` and `C:\games\BeamNG.drive\Bin64\plugins`; the previous helper was stopped only because it held the executable open.
+- NGX still reports `0xBAD0000B` (`FAIL_UnableToInitializeFeature`) during CreateFeature, so visible output remains disabled. The resize protocol is now independently corrected before the next user launch.
+
+## 2026-08-27 — packaged snippet fixed standalone NGX validation
+
+- The first post-fix game session remained stable, but its helper failed to start cleanly and the game-side path repeatedly reported `NO independent device available`. The helper log was unchanged because the helper process had been stopped during the prior deployment; this was a session/deployment-state issue, not a new renderer crash.
+- The standalone helper smoke test initially reproduced `0/100` evaluations and NVIDIA's NGX log explicitly reported that `nvngx_dlss.dll` was missing from the helper directory. The validated 310.6.0 snippet existed in BeamNG's `Bin64` directory but had not been packaged beside `ScaleNG_NGX_helper.exe` in `Bin64\\plugins`.
+- Added automatic snippet packaging to `src\\build.bat`, copied the exact validated DLL to `dist` and `Bin64\\plugins`, and verified matching SHA-256 hashes.
+- Re-ran the standalone test after packaging: `100/100` evaluations passed, exit code `0`. NVIDIA's log confirms the snippet loaded, feature creation succeeded, the expected app CMS ID `241534720` was used, and DLSS evaluation telemetry was emitted.
+- This proves the driver, NGX core, snippet, app ID, basic parameters, and helper-owned D3D12 resource setup can work together. The next phase is in-game shared-resource validation: capture the helper's real color/depth/motion descriptors and determine whether BeamNG's shared-resource contents/states satisfy the same conditions before enabling output replacement.
+
+## 2026-08-27 — helper recovery made restartable
+
+- The user's stable run had no major defects, but the runtime log showed that the long-lived BeamNG process had disabled helper mode after the earlier pre-snippet setup failure. It then retried the unavailable local-device path every three seconds; this prevented the newly packaged helper from being tested in that session.
+- Changed helper setup failure handling to terminate the failed worker and retain helper mode. The normal retry throttle can now create a clean helper later in the same game session instead of permanently selecting the known-unavailable fallback.
+- Rebuilt with VC2026 and redeployed the ASI, helper, INI, and validated `nvngx_dlss.dll`; build/deployment hashes match. A fresh BeamNG launch is still recommended so the ASI and helper begin from a clean process state.
+
+## 2026-08-27 — per-process helper pipe deployed
+
+- The latest stable run produced no crash or artifact, but ScaleNG logged `CreateNamedPipe FAILED err=231` and never produced a fresh helper log. The fixed global pipe name collided with BeamNG's multiple plugin/renderer processes.
+- Changed both sides of the bridge to use `\\.\\pipe\\ScaleNG_NGX_<parent-pid>`, so each BeamNG process gets an isolated helper endpoint. Removed the broad orphan-helper termination from normal startup; it could interfere with another active BeamNG process and is no longer needed with unique names.
+- Rebuilt with VC2026 and redeployed the ASI, helper, INI, and validated DLSS snippet. Build/deployment hashes match. The next fresh launch should provide the first reliable in-game helper/NGX result after the standalone `100/100` proof.
+
+## 2026-08-27 — periodic freeze traced to stale cross-process fence handles
+
+- The latest run was visually stable but paused periodically. Logs show the helper connected repeatedly, then every setup returned `FAIL` because `OpenSharedHandle` rejected the cached input fence value with `ERROR_INVALID_HANDLE`.
+- Root cause: the ASI cached the numeric fence handles across helper restarts. Those values are valid only in the helper process that received them; the restartable-helper change correctly created new workers but exposed this stale-handle cache.
+- Fixed the cache lifetime: fence values are now cleared whenever the helper process or pipe is replaced, forcing fresh `DuplicateHandle` calls for each helper. This stops the restart/fail loop that caused periodic pauses.
+- Rebuilt with VC2026 and redeployed the ASI, helper, INI, and validated DLSS snippet with matching hashes. The next run should show one helper setup success, followed by real helper frame/evaluation telemetry instead of repeated setup failures.
+
+## 2026-08-27 — persistent source fence handles corrected and deployed
+
+- Further inspection showed the retry loop also closed `g_b2HFIn`/`g_b2HFOut` on every setup attempt, despite retaining the underlying shared fences across resizes. Subsequent helper launches therefore received duplicates of closed source handles.
+- Removed that per-setup close. Source shared-fence handles now live with the persistent fences; only the duplicated handle values inside the current helper are cleared on helper replacement.
+- Rebuilt with VC2026 and redeployed the ASI, helper, INI, and validated DLSS snippet with matching hashes. This should eliminate the periodic setup-failure/restart pauses and allow the next run to reach shared-resource validation.
+
+## 2026-08-27 — helper GPU allocator reuse synchronized
+
+- After the game report, the helper process remained alive after BeamNG exited and reached approximately 2.7 GB committed memory. This exposed a second lifetime defect in the helper: it reset and reused one D3D12 command allocator/list immediately after queue submission, without waiting for the prior GPU work to finish.
+- Added output-fence completion synchronization before every allocator/list reuse and before releasing shared resources during a resize/setup. Added explicit output-fence signal error handling and reset the submitted-value epoch when a setup replaces the fence interface.
+- Terminated the orphan helper from the crashed session. Rebuilt with VC2026 and redeployed the ASI, helper, INI, and validated DLSS snippet. Deployment backup: `Bin64\\plugins\\ScaleNG-backup-20260827-030853`. Dist/deployment SHA-256 hashes match.
+
+## 2026-08-27 — long-run heap-corruption report investigated and backbuffer leak fixed
+
+## 2026-08-27 — freeze source identified as incompatible fallback retries
+
+## 2026-08-27 — crash run traced to persistent pipe collision and stale plugin processes
+
+## 2026-08-27 — no-window launches traced to startup swapchain handling
+
+## 2026-08-27 — startup swapchain stabilization gate implemented
+
+## 2026-08-27 — interleaved swapchain stabilization corrected
+
+## 2026-08-27 — rollback copies removed from active plugin discovery path
+
+## 2026-08-27 — first sustained in-game NGX evaluation confirmed
+
+## 2026-08-27 — bounded NGX session recycle added
+
+## 2026-08-27 — full helper batch restart added for memory reclamation
+
+- The 1200-frame NGX wrapper recycle did not reduce memory: helper commit continued rising from roughly 437 MB at 254 frames to about 2 GB after 7500+ frames, despite repeated `recycling NGX session` markers. The driver/snippet retains allocations beyond feature destruction.
+- Changed the helper to exit after every 900 completed frames, after sending the final valid acknowledgement. Changed the ASI to detect the closed/broken pipe immediately, kill/clear the dead worker, mark the bridge unready, and reconnect a fresh helper on the next frame.
+- This bounds each helper lifetime and lets Windows reclaim the complete NGX/driver allocation set. It also prevents a dead helper from causing permanent frame skips.
+- Rebuilt with VC2026 and deployed all runtime files. Rollback backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-043146`; dist/deployment SHA-256 hashes match.
+
+- The stable in-game session completed 7,587/7,587 NGX evaluations but helper commit grew to approximately 2034 MB. Queue-fence synchronization prevented allocator reuse hazards, so the remaining growth is associated with long-lived NGX/snippet evaluation state.
+- Added a safe recycle at every 1200 completed helper frames. The helper waits for the previous output fence first, then destroys/recreates only the NGX wrapper and evaluation heap; shared textures, fences, command queue, pipe, and protocol remain intact.
+- Rebuilt with VC2026 and deployed all runtime files. Rollback backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-042257`; dist/deployment SHA-256 hashes match.
+
+- After removing rollback executables from the active plugin tree, the runtime reached a stable 1920x992 swapchain, connected helper pid 9700, and completed genuine in-game DLSS evaluations. Helper telemetry reached `7587 frames ... ok=7587 skip=0`; ScaleNG continued through frame 7801 without a crash artifact after 04:14.
+- The same session exposed a remaining helper lifetime problem: helper commit reached approximately 2034 MB after 7587 evaluations, and the helper remained alive after the game was terminated. The orphan helper was stopped manually.
+- This confirms the startup/window issue and the NGX evaluation path are solved enough for integration testing. The next blocker is bounding NGX/helper memory and making parent/session shutdown deterministic before enabling visible output replacement.
+
+- The latest launch still produced no window and never reached the stable-swapchain threshold. The active plugin tree contained 13 `ScaleNG-backup-*` directories, each holding executable ASI/helper copies; a prior inspection confirmed a helper had actually launched from one of those backup directories.
+- Moved all rollback directories, preserving them unchanged, to `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups`. The active `Bin64\\plugins` directory now contains only the intended current ASI, helper, DLSS snippet, and INI (plus BeamNG's existing plugin utility files).
+- No source rebuild was needed for this cleanup. This removes multiple discovered ASI/helper instances as a confounding variable for the next startup test.
+
+- The first gate required eight consecutive presents from one swapchain. BeamNG alternates among several startup swapchains, so the gate never selected any candidate and the pipeline never reached DLSS.
+- Replaced the single-candidate consecutive counter with per-swapchain counters for up to 16 observed candidates. A candidate is now eligible after eight presents of its own, even when other swapchains are interleaved.
+- Rebuilt with VC2026 and deployed the ASI, helper, INI, and validated DLSS snippet. Deployment backup: `Bin64\\plugins\\ScaleNG-backup-20260827-041247`; dist/deployment SHA-256 hashes match.
+
+- Added a shared Present-time candidate tracker. A swapchain must present eight consecutive times before ScaleNG adopts it and enters the self-contained pipeline; transient startup/UI/probe swapchains are now forwarded without `GetBuffer`, resource probing, or NGX work.
+- Applied the gate to the scanned Present stubs, the normal Present hook, and Present1. This preserves later swapchain re-adoption while preventing early startup surfaces from blocking window creation.
+- Rebuilt successfully with VC2026 and deployed the ASI, helper, INI, and validated DLSS snippet. Deployment backup: `Bin64\\plugins\\ScaleNG-backup-20260827-040955`; dist/deployment SHA-256 hashes match.
+
+- Two launches produced no visible game window and required termination. The newest crash artifacts were access violations at `BeamNG.drive.x64.exe+0xD2A747` (both 04:04 and 04:05 sessions), not heap-corruption reports.
+- Neither session reached `ngx-b2`, helper startup, or NGX evaluation. ScaleNG adopted and processed many different swapchains during BeamNG startup; the final traces stop after `ngx-pipe: bb=...` and before the pipeline can log the backbuffer dimensions. This indicates the self-contained Present pipeline is being entered on transient startup swapchains before the display swapchain is stable.
+- No DLSS bridge change was deployed from this run. The next fix is to gate pipeline execution until a stable display swapchain is selected, preventing transient startup surfaces from blocking BeamNG window creation.
+
+- The latest run generated a fresh BeamNG crash artifact at approximately 03:26. It is an access violation at `BeamNG.drive.x64.exe+0xD746D0`, not a new `0xC0000374` report. ScaleNG's last active process repeatedly received `CreateNamedPipe FAILED err=231` from 03:23 through the crash, so the helper never connected and no DLSS evaluation occurred in this run.
+- Process inspection found BeamNG renderer processes and an orphan `ScaleNG_NGX_helper.exe` still alive after the reported crash. The orphan helper was running from an older `ScaleNG-backup-*` directory inside the active `plugins` tree, creating a competing executable/endpoint source. Leftover BeamNG/ScaleNG processes were stopped before deployment.
+- Changed the helper endpoint to include a per-launch tick-count nonce and passed the exact endpoint to the helper, while retaining the parent PID separately for liveness checks. This removes dependence on a PID-only pipe name and prevents stale endpoint collisions.
+- Rebuilt with VC2026 and deployed all runtime files. Deployment backup: `Bin64\\plugins\\ScaleNG-backup-20260827-032919`; dist/deployment SHA-256 hashes match.
+
+- The latest run was stable enough to avoid a crash but still froze periodically. Its log shows the helper never connected: the first setup returned `CreateNamedPipe FAILED err=231` (`ERROR_PIPE_BUSY`). The bridge then set helper mode off and retried the wrapped-device local path every three seconds, repeatedly logging `NO independent device available`.
+- This was not a valid test of the helper allocator synchronization. Changed pipe/spawn/connect/handshake failure handling so explicit helper mode remains enabled and cannot fall through to the incompatible in-process device. A future retry now stays on the safe helper-only path.
+- Rebuilt with VC2026 and redeployed all four runtime files. Deployment backup: `Bin64\\plugins\\ScaleNG-backup-20260827-032031`; dist/deployment SHA-256 hashes match.
+
+## 2026-08-27 — removed render-path helper restart
+
+- User reported a momentary game freeze every time the helper exited for the 900-frame memory-reclamation batch.
+- The cause is architectural: closing the named pipe and synchronously reconnecting/handshaking the replacement helper occurs from the frame submission path, so BeamNG waits for the worker transition.
+- Removed the periodic helper-process exit from `ngxc_helper.cpp`. The helper remains persistent for the next validation run, preserving frame continuity while retaining the existing memory telemetry.
+- The ASI still handles an unexpected pipe failure, but it no longer deliberately creates a restart hitch during ordinary rendering.
+- Rebuilt successfully with VC2026 and deployed the ASI, helper, DLSS runtime, and INI. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-043647`; deployment hashes matched.
+- A seamless background helper handoff remains a separate lifecycle task: the replacement must be launched and fully initialized before the current worker is retired, without blocking Present.
+
+## 2026-08-27 — fixed helper acknowledgement reconnect loop
+
+- The subsequent runtime log showed the helper was not exiting at the old batch boundary. Instead, the ASI was killing and recreating it repeatedly: each connection lasted roughly 0.4–0.5 seconds, then logged `helper channel lost ... ackBytes=0`.
+- The cause was the 250 ms synchronous acknowledgement wait on the render path. The helper's first NGX evaluation can exceed that interval while the driver initializes internal state, so the ASI misclassified a slow acknowledgement as a dead pipe. This produced the reported recurring freezes.
+- Changed frame acknowledgement handling to drain only bytes already available. A delayed acknowledgement now leaves that frame skipped and is polled on later frames; the helper is terminated only on an actual pipe write/query failure.
+- Corrected helper parent monitoring to read the BeamNG PID from `argv[2]`; `argv[1]` is the named-pipe endpoint and was previously being passed to `OpenProcess` as a PID.
+- Rebuilt successfully with VC2026 and deployed all runtime files. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-044144`; deployment hashes matched.
+
+## 2026-08-27 — resize backlog eliminated with one-frame backpressure
+
+- Two launches were stable during ordinary rendering, but resizing froze. The runtime log showed the helper processing thousands of queued frame messages while ScaleNG reported every frame as `skipped (no ack/eval)`.
+- The resize setup message could sit behind an unbounded frame backlog while the ASI synchronously waited for the setup acknowledgement.
+- Added one-frame backpressure to the helper protocol: ScaleNG now sends a new frame only after draining the prior helper acknowledgement. This prevents the pipe backlog and limits resize setup to at most one outstanding evaluation.
+- The previous deployment attempt was blocked by the orphan helper process holding the helper and DLSS files open. After the user closed the session, the leftover helper was stopped and the complete build was deployed successfully.
+- Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-045043`; dist/deployment SHA-256 hashes matched.
+
+## 2026-08-27 — helper shutdown completed after parent exit
+
+- The stable run confirmed that resizing no longer caused issues and normal rendering remained usable.
+- The helper log showed `parent exited - bye`, proving the parent-monitoring check fired, but then returned to the outer setup loop and remained alive waiting for another client.
+- Added an explicit parent-exited state: once BeamNG termination is observed, the helper closes its parent handle, exits the setup loop, and returns from `main`.
+- The same run's telemetry reached approximately `3200MB` at `12906` successful evaluations, so NGX/driver memory growth remains a separate unresolved issue. No periodic restart was reintroduced because it caused visible freezes.
+- Rebuilt successfully with VC2026 and deployed all runtime files. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-045941`; dist/deployment SHA-256 hashes matched.
+
+## 2026-08-27 — stable runtime and clean helper shutdown validated
+
+- User reported a flawless run with no major issues and successful resizing.
+- No new crash artifact or active BeamNG/helper process was present after exit.
+- The latest helper sequence ended with `parent exited - bye`, `parent shutdown complete - exit`, and `pipe closed - exit`.
+- The historical log still contains the earlier 3200 MB / 12906-frame session, while the latest post-fix sequence reached approximately 428 MB after setup and then shut down cleanly. Memory growth is improved in the latest sequence but needs a longer isolated measurement before being considered fully resolved.
+
+## 2026-08-27 — acknowledgement state made resize-safe for output handoff
+
+- Began the visible-output implementation phase after the stable runtime/shutdown milestone.
+- The cumulative log showed the helper successfully processing frames while the ASI remained stuck on one pending value. This was caused by frame acknowledgements and resize setup sharing a byte-oriented pipe without shared pending state.
+- Promoted frame-ack state to the bridge level and made `B2SendSetup` drain the single outstanding frame acknowledgement before sending a resize/setup message. This prevents a setup response from consuming the first bytes of a frame acknowledgement.
+- Kept one-frame backpressure active so the protocol cannot accumulate a frame backlog.
+- Rebuilt successfully with VC2026 and deployed all runtime files. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-051333`; dist/deployment SHA-256 hashes matched.
+- Output replacement remains disabled until the next run proves that acknowledgements and deferred output-copy logs are synchronized.
+
+## 2026-08-27 — hardened stale ACK draining before setup
+
+- The latest validation run was visually stable, but the log contained a BeamNG access-violation artifact at `BeamNG.drive.x64.exe+0xD58131` from the earlier launch and a resize setup response of `0x000005B9`.
+- `0x000005B9` matched the low 32 bits of a queued frame acknowledgement, proving that a stale frame ACK was still preceding the setup response on the byte-oriented pipe.
+- Setup synchronization now drains all complete queued frame ACKs, waits for a partial ACK to complete, and waits for the single known pending ACK before writing resize setup. This prevents setup responses from being read from frame-ACK bytes.
+- Rebuilt with VC2026 and deployed all runtime files. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-052040`; dist/deployment SHA-256 hashes matched.
+- Direct output replacement remains disabled until the ACK/setup framing is validated without a new crash artifact.
+
+## 2026-08-27 — corrected one-frame-late ACK handoff
+
+- The helper log showed successful NGX evaluations, but ScaleNG still marked frames skipped because the helper ACK for frame N normally arrives while Present is handling frame N+1.
+- The ASI compared the ACK only with the current frame value, so a valid previous-frame ACK was discarded from the output-handoff path.
+- Valid recorded ACKs now arm deferred output using their own completed fence value, independent of the current Present frame. This activates the existing engine-owned copy hook without direct backbuffer replacement.
+- Rebuilt with VC2026 and deployed all runtime files. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-052818`; dist/deployment SHA-256 hashes matched.
+
+## 2026-08-27 — helper ACK path confirmed; engine copy still pending
+
+- The latest run was visually stable and the new ACK logic worked: ScaleNG logged repeated `helper acknowledged v=...; deferred output armed` messages.
+- The helper completed `5864` successful evaluations with approximately `1656MB` commit before clean shutdown (`parent exited - bye`, `parent shutdown complete - exit`, `pipe closed - exit`).
+- No `deferred DLSS output copied in engine list` message was produced, so the engine-side source/destination match is still not proven and visible DLSS output cannot yet be claimed.
+- A BeamNG access-violation artifact exists at 05:29:59 (`BeamNG.drive.x64.exe+0x140386`) and is being tracked separately from the later stable continuation.
+
+## 2026-08-27 — instrumented deferred-copy near misses
+
+- The latest run proved the helper ACK path and repeatedly armed deferred output, but still produced no `deferred DLSS output copied in engine list` message.
+- Added throttled diagnostics at the exact deferred-copy matcher. When BeamNG targets the current Present backbuffer but any source/type/subresource/coordinate/fence condition fails, the log now records the near-miss shape and fence values without modifying the native command.
+- Rebuilt with VC2026 and deployed all runtime files. Deployment backup: `C:\games\\BeamNG.drive\\Bin64\\ScaleNG-backups\\ScaleNG-backup-20260827-053541`; dist/deployment SHA-256 hashes matched.
+
+## 2026-08-27 — ACK/evaluation stable; backbuffer copy candidate not matched
+
+- The latest run remained stable and produced repeated `helper acknowledged v=...; deferred output armed` messages.
+- The helper completed approximately 8,133 successful evaluations and shut down with the expected parent/pipe exit sequence. No active BeamNG or helper process remained after the run.
+- No `deferred DLSS output copied in engine list` or `deferred output near-miss` messages appeared. This means the current engine-copy matcher is not seeing a copy whose destination pointer equals the backbuffer captured at Present; the next step must correlate BeamNG's full-resolution copy candidates with the active swapchain rather than rely on exact pointer identity.
+- Helper telemetry still shows linear memory growth, reaching approximately 2.15 GB in this session. This remains a separate stability/resource task.
+
+- The user reported a new BeamNG 0.39.3.0 `0xC0000374 STATUS_HEAP_CORRUPTION` after a long run. `Bin64\CrashReports` and Windows WER did not contain a matching new report, so the exact BeamNG faulting module is not yet available. The active ScaleNG log ended with repeated helper-independent-device fallback attempts, while the earlier helper session had already proven real in-game NGX evaluation (`recorded=1`, `ngxResult=1`).
+- Static lifetime review found that the Present bridge acquired one backbuffer COM reference per frame but failed to release it on successful evaluation-only/deferred-output returns, fence-wait failure, and the guarded `GetDesc` exception path. This leaked a reference on every evaluated frame and is a credible explanation for a delayed heap/resource failure.
+- Added `bb->Release()` to every previously missing exit path, including the final output-replacement path. Kept `replaceOutput=0` and `deferredOutput=1` unchanged so the next test continues validating NGX without the known-risk copy-back operation.
+- Rebuilt with VC2026 and deployed ASI, helper, INI, and validated DLSS snippet. Deployment backup: `Bin64\plugins\ScaleNG-backup-20260827-030718`. Dist/deployment SHA-256 hashes match.
+
+## 2026-08-27 — broad deferred-copy diagnostics deployed
+
+- The helper NGX evaluation path is now confirmed working (recent sessions show `recorded=1`, `ngxResult=1` for thousands of frames). The game-side deferred output handoff is repeatedly armed (`helper acknowledged v=...; deferred output armed`), but no `deferred DLSS output copied in engine list` or `deferred DLSS candidate copied` message has ever been produced.
+- Added comprehensive diagnostics in `CopyTexBody` that log EVERY full-frame copy when deferred output is pending, recording: source/destination resource pointers, dimensions, formats, pending/completed fence values, and the output resource descriptor. This will reveal which BeamNG copy operation is the true presentation handoff and why the current exact-match and guarded-candidate matchers both fail.
+- The existing near-miss logging only triggered when `dst->pResource == g_b2PresentBb`; the new broad diagnostics fire on any full-frame copy regardless of destination identity.
+- Rebuilt with VC2026 and deployed all runtime files. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\ScaleNG-backup-20260827-062319`; dist/deployment SHA-256 hashes match.
+- Next launch will produce the broad diagnostic logs. Expected outcomes: (1) identify the exact engine copy that should consume the DLSS output, (2) determine whether the destination resource is the same backbuffer captured at Present or a different resource in the presentation chain, (3) confirm format/dimension/fence alignment, then narrow the matcher to that specific copy.
+
+## 2026-08-27 — recovered mixed AI state; removed live NGX recycling
+
+- Preserved the mixed working tree and dist files before intervention in `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\pre-recovery-20260827-153703`.
+- The latest helper log showed successful NGX evaluation through frame 18,000, followed by periodic live-session recycling, permanent `recorded=0` rejection, and approximately 4.36 GB commit.
+- Removed periodic NGX wrapper destruction/recreation during active sessions. Resize-triggered teardown remains fence-guarded through `ApplySetup()`.
+- Added bounded diagnostics for rejected evaluations, including the NGX evaluation and feature-creation result codes.
+- Rebuilt with VC2026 and deployed the ASI, helper, INI, and DLSS snippet. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\deploy-pre-20260827-153901`.
+- The active configuration remains `replaceOutput=0` and `deferredOutput=1`; visible output is not claimed until a runtime test proves the copy path.
+
+## 2026-08-27 — sustained evaluation restored; memory growth remains
+
+- The post-recovery run completed without a new crash artifact and the helper exited normally after BeamNG closed.
+- The helper continuously evaluated DLSS frames: `recorded=1`, `ngxResult=1`, with approximately 17,024 successful evaluations and zero skips in the observed session.
+- The game-side bridge repeatedly armed deferred output for completed helper frames.
+- Memory growth remains severe: helper commit increased from approximately 428 MB near startup to approximately 4.1 GB by shutdown. This confirms that live-session recycling was masking a resource-lifetime problem rather than solving it.
+- No visible DLSS output is claimed because `replaceOutput=0` remains active and no deferred-copy substitution message was observed in this session.
+- Next implementation focus is the NGX parameter/resource lifecycle. Whole-feature recycling is excluded because it caused permanent evaluation rejection in the preceding run.
+
+## 2026-08-27 — direct visible-output integration test enabled
+
+- The sustained run proved helper-side DLSS evaluation remains successful, but produced zero `CopyTexBody`/deferred-copy diagnostics. BeamNG's active renderer path is therefore not exposing the copy hook required by deferred handoff.
+- Changed the deployed test configuration to `replaceOutput=1` while retaining `deferredOutput=1`. This activates the guarded Present-time copy from the completed helper output into the game's backbuffer.
+- Preserved the previous configuration at `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\output-test-pre-20260827-155248`.
+- No source or binary change was made for this test; the existing direct path remains protected by fence completion and resource barriers.
+- This run is intended to determine whether actual DLSS output reaches the visible BeamNG window.
+
+## 2026-08-27 — direct output path rejected by crash evidence
+
+- With `replaceOutput=1`, BeamNG displayed a black window and crashed immediately after the first acknowledged helper frame.
+- The newest crash artifact reports a null access violation at `BeamNG.drive.x64.exe + 0xF0AAF8`; ScaleNG logged `frame 1 eval=ok` immediately before the failure.
+- The direct Present-time copy path is therefore unsafe for this renderer and is no longer the active configuration.
+- Reverted the deployed INI to `replaceOutput=0`, `deferredOutput=1`. The pre-revert configuration was preserved at `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\crash-revert-20260827-155625`.
+- The next integration design must submit the replacement through the renderer's actual presentation command path or use a properly synchronized swapchain-owned target; repeating direct backbuffer replacement is ruled out.
+
+## 2026-08-27 — real BeamNG queue discovery control build deployed
+
+- The existing ECL hook was found to be disabled and the prior setup only created a temporary ScaleNG queue, so it could not observe BeamNG's submissions.
+- Added a cold-path `ID3D12Device::CreateCommandQueue` hook to capture BeamNG's first real direct graphics queue and install the ECL hook on its actual submission function.
+- Kept ECL behavior observation-only for this build; it logs real BeamNG queue submissions but does not inject or alter GPU work yet.
+- Removed the temporary queue creation from the discovery path so ScaleNG cannot misidentify its own queue as BeamNG's queue.
+- Compiled successfully with VC2026 and deployed the ASI, helper, INI, and DLSS snippet. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\queue-control-pre-20260827-160234`.
+- The deployed INI is back in stable evaluation-only mode: `replaceOutput=0`, `deferredOutput=1`.
+
+## 2026-08-27 — real BeamNG queue confirmed
+
+- The observation-only control run completed without artifacts, crashes, or a new crash artifact.
+- ScaleNG captured BeamNG's actual direct graphics queue and installed the real ECL hook. The log recorded sustained `GAME ExecuteCommandLists observed` events across the active frame stream, including submissions containing 1, 3, 4, and 8 command lists.
+- Helper-side DLSS evaluation remained healthy during the run (`recorded=1`, `ngxResult=1`) and deferred output continued to arm.
+- The queue-discovery milestone is complete. The next implementation can move the output-copy submission to the confirmed game queue, after BeamNG's native command lists and before Present.
+
+## 2026-08-27 — ECL becomes the pipeline driver; safe control build deployed
+
+- The queue control run proved the real BeamNG direct queue and sustained ECL cadence.
+- Changed the real ECL hook from observation-only to the pipeline driver and disabled duplicate Present-time driving whenever the real queue is observed.
+- The deployed configuration remains `replaceOutput=0`, so this build changes execution ordering only and does not copy DLSS output into the backbuffer yet.
+- Compiled successfully with VC2026 and deployed the ASI, helper, INI, and DLSS snippet. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\ecl-driver-pre-20260827-162326`.
+- The next run must confirm stable ECL-driven evaluation before enabling the queue-submitted visible copy.
+
+## 2026-08-27 — ECL full-pipeline driver rejected; stable Present driver restored
+
+- The ECL-driven test crashed during startup while the game was still displaying a black loading window. Logs show the full `TryDeferredInject()` pipeline entered from early ECL submissions before the first helper acknowledgement.
+- Retained real BeamNG queue capture and ECL observation, but removed the call that drove the full pipeline from every ECL submission.
+- Restored Present as the pipeline driver, with `replaceOutput=0` and `deferredOutput=1`, matching the last stable evaluation configuration.
+- Rebuilt successfully with VC2026 and redeployed. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\present-driver-revert-20260827-163037`.
+- The next queue-path implementation must be a narrowly gated post-submit copy operation, not a full pipeline invocation from ECL.
+
+## 2026-08-27 — presentation correlation logging deployed
+
+- Added bounded correlation logs at real BeamNG ECL submission, Present backbuffer capture, and successful deferred-output readiness.
+- The new records include queue identity, command-list count, frame number, backbuffer pointer and dimensions, output readiness, pending fence value, and completed fence value.
+- No rendering or synchronization behavior was changed by this revision; it remains `replaceOutput=0`, `deferredOutput=1`.
+- Compiled successfully with VC2026 and deployed. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\correlation-logging-pre-20260827-163745`.
+- The next run should reveal the ordering and resource identity relationship needed to implement a narrowly gated queue copy.
+
+## 2026-08-27 — queue correlation run completed; multiple direct queues identified
+
+- The run completed without a new crash artifact and helper evaluation remained successful.
+- The real ECL hook observed sustained submissions, but BeamNG used several direct queue interface pointers. The current hook assigns `g_graphicsQueue` on every ECL callback, so its queue field is not a stable identity and must not yet drive output injection.
+- Present correlation was stable within the session: the same backbuffer pointer was reported repeatedly at `1920x1001`, while the helper output fence was completed before the deferred evaluation-ready log.
+- The correlation logger reported `frame=0` for ECL events, showing that the existing frame counter is not synchronized with this renderer's submission stream. A monotonic ECL/Present serial is needed for the next correlation pass.
+- No queue copy or visible-output change was attempted. The configuration remains `replaceOutput=0`, `deferredOutput=1`.
+
+## 2026-08-27 — queue-to-Present correlation confirmed
+
+- The map-load run completed without a crash or new crash artifact.
+- The first captured direct queue remained stable for the session, and ECL serials advanced predictably against Present serials: approximately 600 ECL submissions per 120 Presents in the observed stream.
+- The same Present backbuffer pointer remained active at `1920x992`, while helper acknowledgements and completed output fences continued normally.
+- The helper reached at least 5,395 successful evaluations with zero skips in the captured session segment.
+- This confirms a reliable candidate ordering point for a narrowly gated queue copy. No output copy was attempted; configuration remains `replaceOutput=0`, `deferredOutput=1`.
+
+## 2026-08-27 — first narrowly gated queue-copy build deployed
+
+- Added a dedicated post-submit `TryQueueOutputCopy()` path. It runs only on the retained BeamNG queue, after native command-list submission, when an acknowledged helper frame has a completed output fence.
+- The path validates 2D resource dimensions and formats, atomically consumes one pending output, waits on the GPU fence, records barriers/copy/restore operations on a dedicated command list, and submits them to the game queue.
+- Added `queueCopy=1` to the deployed INI while leaving `replaceOutput=0`; the full DLSS pipeline is not invoked from ECL and direct Present replacement remains disabled.
+- Rebuilt successfully with VC2026 and deployed. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\queue-copy-pre-20260827-165041`.
+- The next run should be evaluated for `QUEUE COPY submitted`, black-window behavior, crashes, and whether the visible image changes.
+
+## 2026-08-27 — warmed queue copy still causes device removal
+
+- The 300-Present warmup gate prevented the startup copy, but the first eligible `QUEUE COPY submitted #1` still caused BeamNG device removal or an immediate access-violation crash.
+- The helper fence was valid in the latest session (`fence=290`); therefore the failure occurs at or after writing the shared DLSS output into the swapchain backbuffer, not during NGX evaluation or fence readiness.
+- Disabled `queueCopy` and restored evaluation-only operation. Revert backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\queue-copy-device-removal-20260827-165755`.
+- The next output design must avoid direct writes to the swapchain resource, even from the correct queue. The next candidate is a native presentation-chain resource discovered from BeamNG's own render graph, with an explicit device/resource ownership check before any copy.
+
+## 2026-08-27 — first queue copy reached GPU but crashed; disabled
+
+- The queue-copy test reached `ngx-b2: QUEUE COPY submitted #1` immediately before BeamNG crashed during the black-window startup phase.
+- The newest crash artifact reports an access violation at `BeamNG.drive.x64.exe + 0xD57BF3`.
+- One startup also reported `fenceDone=UINT64_MAX`, so invalid fence completion values must be rejected before any queue wait or copy submission.
+- Disabled `queueCopy` and restored evaluation-only operation. Revert backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\queue-copy-revert-20260827-165234`.
+- The queue hook and helper evaluation remain useful. The direct swapchain backbuffer is not yet a safe copy target; the next design must use a swapchain-compatible intermediate/present path and validate device/fence state explicitly.
+
+## 2026-08-27 — guarded queue-copy retry deployed
+
+- Added a Present warmup gate requiring 300 observed Presents before queue output copying can arm, preventing startup render-graph mutation.
+- Added explicit rejection for game-device removal and `GetCompletedValue()==UINT64_MAX` before any queue wait or copy submission.
+- Shape mismatch diagnostics now include the Present serial.
+- Enabled `queueCopy=1` with `replaceOutput=0`; the queue copy is now delayed and self-disables on invalid device/fence state.
+- Rebuilt successfully with VC2026 and deployed. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\queue-copy-guarded-pre-20260827-165535`.
+
+## 2026-08-27 — serial correlation instrumentation deployed
+
+- Stopped the ECL hook from overwriting the first real graphics queue with every direct-queue callback.
+- Added independent monotonic ECL and Present serials, including Present1 observations, so queue submissions can be correlated without relying on the inactive frame counter.
+- Added bounded correlation records while keeping the pipeline observation-only and the configuration at `replaceOutput=0`, `deferredOutput=1`.
+- Compiled successfully with VC2026 and deployed. Deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\serial-correlation-pre-20260827-164356`.
+
+## 2026-08-27 — topology logging build deployed; next implementation plan
+
+- Added compact `topo-state` snapshots at Present intervals. Each snapshot records the ECL/Present serials, retained game queue, cached backbuffer, tracked scene targets, currently bound RTV, last observed full-resolution copy source, and guarded resource descriptors (dimensions, format, flags, and sample count).
+- Added guarded descriptor-fault reporting so stale BeamNG resources are recorded as evidence rather than dereferenced unsafely.
+- Kept the known-unsafe output mutations disabled: `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`. DLSS/DLAA evaluation remains active through the helper, but no result is written into BeamNG's swapchain.
+- Built successfully with VC2026 and deployed. Pre-deployment backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\topology-logging-pre-20260827-170148`.
+
+### Turn-based implementation plan
+
+1. **Observe one clean run.** User launches BeamNG, reaches the map or main menu, and lets it run for about 60–120 seconds without resizing. We inspect only the new `topo-state`, `topo:`, `present-feed`, helper evaluation, and crash/device-removal lines.
+2. **Identify the safe source/target pair.** A candidate must be a stable full-resolution resource owned by the game device, appear in BeamNG's own render/presentation chain, and be distinct from the swapchain backbuffer. No copy is attempted until its identity, format, dimensions, and ordering are evidenced.
+3. **Add a dry-run handoff gate.** Log exactly when the candidate is written by native rendering and when the helper output is ready, including ECL/Present serials and fence values. The gate remains non-mutating for the first validation build.
+4. **Implement the smallest reversible visible-output experiment.** Use the candidate resource only if the gate proves it is alive at the ordering point; keep `replaceOutput=0` and `queueCopy=0` until the dry-run is confirmed. Enable one mutation at a time with an automatic device-removal and crash signature circuit breaker.
+5. **Validate visually and operationally.** User reports whether DLSS/DLAA artifacts, temporal changes, or a visible image change occurred. We correlate that report with logs, then address resize/lifecycle behavior and only afterward consider performance and memory cleanup.
+
+The immediate next run is step 1. It is observation-only and should provide the evidence needed for step 2 without another black-window experiment.
+
+## 2026-08-27 — reduced-resolution run exposed missing discovery signal
+
+- User completed a longer run at a non-maximized window size without reporting a crash or resize issue.
+- Present and helper evaluation remained healthy: the trace reached roughly 7,000 Present serials, sustained ECL submissions, and repeated `eval=ok` frames with completed fences.
+- The new topology snapshot fields for cached backbuffer, scene resources, bound RTV, and copy source remained null. This means the current command-list/resource discovery path is not observing BeamNG's render graph in this mode; it does not mean those resources are absent.
+- Extended the snapshot to include the bridge's actual Present backbuffer and DLSS output resources, bridge readiness, and deferred-pending state. Rebuilt and redeployed with `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+- Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\topology-b2-logging-pre-20260827-230444`.
+
+Next run remains observation-only and should confirm the bridge resource descriptors. The following implementation step is to restore or replace the disabled resource-discovery observation path, not to attempt another swapchain write.
+
+## 2026-08-27 — bridge topology confirmed in clean run
+
+- The latest approximately two-minute user run completed without a new crash, device-removal event, or reported rendering defect.
+- The bridge stayed ready and stable. The same bridge Present backbuffer remained `1920x983`, format `28`, flags `1`, and the same bridge output remained `1920x983`, format `28`, flags `36`, samples `1`.
+- ECL/Present correlation continued normally, and helper evaluations repeatedly completed successfully with completed output fences.
+- The native discovery fields (`bb`, `scene`, `sceneAlt`, `bound`, and `lastCopySrc`) remained null for the entire run. The command-list observation hooks are explicitly disabled, so the next blocker is render-graph visibility rather than NGX initialization, bridge synchronization, or output-resource validity.
+- No output mutation was attempted. Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`.
+
+The next implementation task is to build a narrowly scoped, observation-only command-list discovery mode (or an equivalent device-level resource path) with no resource writes. Only after it identifies a stable native presentation-chain resource will the visible-output path be revisited.
+
+## 2026-08-27 — consolidated evidence and genuine integration plan
+
+The project history has been consolidated into `docs/DLSS_INTEGRATION_PLAN.md`. The proven working subsystem is plugin loading, real BeamNG device/queue capture, Present observation, separate-helper NGX initialization, thousands of successful DLSS evaluations, valid fences, and stable observation-only runs.
+
+The actual blocker is output insertion into BeamNG's native presentation path. Direct Present replacement and guarded swapchain-backbuffer copying are rejected by crash/device-removal evidence. Native scene/RTV/copy resources remain invisible because command-list observation is disabled or not attached to BeamNG's real command lists.
+
+The next build is Phase 1 only: restore read-only native resource observation. No output mutation is permitted until a stable non-swapchain presentation-chain resource is proven.
+
+## 2026-08-27 — Phase 1 native observation build deployed
+
+- Code audit found the native resource hooks explicitly disabled behind `if (false)`, while `InstallCommandListHooks()` was only a disabled stub.
+- Added a cold `ID3D12Device::CreateCommandList` observer. It records real game command-list pointers, list type, vtable identity, and allocator without intercepting any hot command-list method.
+- Re-enabled only the cold device-level RTV/SRV creation hooks so native render-target candidates can be recorded. Hot `CopyTextureRegion`, `ResourceBarrier`, `OMSetRenderTargets`, descriptor-heap, viewport, and scissor methods remain unhooked.
+- Corrected one MinHook status check discovered during compilation; the first failed compile produced no deployment.
+- Rebuilt successfully with VC2026 and deployed the Phase 1 observation build. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\phase1-native-observe-pre-20260827-230444`.
+- Verified the deployed configuration remains `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`.
+
+The next run is successful if it produces `GAME CreateCommandList` records and/or native RTV/SRV candidate records while remaining stable. It is not a visible-output test; no output mutation is enabled.
+
+## 2026-08-27 — Phase 1 native resource discovery succeeded
+
+- The Phase 1 run produced real BeamNG `GAME CreateCommandList` records for direct and copy command lists. The cold device hook is attached to the game's device and sees the renderer's actual list creation path.
+- Re-enabled cold RTV/SRV observation produced many genuine native resources, including full-resolution `R16G16B16A16` scene-color candidates, `R16G16_FLOAT` motion-vector candidates, and depth SRV candidates. The renderer rotates these resources frequently, so one pointer is not a sufficient identity.
+- The bridge remained healthy during the run: repeated helper acknowledgements and `eval=ok` records had completed fences, and the same bridge Present backbuffer/output resources remained stable.
+- The cached BeamNG backbuffer pointer later produced guarded `desc-fault` records. This confirms that resource pointers observed through creation hooks can become stale and must not be used for output work without a lifetime/ordering proof.
+- Native `bound` and `lastCopySrc` remained unavailable because hot command-list methods are still not intercepted. The current evidence identifies native candidates but does not yet prove which one feeds Present.
+- The user reported a late crash likely related to helper memory exhaustion. No new crash artifact was found in the checked directory; memory remains deferred until after visible integration.
+- No output mutation was attempted. Configuration remains `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`.
+
+Phase 1 exit criteria are met: native resource creation is observable. The next gate is presentation-chain correlation, requiring a read-only relationship between candidate resources and Present before any copy or substitution is enabled.
+
+## 2026-08-27 — bounded native candidate registry deployed
+
+- Added a bounded 96-entry, read-only native candidate registry for qualifying full-resolution D3D12 resources. Each entry stores pointer, dimensions, format, flags, samples, RTV/SRV roles, creation counts, and ECL/Present serial context.
+- Added throttled Present-time candidate summaries so the next log can distinguish persistent resources from transient resource churn without producing a large trace.
+- The registry owns no COM references and all later descriptor reads remain guarded; it is evidence only and cannot extend resource lifetime or alter GPU work.
+- Built successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\candidate-registry-pre-20260827-232926`.
+- Verified safe configuration: `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`.
+
+The next run is successful if the registry records native candidates and Present summaries show which resources persist or are created near the active Present stream. This remains an observation-only build.
+
+## 2026-08-27 — long candidate-registry run analyzed; recency fix deployed
+
+- The long run remained active through at least 12,000 successful helper evaluations and sustained ECL/Present traffic before termination.
+- Native candidate discovery was productive: the registry reached its 96-entry limit and recorded many `1920x983` RTV/SRV resources in formats 10, 11, and 34, plus other render-sized resources. This confirms substantial renderer resource churn.
+- The first registry summary was biased toward startup entries because it emitted the first eight slots. The table also stopped accepting later candidates once full.
+- Changed the registry to evict the oldest creation-context entry when full and changed summaries to emit the eight most recently created candidates. This keeps long-run evidence focused on the active renderer window without retaining COM references.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\candidate-recentness-pre-20260827-233954`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`.
+
+The next run should be shorter (about 60–120 seconds) and will be judged by the recent candidate summaries, not by the eventual memory-related termination.
+
+## 2026-08-27 — long recency-registry run analyzed
+
+- The recency fix behaved correctly: recent summaries now surfaced resources created near the active Present stream, and the bounded table evicted older entries once full.
+- BeamNG continued creating and refreshing many full-resolution `1920x983` resources, especially formats 10 and 11, with both RTV and SRV roles. This is genuine renderer churn, not a single stable output target.
+- The registry still cannot establish which candidate feeds Present because `bound` and `lastCopySrc` remain unavailable while hot command-list methods are unhooked. Candidate creation order alone is insufficient for output integration.
+- The helper reached `23,857` frame messages, with `17,624` successful evaluations and `6,233` skips before the late-session rejection storm. The helper log reported approximately `4249MB` commit, then BeamNG produced a null access violation at `BeamNG.drive.x64.exe+0xD57EB7`.
+- Per the current project priority, the late memory/rejection/crash behavior is recorded as a separate deferred stability issue. It is not used as evidence for choosing an output target.
+
+The topology conclusion is unchanged: the next integration build must observe command-list resource usage or an equivalent native presentation relationship. No candidate is yet authorized for output mutation.
+
+## 2026-08-28 — per-command-list read-only observation build deployed
+
+- Replaced the disabled hot-method interception path with per-object command-list vtable shims. Each observed list receives a private cloned vtable; only `CopyTextureRegion`, `OMSetRenderTargets`, and `ResourceBarrier` are wrapped, and every call is forwarded to the original implementation.
+- The shim records only qualifying large native resources and does not copy, substitute, transition, retain, or otherwise modify any GPU resource. No MinHook patch is applied to the driver's hot command-list methods.
+- Added bounded/throttled `native-usage:` records for copy source/destination, render-target binding, and resource transitions, including the current Present serial for ordering analysis.
+- Built successfully with VC2026. Deployment snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\command-list-observe-pre-20260828-000406`.
+- Deployed the new `ScaleNG.asi`, helper, and DLSS runtime. The attempted `ScaleNG.dll` copy was unnecessary because this build produces the ASI package only; the existing safe deployment remains intact.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run BeamNG for 60–120 seconds without resizing and check for `hooks: command-list read-only shim installed` plus `native-usage:` records. This build is successful only if the game remains stable and provides native ordering evidence; it is not expected to show DLSS artifacts yet.
+
+## 2026-08-28 — command-list attachment moved to creation time
+
+- The validation run remained stable and installed two shims, but emitted no `native-usage:` events. The evidence showed the first attachment point was too late: `ExecuteCommandLists` runs after command recording has completed.
+- Changed `Hook_CreateCommandList` to install the read-only shim immediately after BeamNG creates each list, before the renderer can record work. The wrapper still forwards all calls unchanged and does not mutate output.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\command-list-create-observe-pre-20260828-001220`.
+
+Next validation: run 60–120 seconds without resizing. A useful result is stable execution with `native-usage:` events that can be ordered against Present. If events remain absent, the next change will be instrumentation of interface identity/recording path rather than enabling output mutation.
+
+## 2026-08-28 — per-object command-list coverage corrected
+
+- The creation-time run was stable and confirmed that two shims installed, but no `native-usage:` records appeared. Investigation showed the shim registry deduplicated by shared vtable address; BeamNG uses the same vtable for many distinct command-list objects.
+- Changed the registry identity to the command-list object plus its cloned vtable, allowing every distinct active list to receive its own observation table even when implementations share a vtable.
+- Expanded the bounded registry from 8 to 64 entries. It remains non-owning and does not retain COM references; stale entries are only a bounded observation limitation and cannot affect GPU lifetime.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\command-list-per-object-pre-20260828-002158`.
+
+Next validation: run 60–120 seconds without resizing. The expected signal is multiple shim-install records followed by throttled `native-usage:` copy/OM/barrier records. No visible-output option is authorized until those records identify a stable presentation relationship.
+
+## 2026-08-28 — per-object coverage validation analyzed
+
+- The first launch produced a D3D12Core access violation at `D3D12Core.dll+0x1922C5` while the per-object observer was active. The user identified this launch as an accidental crash; it is retained as a safety signal, but it is not treated as a confirmed reproducible integration failure.
+- The second launch ran successfully for several minutes with no device-removal or fatal record. It installed many distinct object shims, confirming that the shared-vtable identity issue is fixed.
+- The successful process produced native copy evidence, including a `1920x954` format-28 copy during startup and two-way `1920x1001` format-10 copies near Present serial 2085. This proves the wrapper is observing recorded native work, but these copies do not yet identify the swapchain backbuffer (`format 28`) as the DLSS output target.
+- No `native-usage: om` or `native-usage: barrier` event was captured in the successful process, so the next observation needs richer command-list context and broader copy/event coverage before any mutation is attempted.
+- Helper evaluation and deferred bridge Present remained healthy in the successful process. Output mutation remains disabled.
+
+The evidence advances the project into Phase 2 dry-run ordering, but does not authorize a visible-output experiment yet. The next build should improve event correlation and lifetime/order logging around the native copy candidates.
+
+## 2026-08-28 — native copy correlation build deployed
+
+- Added command-list metadata to native copy records: D3D12 command-list type, per-list copy ordinal, list creation Present/ECL serials, current Present/ECL serials, and the Present distance from list creation.
+- The metadata is captured without touching resource state or retaining resources. It is intended to distinguish startup/upload copies from render-output copies and to show whether a candidate is recorded near the active Present window.
+- The prior successful run established that the per-object shims see real copies, including a two-way format-10 copy pair near Present serial 2085. This build makes that relationship reproducible and less ambiguous.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\copy-correlation-pre-20260828-003122`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing. We need repeated copy records with their list type and Present/ECL context. No visible-output mutation is authorized until a stable chain is identified.
+
+## 2026-08-28 — native copy correlation run analyzed
+
+- The successful process ran through approximately 6,000 Present cycles and 32,000 ECL submissions, installed 38 distinct command-list shims, and produced no device-removal, fatal, or exception record.
+- The new correlation fields worked. Two qualifying copies were captured during startup: a type-0 list copied a `1902x945` format-28 resource, and a type-3 list performed the expected upload/initialization copy into a `1911x1911` format-28 resource. Their `createdPresent`/`createdEcl` and current Present/ECL values were recorded.
+- No qualifying native copy occurred during the long gameplay interval, and no OM or barrier observation appeared. Therefore the active scene/output path is likely recorded through another command-list interface/vtable path, or it uses draw/descriptor bindings rather than CopyTextureRegion for the final image.
+- This run validates stability and metadata correctness but does not identify a safe DLSS output target. No mutation was attempted.
+
+Next observation step: add low-rate invocation counters and interface/vtable identity records for all three wrappers, then inspect whether the methods are called through the cloned base interface at all. If they are not, follow the actual interface path before considering any output experiment.
+
+## 2026-08-28 — shim invocation diagnostics deployed
+
+- Added low-rate invocation counters for `CopyTextureRegion`, `OMSetRenderTargets`, and `ResourceBarrier`. The first few calls and sparse milestones log method name, command-list type, original/cloned vtable addresses, and current Present/ECL serials.
+- Added the requested command-list creation interface identity fields (`riid` Data1/Data2/Data3) to the creation records.
+- The successful preceding run showed 38 distinct shims and two startup copies, but no gameplay copy/OM/barrier events. This build will distinguish an unused base interface from a called interface whose resource filter is too narrow.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\shim-invocation-observe-pre-20260828-003928`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing and check `native-usage: invocation` records. Do not enable output mutation based only on copy counts; the method/interface path must first be identified.
+
+## 2026-08-28 — invocation diagnostics run analyzed
+
+- The latest process remained stable through approximately 9,600 Present cycles and 49,000 ECL submissions, with no device-removal, fatal, or exception record.
+- The counters proved that the cloned base interface is active during gameplay: `CopyTextureRegion` and `OMSetRenderTargets` both produced invocation records. Classic `ResourceBarrier` produced none, indicating that BeamNG either uses enhanced barriers or records transitions through another interface/path.
+- The successful process captured eight qualifying native copies, including a repeated two-way `1920x985` format-10 chain at Present serial 2636. This is an active render-sized copy chain, but it is not yet proven to feed the format-28 Present backbuffer.
+- OM calls were observed, but the CPU descriptor handles did not resolve through the current RTV map, so no `native-usage: om` resource record was emitted. This is a descriptor-identity limitation, not evidence that no render target was bound.
+- No output mutation was attempted. The next diagnostic should log raw OM descriptor handles and expand descriptor provenance; separately, enhanced `ID3D12GraphicsCommandList7::Barrier` coverage may be needed.
+
+## 2026-08-28 — raw OM descriptor observation deployed
+
+- Added a bounded `om-raw` trace for the first 120 render-target binding handles, including list identity, slot, descriptor count, CPU handle value, map-hit status, and Present/ECL serials.
+- Confirmed from the Windows SDK that enhanced barriers are exposed through `ID3D12GraphicsCommandList7::Barrier`; classic `ResourceBarrier` absence is treated as a separate interface-coverage question.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\om-raw-observe-pre-20260828-005242`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing and capture the raw OM handle stream. No output mutation is enabled.
+
+## 2026-08-28 — raw OM handle run analyzed
+
+- The run remained stable through approximately 12,900 Present cycles and 64,000 ECL submissions, with no device-removal, fatal, or exception record.
+- The raw trace captured 89 OM calls, but every sampled color-handle value was zero and unresolved. This indicates the observed OM calls are depth-only/unbinding-style calls or otherwise do not carry the final color RTV; handle zero is not a usable output candidate.
+- The native candidate stream continued to show many render-sized RTV/SRV resources in formats 10, 11, and 34, while the active Present backbuffer remained format 28. No direct candidate-to-Present relationship was established.
+- The read-only command-list path remains stable. Output mutation remains disabled.
+
+Next observation step: distinguish OM calls with non-null color handles and inspect the versioned command-list path used for enhanced barriers/color binding. Do not promote the zero-handle OM calls or format-10 copy chain to output targets.
+
+## 2026-08-28 — non-null color OM sampling build deployed
+
+- The previous raw OM sample budget was consumed by zero-handle calls before the sustained gameplay phase. Changed the trace to retain a separate sample budget for non-zero color handles.
+- Added `singleRange` and depth-handle fields to raw OM records, allowing depth-only, unbinding, and genuine color-target calls to be separated.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\om-color-sample-pre-20260828-010925`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing. The important result is any `om-raw` record with `handle` non-zero, regardless of whether the current map resolves it. No output mutation is enabled.
+
+## 2026-08-28 — command-list vtable slot correction deployed
+
+- The timed crash exposed an SDK-layout error in the observation shim. `CopyTextureRegion` was correctly assigned to slot 16, but `ResourceBarrier` and `OMSetRenderTargets` had been assigned to slots 52 and 22.
+- The Windows SDK places `ResourceBarrier` at slot 26 and `OMSetRenderTargets` at slot 46. The wrong slots explain the malformed OM arguments and the D3D12Core access violation at the first apparent barrier call.
+- Corrected the original/cloned slot assignments to 16/26/46. The wrappers remain pass-through observers; no output or GPU state mutation was added.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\vtable-slot-fix-pre-20260828-011635`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing. First priority is stability; then verify that OM handles and classic barrier records have sensible arguments. Roll back if D3D12Core/device-removal behavior recurs.
+
+## 2026-08-28 — corrected-slot native chain confirmed
+
+- The long run initially behaved well and validated the corrected command-list slots. It captured non-zero OM handles, including mapped color descriptors for render-sized resources.
+- A representative batch at Present serial 23704 showed valid transitions, copies, and color bindings on the same direct command-list path. Examples included format-28 resources transitioning between copy/read states, a format-11 `1920x983` resource bound through a mapped color descriptor, and format-34/45 render-sized intermediate resources.
+- This is the first confirmed native presentation-adjacent render batch with coherent OM, barrier, and copy arguments. The final Present backbuffer remains a separate format-28 resource, so the exact DLSS handoff target still requires ordering/lifetime validation.
+- The process later entered a sustained NGX rejection storm (`helper acknowledged ... but NGX rejected the frame`) and crashed at the previously observed BeamNG offset `+0xF0AAF8`. Per the user's report, this was helper-related and did not affect the gameplay experience; it remains deferred memory/stability work.
+- No output mutation was attempted.
+
+Phase 2 has now produced the required native ordering evidence. The next gate is to correlate the coherent batch to the helper input/output and Present handoff across repeated frames, then choose one reversible visible experiment.
+
+## 2026-08-28 — dry-run handoff correlation build deployed
+
+- Added a non-owning native correlation snapshot for the latest qualifying copy source/destination, mapped color binding, and barrier resource/state transition.
+- The snapshot is emitted at throttled Present and helper-ack/rejection points with native Present/ECL serials. It retains only pointer/descriptor identity and ordering metadata; it does not retain COM objects or alter GPU work.
+- This directly tests whether the native render batch, helper evaluation, and Present events form a repeatable handoff sequence before enabling visible output.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\handoff-correlation-pre-20260828-013410`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing and inspect repeated `native-correlation:` records at Present and helper acknowledgement. A visible experiment remains gated on repeatability and lifetime evidence.
+
+The Present snapshot label was corrected to report the actual global Present serial. Rebuilt and redeployed successfully; final rollback snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\handoff-correlation-final-pre-20260828-013458`.
+
+## 2026-08-28 — dry-run handoff correlation run analyzed
+
+- The run remained playable for well over five minutes and reached approximately 20,000 helper acknowledgements/23,000 Present snapshots before the deferred helper rejection/crash behavior.
+- Correlation records were emitted at both Present and helper acknowledgement points, proving the diagnostic path is active. However, after the last qualifying native batch, later records repeated the same native identities with an older `nativePresent`/`nativeEcl` value. The snapshot is therefore not yet freshness-safe.
+- The repeated late batch identified a format-34 `1920x983` resource as the latest color binding/copy pair. Format 34 is consistent with a motion-vector-style intermediate in this project, not a final color output. Earlier batches identified format-11 scene-color resources, but no current-frame proof ties either resource to the final Present backbuffer.
+- The helper entered a prolonged NGX rejection storm, followed by the known BeamNG `+0xD746D0` null access violation. Per the user's report, this did not harm gameplay experience and remains deferred helper/memory work.
+- No visible output mutation was attempted.
+
+The next gate is freshness-aware correlation: attach an age/serial threshold and require a new native batch near the same Present/helper frame before selecting any visible experiment. Cached stale intermediates must not be used.
+
+## 2026-08-28 — freshness-gated correlation build deployed
+
+- Added a generation counter and Present/ECL age calculation to the native correlation snapshot.
+- Every Present/helper correlation record now reports `fresh`, generation, Present age, and ECL age. The current diagnostic eligibility threshold is at most 120 Present serials and 1200 ECL serials since the latest native observation.
+- This is validation-only: the freshness flag does not enable output work. It exists to reject stale format-34/format-11 intermediates before a future visible experiment.
+- Rebuilt successfully with VC2026 and deployed. Backup: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\freshness-gate-pre-20260828-015241`.
+- Safe configuration remains `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0`.
+
+Next validation: run 60–120 seconds without resizing and inspect repeated `native-correlation:` records. A candidate is useful only when `fresh=1` at the helper/Present decision point and its identity/format is appropriate for color output.
+
+## 2026-08-28 — freshness-gated correlation run analyzed
+
+- The latest run was stable for several minutes, reaching roughly Present 24,000 and ECL 118,000 in the captured process records. No fatal, device-removal, or exception record was associated with this run.
+- The freshness gate behaved as intended: a newly observed native batch was temporarily reported as `fresh=1`, while later snapshots became `fresh=0` as the Present/ECL ages grew. This prevents an old resource identity from being treated as a current-frame target.
+- The useful native batch near Present 10,505 contained a format-28 copy chain, a mapped `1920x983` format-11 color binding, format-34 motion-vector-style intermediates, format-45 intermediates, and repeated format-10 copies. This is strong render-graph evidence, but it is not yet proof of the final presentation resource or the exact DLSS insertion point.
+- Helper evaluation/acknowledgement continued, but `replaceOutput=0` remained active. Therefore no visible upscaling artifacts were expected or produced; the run validates observation and correlation only.
+- No new binary was deployed during this log review. The freshness-gated build remains the deployed build, with the rollback snapshot at `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\freshness-gate-pre-20260828-015241`.
+
+Next implementation gate: replace the mixed “latest copy/latest OM/latest barrier” snapshot with a coherent per-batch record keyed by the same ECL/Present window. Only a batch containing a plausible color resource, its state transitions, and helper timing may proceed to target validation. Do not enable visible output yet.
+
+## 2026-08-28 — latest stable gameplay run reviewed
+
+- Process `p12376` loaded the freshness-gated build successfully and maintained a stable Present stream through approximately Present 19,800 and ECL 98,400 in the captured tail. The gameplay window itself remained usable; the ending failure is treated as the previously observed helper/rejection shutdown behavior per the user's report.
+- Native observation continued to work. Early records captured real color and intermediate resources, including a `1902x936` format-11 render target and a `1920x983` format-28 chain. The initial records also showed the expected format-34/45/10 supporting resources.
+- Freshness behavior was confirmed again: early records were `fresh=1` while native activity was current, then later records correctly became `fresh=0` as the cached native batch aged. The late snapshot showed generation 136 with native Present 10,617 versus current Present 19,808, and Present age 9,191; it was correctly ineligible.
+- The significant negative result is helper health: the log counted approximately 5,108 `NGX rejected` acknowledgements and no successful evaluation/acceptance records in this process's extracted lifecycle records. Because the user changed maps and enabled a feature in a modded map during this run, this rejection storm must be treated as a possible scene/render-graph reinitialization or input-contract change, not automatically as a shutdown-only failure. The game remained stable from the user's perspective, but the run did not provide a valid DLSS output frame for correlation.
+- No visible artifacts were expected because `replaceOutput=0` remains active. No binary was changed or deployed during this review.
+
+Next gate: reproduce the map/feature transition with logging around resource-generation changes and helper input dimensions/formats, then determine why the helper enters sustained NGX rejection. Coherent native-batch capture remains necessary, but a visible experiment must also require a non-zero accepted-evaluation streak and a matching helper output fence.
+
+## 2026-08-28 — map/feature transition diagnostics deployed
+
+- Added helper-side setup-generation tracking. Every shared-resource setup now logs generation, dimensions, format, handle values, start fence value, and setup age. This distinguishes a genuine map/feature renderer reset from a stale helper session.
+- Added throttled NGX rejection context: evaluation result, feature-creation result, setup generation/age, color/output/depth/motion identities, and color/output descriptors. This should identify whether sustained rejection follows a resource replacement, unsupported format, dimension mismatch, or feature-state problem.
+- Backed up the previous deployed files at `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\map-feature-diagnostics-deploy-pre-20260828-022627`.
+- Rebuilt successfully with VC2026 and deployed `ScaleNG.asi`, `ScaleNG_NGX_helper.exe`, and the validated `nvngx_dlss.dll` to `C:\games\BeamNG.drive\Bin64\plugins`. The INI remains safe: `replaceOutput=0`, `deferredOutput=1`, `queueCopy=0`.
+- The next test should intentionally repeat the map change and modded-map feature activation, then allow the game to run long enough to capture the transition. Do not resize during the diagnostic interval; no visible output mutation is enabled.
+
+## 2026-08-28 — map/mod run confirms core NGX evaluation
+
+- The latest process `p13216` loaded the diagnostics build, reached the modded-map path, returned to the original map, and maintained a usable Present stream through at least Present 7,000 / ECL 34,800 in the captured records.
+- The helper session associated with this run accepted every captured evaluation: approximately 7,175 frames, `recorded=1`, `ngxResult=1`, `skip=0`, followed by `parent exited - bye`, `parent shutdown complete - exit`, and `pipe closed - exit`.
+- The earlier rejection storm remains visible in the append-only helper log, but it belongs to the prior helper session. It must not be conflated with this run's successful helper session.
+- The map/mod actions changed native candidate identities and intermediate resources, while the helper setup remained at `1920x983` with setup generation 1. This means the core NGX evaluation path survived the map/feature sequence; the current blocker is still output visibility/handoff, not basic DLSS evaluation.
+- No visible artifacts were expected because `replaceOutput=0` remains active. No binary was changed during this review.
+
+This closes the core-evaluation validation gate for this scenario. The next implementation step can focus on the first reversible output experiment, but only after selecting a same-batch color target and preserving the existing circuit breakers.
+
+## 2026-08-28 — coherent native-batch target validator deployed
+
+- Added a per-serial native batch accumulator covering the same Present/ECL window. It records whether a qualifying copy, mapped color RTV, and resource transition occurred together.
+- Added `native-batch: coherent=1` diagnostics that name the candidate color resource, format, copy endpoints, barrier resource/states, and the shared Present/ECL key. The validator excludes the cached swapchain backbuffer and accepts only plausible color formats.
+- This is still observation-only. It does not retain COM references, alter command lists, copy output, or enable `replaceOutput`/`queueCopy`.
+- Rebuilt successfully with VC2026 and deployed. Rollback snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\coherent-batch-pre-20260828-023635`.
+- The next run should be a normal short session. The success signal is repeated coherent-batch records for the same color candidate, not visible artifacts; visible output remains gated until the record is repeatable and helper evaluation/fence timing matches it.
+
+## 2026-08-28 — coherent-batch validator run analyzed
+
+- The run remained stable through at least Present 14,400, with repeated helper acknowledgements and no NGX rejection, fatal, device-removal, or exception record in the active process.
+- The helper reached approximately 14,674 accepted evaluations with `ok=14674 skip=0` before clean parent shutdown. Core NGX evaluation remained healthy throughout the run.
+- The validator emitted zero `native-batch: coherent=1` records. Native work was still present: the trace captured `1920x983` format-28 copy/barrier activity and a mapped `1920x983` format-11 color resource. BeamNG distributes these events across multiple ECL submissions within one Present interval, so the exact same-ECL grouping was too strict.
+- No visible output was attempted. The swapchain backbuffer and helper output remain untouched.
+
+Next implementation adjustment: widen the read-only batch window to the bounded ECL sequence belonging to one Present interval while retaining freshness, target-format, backbuffer-exclusion, and generation checks. Do not enable mutation until that widened record is repeatable.
+
+## 2026-08-28 — Present-window batch correlation deployed
+
+- Widened the native batch key from exact `(Present,ECL)` equality to the Present interval. The validator now accumulates related ECL submissions until the next Present boundary and reports the first-to-last ECL range.
+- Retained all safety gates: plausible color format, swapchain-backbuffer exclusion, freshness/generation checks, and observation-only behavior.
+- Rebuilt successfully with VC2026 and deployed the ASI/helper package. Deployment rollback snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\present-window-batch-deploy-pre-20260828-031411`.
+- The next run's key signal is repeated `native-batch: coherent=1` records naming a stable non-backbuffer color resource. No visible output mutation is enabled yet.
+
+## 2026-08-28 — Present-window batch run analyzed
+
+- The run remained stable through at least Present 14,400. The helper completed approximately 14,674 evaluations with `ok=14674 skip=0`; no NGX rejection, fatal, device-removal, or exception was recorded for the active process.
+- The widened validator emitted eight coherent records, but all belonged to the startup boundary at `batchPresent=1` and ECL range `0–2`. They named target `28587934D20`, format 11, while BeamNG was still assembling its initial presentation resources.
+- No coherent records were emitted after sustained gameplay began, despite continued native copy/RTV/barrier observation. This shows the Present-window grouping is no longer too narrow, but the current target criteria still identify a startup composition batch rather than a repeatable gameplay handoff.
+- No visible output mutation was attempted, and no artifacts were expected.
+
+Next gate: exclude startup-only batches and require the candidate to recur across multiple later Present intervals with matching helper acceptance/fence timing. The visible experiment remains disabled.
+
+## 2026-08-28 — gameplay target recurrence validator deployed
+
+- Added a startup exclusion: coherent batches before Present 120 are ignored because they belong to BeamNG's initial composition/setup phase.
+- Added bounded candidate history for non-backbuffer color resources. A candidate is marked `repeatable=1` only after appearing in three separate later Present intervals; each record reports its hit count and Present/ECL range.
+- The validator remains observation-only and retains format, freshness, generation, and backbuffer-exclusion gates.
+- Rebuilt successfully with VC2026 and deployed. Rollback snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\gameplay-target-recurrence-deploy-pre-20260828-032401`.
+- The next run should be judged by a repeated `native-batch` candidate with `repeatable=1`. No output mutation is enabled.
+
+## 2026-08-28 — gameplay recurrence run analyzed
+
+- The newest process remained stable through at least Present 7,200. Its helper session reached approximately 7,066 accepted evaluations with `recorded=1`, `ngxResult=1`, and `skip=0`, followed by clean parent shutdown.
+- The startup exclusion prevented the earlier Present-1 composition batch from being promoted. No later `native-batch` candidate reached `repeatable=1`.
+- Native observation and the broader correlation stream remained active, but the complete color/copy/barrier combination was not captured as a repeatable gameplay batch under the current Present-window rule. This is a clean negative result for target selection, not a DLSS evaluation failure.
+- No visible output mutation was attempted and no artifacts were expected.
+
+Next gate: correlate by the renderer's bounded frame/ECL sequence rather than requiring all events to be attached to one Present serial. Keep the startup exclusion and recurrence history, and do not enable visible output until a gameplay candidate recurs.
+
+## 2026-08-28 — bounded renderer-frame correlation deployed
+
+- Widened the native batch accumulator to a bounded four-Present interval. BeamNG's observed renderer work can straddle a small Present boundary while still belonging to one frame/composition sequence.
+- Each candidate record now reports first/last Present and first/last ECL values. Startup exclusion, candidate recurrence, freshness, plausible-format, and swapchain-backbuffer filters remain active.
+- Rebuilt successfully with VC2026 and deployed the observation-only package. Rollback snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\bounded-frame-batch-deploy-pre-20260828-033059`.
+- The next run should look for a gameplay `native-batch` record reaching `repeatable=1`. No output mutation is enabled.
+
+## 2026-08-28 — bounded-frame run analyzed
+
+- The latest run remained stable through at least Present 5,400 and continued helper acknowledgements with successful deferred-fence timing. The helper reached approximately 5,400 accepted evaluations with `recorded=1`, `ngxResult=1`, and no skips in the captured interval.
+- No gameplay `native-batch` candidate reached `repeatable=1`; the startup-only candidate was correctly excluded by the Present-120 gate.
+- The native trace still reports a persistent `1920x983` format-11 scene-color resource and separate format-10/34/45 intermediates. The missing signal is not native discovery or NGX evaluation; it is a repeatable association between that persistent scene-color identity and the exact command sequence feeding displayed output.
+- No visible output mutation was attempted. The safe INI remains unchanged.
+
+Next implementation focus: promote the persistent scene-color identity into a read-only handoff candidate using lifetime/recurrence evidence, while separately recording the final copy/presentation sequence. Do not use startup-only or motion-vector candidates for output.
+
+## 2026-08-28 — persistent scene-color candidate deployed
+
+- Added a read-only scene-color lifetime tracker. It samples the already discovered display-sized format-11/format-10 scene-color identities once per 60 Presents, stores only weak resource identities, and never retains COM references or changes resource state.
+- The tracker excludes the cached swapchain backbuffer and mismatched display dimensions. It reports the first observation, promotion after three samples, and periodic lifetime updates as `native-target: scene-color-observed` records.
+- Built successfully with the repository's VC2026 toolchain and deployed the ASI, helper, and packaged DLSS feature beside the plugin. Deployment rollback snapshot: `C:\games\BeamNG.drive\Bin64\ScaleNG-backups\scene-color-candidate-deploy-pre-20260828-034010`.
+- This build remains observation-only: `replaceOutput=0`, `deferredOutput=1`, and `queueCopy=0` are unchanged. No visible-output experiment is enabled by this change.
+
+The next run should be judged by a scene-color record with `persistent=1`, a long Present span, and a stable identity across normal gameplay. That evidence will be used to select the first guarded output handoff experiment.
+
+## 2026-08-28 — pre-deployment run evidence reviewed
+
+- The latest available process (`p15532`) ran through at least Present 5,645 with successful helper acknowledgements and no active-process fatal/device-removal record in the captured tail.
+- The primary tracked scene resource remained `1902x936`, format 11, while the display-sized `1920x983`, format-11 alternate changed identities repeatedly. This confirms why a weak “latest scene pointer” is insufficient and why the new tracker samples recurrence without retaining or mutating those resources.
+- The log predates the persistent-candidate deployment, so it contains no `native-target: scene-color-observed` records. The next launch is the first valid test of this diagnostic.
+
+## 2026-08-28 Vector A aggressive handoff deployed
+
+- Added g_vectorAOneShot / g_vectorAEnabled and TryVectorA path via Shim_CopyTextureRegion (src\d3d12_hooks.cpp:1207 shim now calls TryVectorA after ObserveNativeCopyUsage). Previous CopyTexBody deferred candidate required sd.Format==dd.Format which blocks the common final blit where src is mt 11 1920x983 scene-color and dst is mt 28 1920x983 backbuffer. Vector A relaxes to allow dst display-sized mt 28 full-frame where src is any display-sized 1920x983 (logs persistence via g_sceneColorCandidates at src\d3d12_hooks.cpp:851), fence completed>=pending and presentSerial>300, one-shot.
+- Helpers SafeGetDesc / SafeGetFenceCompleted added (src\d3d12_hooks.cpp:995) to avoid __try in unwinding function (C2712).
+- Forward declaration TryVectorA before shim and definition after B2CheckIniFlag (src\d3d12_hooks.cpp:2696) ensures visibility of g_b2Deferred* etc.
+- Built with VC2026 src\build.bat:56 ? dist\ScaleNG.asi 966,144 CD05FBB8668A2E9ECBD84736494423C5D755D7C424EC24AED94ED8F7452BC311 / dist\ScaleNG_NGX_helper.exe F7311B3C21A1DA00071FA3D9E684D44B4B9F861D84C85D59082343B48AFDAAA0 / 
+vngx_dlss.dll 4E86DAD0� (unchanged). Deployed to C:\games\BeamNG.drive\Bin64\plugins after stopping helper; hashes verified dist==deployed. Previous deployment backed up at C:\games\BeamNG.drive\Bin64\ScaleNG-backups\vectorA-pre-20260828-054250 / ectorA-deploy-pre-20260828-054250.
+- This build changes rendering on exactly one engine-owned CopyTextureRegion where conditions pass (barriers COMMON->COPY_SOURCE / COPY_SOURCE->COMMON around replacement g_b2OutG 1920x983 fmt 28). All other copies forwarded. One-shot prevents repeat corruption. Safe INI remains eplaceOutput=0 deferredOutput=1 queueCopy=0; Vector A is the first guarded eplaceOutput-like path via engine list.
+- Rollback: restore C:\games\BeamNG.drive\Bin64\ScaleNG-backups\vectorA-deploy-pre-20260828-054250\ScaleNG.asi if black window / device removal / crash.
+- Next run: 60-120s without resize, judge by ectorA: attempting handoff / ectorA: DLSS output substituted plus 
+ative-target persistent and 
+gx-b2: frame eval=ok with same pending. Visible image change required for success.
+
+
+## 2026-08-28 Vector B OM descriptor hijack deployed
+
+- Added Vector B one-shot via Shim_OMSetRenderTargets (src\d3d12_hooks.cpp:1235 now calls TryVectorB). Added globals g_vectorBOneShot/Enabled (src\d3d12_hooks.cpp:2578), helper SafeOverwriteRTV (src\d3d12_hooks.cpp:1007), forward decl TryVectorB (src\d3d12_hooks.cpp:1207), and definition after B2CheckIniFlag (src\d3d12_hooks.cpp:2708).
+- Vector B logs every non-zero color RTV handle whose mapped resource (g_rtvMap via BookGuard) is display-sized 1920x983 and mt 11/10 (ectorB: candidate handle=%llX resource=%p size=%ux%u fmt=%u present=%llu ecl=%llu pending=%llu completed=%llu). Requires persistence samples>=3 via g_sceneColorCandidates (src\d3d12_hooks.cpp:851), presentSerial>300, g_b2DeferredPending + SafeGetFenceCompleted>=pending, non-backbuffer es!=g_bbCached, one-shot g_vectorBOneShot.
+- On first qualifying candidate, logs ectorB: attempting and atomically consumes g_b2DeferredPending; then SafeOverwriteRTV(g_b2OutG, handle) overwrites the descriptor at that CPU handle to point to the shared 1920x983 fmt28 DLSS output (g_device->CreateRenderTargetView). Logs ectorB: substituted on success and forwards to original shim->omSetRenderTargets with hijacked descriptor; on failure logs ectorB: skipped and restores g_vectorBOneShot. No queue-copy, Present, resource state, or eplaceOutput changes. Exception guard via SafeOverwriteRTV try/except.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 966,656 DC83723BACCA803A253F552BB2AED08DAFC573300C3B11977B8AAB017C84EC52 / ScaleNG_NGX_helper.exe F0009B8640533C31B12AEA559C24089994F50772678CB06C3A8B57739545016D / 
+vngx_dlss.dll 4E86DAD0� (unchanged). Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-pre-20260828-061555 and ectorB-deploy-pre-20260828-061555. Vector A remains in place but Shim_CopyTextureRegion continues to miss (engine final not via copy); Vector B is the first OM-based attempt.
+- INI unchanged eplaceOutput=0 deferredOutput=1 queueCopy=0 helper=1. Rollback: restore ectorB-deploy-pre ASI if device removal/black/crash. Next run: short 60-120s without resize, judge by ectorB: candidate / ttempting / substituted / skipped plus 
+ative-target persistent and 
+gx-b2: frame eval=ok for same pending.
+
+
+## 2026-08-28 Vector B provenance diagnostic deployed (observation-only)
+
+- Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 now logs every qualifying display-sized RTV creation (>=1000x500 Mips==1 Count==1) as tv-provenance: create handle=%llX resource=%p size=%ux%u fmt=%u flags=%u (src\d3d12_hooks.cpp:1614), not only scene-color.
+- TryVectorB src\d3d12_hooks.cpp:2784 rewritten to observation-only: for every non-zero OM handle logs ectorB: probe handle=%llX foundInMap=%u resource=%p isDisplay=%u format=%u present=%llu ecl=%llu; when oundInMap && isDisplay also logs ectorB: candidate handle=%llX resource=%p size=%ux%u fmt=%u present=%llu ecl=%llu pending=%llu completed=%llu. If any isDisplay seen, dumps first 16 g_rtvMap entries as ectorB: rtvMap handle=%llX resource=%p size=%ux%u fmt=%u. No SafeOverwriteRTV call in this build.
+- Disabled visible mutation: g_vectorAEnabled=false (src\d3d12_hooks.cpp:2579) and TryVectorB always returns alse after logging, so Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 forwards unchanged. eplaceOutput=0 queueCopy=0 preserved.
+- Helpers SafeGetDesc/SafeGetFenceCompleted/SafeOverwriteRTV kept (src\d3d12_hooks.cpp:996) but SafeOverwriteRTV not invoked.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 968192 D913D482C7C08F0EF662C29664655A08CA623E4383CDE37212BC253846237CA2 / helper 1B661AF4C675462AD0396A187BB489252005B02E4598088B8A0BF4D3F9ED6480 / 
+vngx_dlss.dll 4E86DAD0�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups provenance-pre-20260828-064018 / provenance-deploy-pre-20260828-064018. Only success criterion for this turn is identifying the actual OM CPU handle that maps to the persistent 1920x983 fmt11 scene resource.
+
+
+## 2026-08-28 Vector B guarded one-shot substitution enabled
+
+- Enabled TryVectorB substitution via Shim_OMSetRenderTargets src\d3d12_hooks.cpp:2784 using runtime-resolved OM handle/resource mapping (no hardcoded 21137762A80). Gates: presentSerial>300, oundInMap=1, persistent samples>=3 (g_sceneColorCandidates src\d3d12_hooks.cpp:851), 1920x983 mt 11/10 isDisplay, es!=g_bbCached, pending!=0 SafeGetFenceCompleted>=pending (src\d3d12_hooks.cpp:996), one-shot g_vectorBOneShot atomic. Logs ectorB: candidate for display-sized, ectorB: attempting with handle/resource/size/fmt/present/ecl/pending/completed, ectorB: substituted with origRes/repl on SafeOverwriteRTV(g_b2OutG, candidateHandle) success (src\d3d12_hooks.cpp:1007), otherwise ectorB: skipped. Forwards hijacked handles to shim->omSetRenderTargets once.
+- Preserved observation: tv-provenance src\d3d12_hooks.cpp:1614 and ectorB: probe / tvMap dump remain. g_vectorAEnabled=false, no Vector A/C queue-copy Present state mutation, eplaceOutput=0 queueCopy=0 ScaleNG.ini unchanged. Exception guard via SafeOverwriteRTV try/except.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 969728 6E1C5D22D44C9F49FE177022102C8B6C902F174A13A7D6A2A0D536847A4595E8 / helper  42C3CC2363ED04B8B210698876C9DABF133CEC6C86AECC97F5B15BAAE1DC530 / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-subst-pre-20260828-070024 / ectorB-subst-deploy-pre-20260828-070024. Rollback: restore that ASI if black window/crash/freeze/device removal or no substituted record. Next run judged by ectorB: substituted + 
+ative-target persistent + 
+gx-b2 eval=ok pending + visible change.
+
+
+## 2026-08-28 Vector B visible one-shot (samples>=1) deployed
+
+- Changed only persistence gate in TryVectorB src\d3d12_hooks.cpp:2859 from samples>=3 to samples>=1 for this one-shot experiment. No change to provenance tv-provenance 1614, ObservePersistentSceneColor 1061 (>=3 for persistent flag), descriptor dimensions/format, backbuffer exclusion, fence completed>=pending, presentSerial>300, one-shot g_vectorBOneShot/g_b2DeferredPending, exception guard SafeOverwriteRTV 1007, or SafeGetDesc logic.
+- Keeps runtime-resolved OM handle mapping (g_rtvMap.find BookGuard), 1920x983 fmt11/10 isDisplay, es!=g_bbCached, valid pending g_b2DeferredVal SafeGetFenceCompleted, one substitution only via g_device->CreateRenderTargetView(g_b2OutG, nullptr, candidateHandle) with shim->omSetRenderTargets forwarding.
+- g_vectorAEnabled=false Vector C disabled, eplaceOutput=0 queueCopy=0 ScaleNG.ini unchanged.
+- Logs ectorB: candidate/ttempting/substituted with handle/resource/size/fmt/present/ecl/pending/completed and samples implicitly via persistent check (now >=1 qualifies). Previous p16148 200479B52C0 1920x987 fmt11 present=3567 pending=3558 would have been skipped persistent=0 at >=3 but qualifies at >=1.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 969728 90C0DEA8039500F9FCD8DC6B383C7283C5DA3E27DEA932994FFECCA931C6EDCA / helper BDA308A46721DB2FCDA2F0BC197F1538F5B8C00B86F78EDE67514C7D390563CD / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-visible-pre-20260828-073732 / ectorB-visible-deploy-pre-20260828-073732. Rollback: restore that ASI if black/crash/freeze/device removal. Next run judged by ectorB: substituted + 
+ative-target + 
+gx-b2 eval=ok for same pending and visible change.
+
+
+## 2026-08-28 Vector B full-slot observation deployed (no substitution)
+
+- Kept exact display-sized 1920x983/987 mt11/10 requirement. TryVectorB src\d3d12_hooks.cpp:2784 now scans handles[0..count) i<8 independently, never returns early after handles[0]. For every non-zero handle logs ectorB: slot=%u handle=%llX foundInMap=%u resource=%p size=%ux%u fmt=%u samples=%u present=%llu ecl=%llu pending=%llu completed=%llu isDisplay=%u (includes slot index, handle, esource, dimensions, ormat, samples via g_sceneColorCandidates 851, Present/ECL 323, pending g_b2DeferredVal completed SafeGetFenceCompleted 1002). When oundInMap && isDisplay also logs ectorB: candidate.
+- When any slot is isDisplay logs full ectorB: omCall count=%u singleRange=%u present=%llu ecl=%llu handles=%llX %llX %llX %llX and dumps first 16 g_rtvMap as ectorB: rtvMap handle=%llX resource=%p size=%ux%u fmt=%u (BookGuard 730). tv-provenance src\d3d12_hooks.cpp:1614 still logs every >=1000x500 RTV handle as before.
+- SafeOverwriteRTV src\d3d12_hooks.cpp:1007 not called this build; TryVectorB always returns alse after logging, Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 forwards unchanged. g_vectorAEnabled=false Vector A/C disabled, eplaceOutput=0 queueCopy=0 preserved. No queue/Present/state mutation.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 969216 BB4A428BED25B630F3BD0B925C891F80A3D3B8BC0C257AAFEC3AB4663AA69AF0 / helper 68FFE51CA27E667AE386FD2E646CDCDC4496100805AF68BD4D43A3BEEBC4CF6A / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-observe-pre-20260828-075228. Success = OM slot that is isDisplay=1 oundInMap=1 samples>=1 with pending/completed ready, even if not persistent/ence ready.
+
+
+## 2026-08-28 Vector B armed reduced-log deployed
+
+- Reduced per-OM WriteFile overhead: TryVectorB src\d3d12_hooks.cpp:2784 now only logs detailed slot/candidate/omCall/tvMap when sawDisplaySized (1920x984 fmt11/10) or enceReady (pending!=0 && completed>=pending && g_b2DeferredPending). Otherwise OM forwarded with no WriteFile.
+- Added armed state g_vectorBArmed* src\d3d12_hooks.cpp:2593 (g_vectorBArmed g_vectorBArmedRes/Handle/Samples/Pending) set when persistent samples>=1 display-sized candidate with enceReady exists, even if current OM binds other resource. Logs ectorB: armed handle=%llX resource=%p size=%ux%u fmt=%u samples=%u present=%llu pending=%llu completed=%llu.
+- On later OM that binds exact g_vectorBArmedHandle, logs ectorB: armed-match and performs one-shot SafeOverwriteRTV(g_b2OutG) src\d3d12_hooks.cpp:1007 with present>300 oundInMap persistent 
+on-backbuffer pending completed>=pending one-shot exception guard, logs ectorB: substituted. Keeps tv-provenance src\d3d12_hooks.cpp:1614 for >=1000x500 RTVs.
+- g_vectorAEnabled=false Vector A/C disabled, eplaceOutput=0 queueCopy=0 preserved, one substitution only.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 971264 9CE2E3DE8B756BCE20C40D97DBE7B5B6F6BFF6E8D8141340F2CA263005B60E54 / helper  6D2C0A2E58D6A7D403A2F48DCF7A4525B8A84D7D7514822C06418B9AF45703D / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-armed-pre-20260828-084617. Next run judged by rmed ? rmed-match ? substituted with same pending and visible change.
+
+
+## 2026-08-28 Handle provenance diagnostic (observation-only)
+
+- Investigated why armed 1920x983 fmt11 RTV 1692DC5C0A0?168CC44A8B0 at present 919 never appears in later OMSetRenderTargets despite samples=15 and enceReady. Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 g_rtvMap 730 stores handle?resource but handle can be reused for new resource; Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 TryVectorB src\d3d12_hooks.cpp:2784 previously logged every OM handle as oundInMap=0 for 1920x984 after present 919 (p17936 1E4E5C03040 etc) � proves OM at that present bound 1902x938/128x128 not 1920x984.
+- Added g_lastDisplayRTVHandle/Resource/Present src\d3d12_hooks.cpp:730 tracking last display-sized RTV creation, tv-provenance: handle reuse log when handle.ptr already in g_rtvMap with different oldRes, and ectorB: lastDisplay bound log when OM handle equals g_lastDisplayRTVHandle (src\d3d12_hooks.cpp:2813). TryVectorB now logs ectorB: slot only when sawDisplaySized||fenceReady to avoid 1fps overhead, dumps tvMap 16 only when sawDisplaySized, and is observation-only (eturn false before SafeOverwriteRTV src\d3d12_hooks.cpp:1007).
+- Kept exact oundInMap=1 isDisplay 1920x983 fmt11/10 persistent samples>=1 
+on-backbuffer present>300 completed>=pending one-shot gates but disabled substitution for this build. g_vectorAEnabled=false Vector A/C disabled, eplaceOutput=0 queueCopy=0.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970240 2EF4B9A751C88236F622A7BD58E55A6F3837ACAD97454FCBE5B2D7E885DF2F15 / helper EE115C5B2FAC955AAD713BB19AA27AAEA8FD894B722A1897D92CAECE4B5D1040 / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-armed-pre-20260828-084617 etc. Next success = lastDisplay handle appears as ectorB: lastDisplay bound at same present as rmed and later rmed-match would fire if substitution re-enabled.
+
+
+## 2026-08-28 Resource-level correlation diagnostic (observation-only)
+
+- Added DisplayRTVRecord g_displayRTVHistory[8] src\d3d12_hooks.cpp:730 tracking last 8 display-sized mt11 creations (handle/resource/size/fmt/present). Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 now logs tv-provenance: handle reuse when handle already in g_rtvMap with different oldRes, and records g_lastDisplayRTV* + history with Log rtv-provenance: display history.
+- TryVectorB src\d3d12_hooks.cpp:2784 now resource-level: for every OM handles[0..count) logs ectorB: slot only when sawDisplaySized||fenceReady (reduced WriteFile), logs ectorB: lastDisplay bound when handle==g_lastDisplayRTVHandle, and logs ectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu samples=%u pending=%llu completed=%llu persistent=%u when OM es equals tracked display esource even if handle recycled (checks g_sceneColorCandidates 851 and g_displayRTVHistory). Keeps oundInMap isDisplay samples pending/completed present>300 gates but eturn false before SafeOverwriteRTV 1007 � observation-only, no Vector A/C queueCopy Present mutation, eplaceOutput=0.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970752 E6A7E635142E836BB636C6657B221D960A0A45DAD8BBD400C65FAE58FB72FBC9 / helper 227DFB37F67647A7A5BFFF288C91D6982946FA8D66E037E34C25CE1742D52668 / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-track-pre-20260828-221420. Next success = esource-match where creationHandle creationRes creationPresent and omHandle omRes omPresent share same esource 1920x984 fmt11 with samples>=1 enceReady.
+
+
+## 2026-08-28 Resource-level OM correlation (observation-only)
+
+- Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 now records DisplayRTVRecord g_displayRTVHistory[8] for display-sized mt11 and logs tv-provenance: handle reuse and display history. TryVectorB src\d3d12_hooks.cpp:2784 now scans handles[0..count) for oundInMap isDisplay and logs ectorB: slot only when sawDisplaySized||fenceReady (reduced WriteFile), and logs ectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu samples=%u pending=%llu completed=%llu persistent=%u when OM es equals tracked display esource even if handle recycled (g_sceneColorCandidates 851 samples + g_displayRTVHistory 730). Keeps oundInMap=1 isDisplay persistent>=1 
+on-backbuffer present>300 completed>=pending gates but eturn false before SafeOverwriteRTV 1007 � no Vector A/C queueCopy Present mutation, eplaceOutput=0.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970752+ 7358171BE4A4826F6BCDE1F56F4FF235E5815FC084815CE3580D753742F263FA / helper 227DFB37� / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next success = esource-match where creationRes==omRes 1920x984 fmt11 samples>=1 enceReady.
+
+
+## 2026-08-28 Resource-level OM correlation unconditional (observation-only)
+
+- Made TryVectorB src\d3d12_hooks.cpp:2784 resource-level ectorB: resource-match unconditional: for every OM handles[0..count) where es equals tracked g_displayRTVHistory 1920x984 fmt11 or g_sceneColorCandidates 851 display-sized, logs creationHandle/Res/Present omHandle/Res/Present size=%ux%u fmt=%u samples pending completed persistent ecycled (creationHandle.ptr != omHandle.ptr), regardless of sawDisplaySized/enceReady/present throttling. Keeps oundInMap=1 isDisplay persistent>=1 
+on-backbuffer present>300 completed>=pending gates but eturn false before SafeOverwriteRTV 1007 � no Vector A/C queueCopy Present mutation, eplaceOutput=0.
+- Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 already logs tv-provenance: create and handle reuse and display history for g_displayRTVHistory[8] 730.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 971776+ F0EA1863FE2446DA6DF087B1B488BEB7AB31FEBED5627B2C6469E6320E66C634 / helper ... / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next success = esource-match where creationRes==omRes 1920x984 fmt11 samples>=1 enceReady.
+
+
+## 2026-08-28 Unconditional resource-level OM diagnostic (no substitution)
+
+- Verified TryVectorB src\d3d12_hooks.cpp:2784 control flow: shouldLogDetails = sawDisplaySized||fenceReady gated ectorB: slot/omCall/tvMap src\d3d12_hooks.cpp:2813 but esource-match loop at ~2850 was already outside that gate yet still depended on g_rtvMap.find success. Made it unconditional and handle-independent: now for every OMSetRenderTargets handles[0..count) src\d3d12_hooks.cpp:1235 TryVectorB does g_rtvMap.find else g_displayRTVMap.find else reverse g_displayRTVHistory handle?resource lookup, then checks esource against g_displayRTVHistory/g_sceneColorCandidates src\d3d12_hooks.cpp:851 isTracked even if oundInMap=0 originally.
+- Added persistent g_displayRTVMap src\d3d12_hooks.cpp:730 not overwritten on handle reuse (vs g_rtvMap overwritten), populated in Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 for 1920x983 fmt11 when handle already in g_rtvMap with different oldRes logs handle reuse but keeps g_displayRTVMap[handle] first mapping. g_displayRTVHistory[8] 730 already tracked creation handle/resource/present.
+- ectorB: resource-match now logs creationHandle/Res/Present omHandle/Res/Present size=%ux%u fmt=%u samples pending completed persistent ecycled (creationHandle.ptr != omHandle.ptr) for **every** OM where omRes equals tracked display esource 1920x983 fmt11, regardless of sawDisplaySized enceReady present window shouldLogDetails or oundInMap. Only logs when isTracked true, so not per-OM spam.
+- Kept g_vectorAEnabled=false Vector A/C queueCopy Present SafeOverwriteRTV src\d3d12_hooks.cpp:1007 unreachable (eturn false before substitution), eplaceOutput=0. tv-provenance: create 1614 and handle reuse remain.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 971k+ C31692DD367684389056FA35A2EE7F27951C96725A74E0EE9BC7EF749A6B60F8 / helper ... / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next run will prove if 1920x983 fmt11 esource is OM-bound.
+
+
+## 2026-08-29 Targeted OM gameplay diagnostic (no substitution)
+
+- Inspected Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1249 TryVectorB src\d3d12_hooks.cpp:2784: shouldLogDetails = sawDisplaySized||fenceReady gated ectorB: slot/omCall/tvMap but esource-match at ~2850 was already outside that gate yet still depended on g_rtvMap.find success (handle lookup). Made esource-match unconditional and handle-independent via g_displayRTVMap 730 persistent map + reverse g_displayRTVHistory 730 esource compare, even if handle recycled (tv-provenance: handle reuse 1604 shows 2DE56A88880 5�).
+- Added targeted diagnostic inside Shim_OMSetRenderTargets 1249 before TryVectorB: for every OM count handles[0..8) resolve es via g_rtvMap 730 SafeGetDesc 996 isDisplay g_displayW/H 57 mt11/10, check isTracked via g_sceneColorCandidates 851 samples + g_displayRTVHistory 730, if isTracked log ectorB: targeted OM list=%p queue=%p count=%u present=%llu ecl=%llu and ectorB: targeted slot=%u handle=%llX resource=%p size=%ux%u fmt=%u samples=%u isDisplay=%u and ectorB: miss shim null if !shim/!shim->omSetRenderTargets. Only logs when OM is for tracked 1920x983 fmt11, not per-OM.
+- Kept g_vectorAEnabled=false Vector A/C queueCopy Present SafeOverwriteRTV 1007 unreachable (eturn false before substitution), eplaceOutput=0. No broad per-OM WriteFile.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 972800+ DBA6C6CEBD80D0B146F237F4525342714DF6249F67D259C67821923E3C994515 / helper ... / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups 	argeted-pre-20260829-002157.
+
+
+## 2026-08-29 Vector B format-agnostic 1000-frame test (resource identity authoritative)
+
+- Fixed TryVectorB src\d3d12_hooks.cpp:2784 to use omRes == tracked display resource as primary match, accepting 1920x983 mt 10 or 11 at OM (isDisplay d.Format==11||10 g_displayW/H 57), not requiring OM mt == creation mt11. Added omMatchedRes/Handle/Samples scan for every OM handles[0..8) isTracked via g_sceneColorCandidates 851 samples + g_displayRTVHistory 730 esource even if handle recycled (g_displayRTVMap 730 persistent). p18420/present 949 16097B55A40 1920x983 mt10 samples=1 pending 940 ecycled=0 now qualifies as esource-match creationPresent 919 omPresent 949 persistent=1 vs previous estRes=29651C99E20 samples=14 mismatch.
+- Once omMatchedRes isDisplay persistent>=1 present>300 completed>=pending 
+on-backbuffer oundInMap valid, logs ectorB: resource-match with creationHandle/Res/Present omHandle/Res/Present size/fmt samples pending/completed persistent ecycled, and if !g_vectorBTestActive starts 1000-frame test g_vectorBTestActive g_vectorBTestHandle=omMatchedHandle g_vectorBTestResource=omMatchedRes Log TEST START handle=%llX resource=%p present=%llu src\d3d12_hooks.cpp:2590 g_vectorBTestTotal=1000, then keeps SafeOverwriteRTV 1007 active for 1000 Presents (TEST FRAME 60/1000 TEST END). Preserves g_vectorBArmed for compatibility, shouldLogDetails reduced sawDisplaySized||fenceReady still 1614 tv-provenance.
+- Keeps g_vectorAEnabled=false Vector A/C queueCopy Present SafeOverwriteRTV try/except, eplaceOutput=0. No estRes vs omRes mismatch.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi C9E2D314AC47E7A8F1285C03CAE80386E63CC195CCB14BD67D3CFC4B2758ED27 / helper ... / 
+vngx_dlss.dll 4E86D�. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-format-agnostic-pre-20260829-014322. Next p18420/994 296FD9E6FE0 1920x983 fmt11 present 994 esource-match should now TEST START and run 1000 frames.
+

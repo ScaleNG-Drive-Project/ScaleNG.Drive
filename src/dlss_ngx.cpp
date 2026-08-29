@@ -322,6 +322,7 @@ static int SafeNgxCreateFeature(PFN_NVSDK_NGX_D3D12_CreateFeature f,
 
 bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
 {
+    m_lastCreateResult = -3000;
     if (!cmdList)
         return false;
 
@@ -333,7 +334,10 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     // state. Retry at most once per second.
     static DWORD s_lastFailTick = 0;
     if (s_lastFailTick && GetTickCount() - s_lastFailTick < 1000)
+    {
+        m_lastCreateResult = -3001;
         return false;
+    }
 
     // Item #4 (correctness.md): a device-removed adapter is a hard precondition
     // failure - never let NGX discover it internally. Observed: clean-device
@@ -347,6 +351,7 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
                 HooksDumpDRED("createfeature");
             }
             s_lastFailTick = GetTickCount();
+            m_lastCreateResult = -3002 - (int)drr;
             return false;
         }
     }
@@ -361,11 +366,13 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     if (irc == -2) {
         Log("DLSS: NVSDK_NGX_D3D12_Init FAULTED (SEH 0x%08X) - DLAA unavailable", sehCode);
         s_lastFailTick = GetTickCount();
+        m_lastCreateResult = -3003 - (int)sehCode;
         return false;
     }
     if (irc < 0 || !NVSDK_NGX_SUCCEEDED((NVSDK_NGX_Result)irc)) {
         Log("DLSS: NVSDK_NGX_D3D12_Init failed, result=%d", irc);
         s_lastFailTick = GetTickCount();
+        m_lastCreateResult = irc;
         return false;
     }
 
@@ -448,11 +455,13 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     int cr = SafeNgxCreateFeature(pCreateFeature, cmdList, NVSDK_NGX_Feature_SuperSampling,
                                   m_parameters, (void**)&m_feature, &cfSeh);
     if (cr == -2) {
+        m_lastCreateResult = -3004 - (int)cfSeh;
         Log("DLSS: CreateFeature FAULTED (SEH 0x%08X)", cfSeh);
         s_lastFailTick = GetTickCount();
         return false;
     }
     NVSDK_NGX_Result r = (NVSDK_NGX_Result)cr;
+    m_lastCreateResult = cr;
     if (!NVSDK_NGX_SUCCEEDED(r) || !m_feature) {
         Log("DLSS: CreateFeature failed, result=%d", r);
         s_lastFailTick = GetTickCount();
@@ -467,6 +476,7 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
 
 bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
 {
+    m_lastEvaluateResult = -1000;
     if (!m_initialized || !m_enabled)
         return false;
     if (!params.commandList || !params.color || !params.depth || !params.motionVectors || !params.output)
@@ -478,6 +488,7 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
         ID3D12Device* cmdDev = nullptr;
         if (SUCCEEDED(params.commandList->GetDevice(__uuidof(ID3D12Device), (void**)&cmdDev)) && cmdDev) {
             if (cmdDev != m_device) {
+                m_lastEvaluateResult = -1001;
                 Log("DLSS: DEVICE MISMATCH! cmdList dev=%p but NGX dev=%p — skipping eval",
                     (void*)cmdDev, (void*)m_device);
                 cmdDev->Release();
@@ -488,8 +499,10 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     }
 
     if (!m_featureCreated) {
-        if (!CreateFeature(params.commandList))
+        if (!CreateFeature(params.commandList)) {
+            m_lastEvaluateResult = -1002;
             return false;
+        }
     }
 
     m_paramStore->SetR12(NVSDK_NGX_Parameter_Color, params.color);
@@ -548,10 +561,12 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
         evr = -2;
     }
     if (evr == -2) {
+        m_lastEvaluateResult = -2000 - (int)evSeh;
         Log("DLSS: EvaluateFeature FAULTED (SEH 0x%08X)", evSeh);
         return false;
     }
     NVSDK_NGX_Result r = (NVSDK_NGX_Result)evr;
+    m_lastEvaluateResult = evr;
     if (!NVSDK_NGX_SUCCEEDED(r)) {
         Log("DLSS: EvaluateFeature failed, result=%d", r);
         return false;

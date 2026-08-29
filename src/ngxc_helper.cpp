@@ -31,6 +31,7 @@
 #pragma comment(lib, "psapi.lib")
 // ---- dlss_ngx.cpp linkage stubs (helper has no hook layer) -----------------
 #include "upscaler.h"
+#include "dlss_ngx.h"
 #include "d3d12_hooks.h"
 void HooksGetDescriptorHeaps(UINT* count, ID3D12DescriptorHeap** heaps)
 {
@@ -69,6 +70,7 @@ static void LogLine(const char* fmt, ...)
     if (f) { fputs(buf, f); fputc('\n', f); fflush(f); }
 }
 
+#pragma pack(push, 1)
 struct SetupMsg {
     unsigned long long hColor;
     unsigned long long hOut;
@@ -76,9 +78,10 @@ struct SetupMsg {
     unsigned long long hFOut;
     unsigned int w, h, fmt;
     unsigned int pad;
-    unsigned long long startVal; // ASI's next expected fence value
+    unsigned long long startVal;
 };
 static_assert(sizeof(SetupMsg) == 56, "SetupMsg size mismatch - must be 56 bytes");
+#pragma pack(pop)
 
 static ID3D12Device*              g_dev    = nullptr;
 static ID3D12CommandQueue*        g_q      = nullptr;
@@ -88,12 +91,50 @@ static ID3D12Resource*            g_color  = nullptr;
 static ID3D12Resource*            g_out    = nullptr;
 static ID3D12Fence*               g_fIn    = nullptr;
 static ID3D12Fence*               g_fOut   = nullptr;
+
+static void LogResourceDesc(const char* name, ID3D12Resource* res)
+{
+    if (!res) { LogLine("helper: %s=null", name); return; }
+    D3D12_RESOURCE_DESC d = res->GetDesc();
+    LogLine("helper: %s=%p dim=%u size=%llux%u fmt=%u flags=0x%X samples=%u mip=%u",
+        name, (void*)res, (unsigned)d.Dimension, (unsigned long long)d.Width,
+        (unsigned)d.Height, (unsigned)d.Format, (unsigned)d.Flags,
+        (unsigned)d.SampleDesc.Count, (unsigned)d.MipLevels);
+}
 static HANDLE                     g_fInEv  = nullptr;
+static HANDLE                     g_fOutEv = nullptr;
 static ID3D12Resource*            g_depthIn = nullptr; // zero-filled dummies
 static ID3D12Resource*            g_mvIn    = nullptr;
 static IUpscaler*                 s_up      = nullptr;
 static UINT                       s_initW   = 0, s_initH = 0;
 static unsigned long long         s_seedVal = 1;
+static unsigned long long         g_lastSubmitted = 0;
+static unsigned long long         g_setupGeneration = 0;
+static DWORD                       g_setupTick = 0;
+static unsigned long long         g_lastRejectedValue = 0;
+
+static bool WaitForPreviousWork()
+{
+    if (!g_fOut || !g_lastSubmitted) return true;
+    if (!g_fOutEv) g_fOutEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_fOutEv) return false;
+    if (FAILED(g_fOut->SetEventOnCompletion(g_lastSubmitted, g_fOutEv))) return false;
+    return WaitForSingleObject(g_fOutEv, 5000) == WAIT_OBJECT_0;
+}
+
+static void ResetUpscaler()
+{
+    // A resize invalidates the feature's resource bindings and dimensions.
+    // Destroy the old wrapper before replacing the shared resources so NGX can
+    // release its feature state cleanly instead of accumulating one feature per
+    // resize or leaving the driver in a stale-resource state.
+    if (s_up) {
+        delete s_up;
+        s_up = nullptr;
+    }
+    s_initW = 0;
+    s_initH = 0;
+}
 
 static bool InitDevice()
 {
@@ -160,13 +201,26 @@ static bool OpenByValue(unsigned long long hv, REFIID iid, void** out)
 
 static bool ApplySetup(const SetupMsg& m)
 {
-    LogLine("helper: wire vals color=%llu out=%llu fIn=%llu fOut=%llu w=%u",
+    // The shared resources and fence interfaces may be replaced during a
+    // resize.  Do not release them while the previous submission can still
+    // reference them on the helper queue.
+    if (!WaitForPreviousWork()) {
+        LogLine("helper: previous GPU work did not complete before setup");
+        return false;
+    }
+    ++g_setupGeneration;
+    g_setupTick = GetTickCount();
+    g_lastRejectedValue = 0;
+    LogLine("helper: setup transition generation=%llu color=%llu out=%llu fIn=%llu fOut=%llu w=%u h=%u fmt=%u start=%llu",
+        (unsigned long long)g_setupGeneration,
         (unsigned long long)m.hColor, (unsigned long long)m.hOut,
-        (unsigned long long)m.hFIn, (unsigned long long)m.hFOut, m.w);
+        (unsigned long long)m.hFIn, (unsigned long long)m.hFOut,
+        m.w, m.h, m.fmt, (unsigned long long)m.startVal);
     IUnknown* olds[4] = { g_color, g_out, g_fIn, g_fOut };
     for (IUnknown* p : olds)
         if (p) p->Release();
     g_color = nullptr; g_out = nullptr; g_fIn = nullptr; g_fOut = nullptr;
+    g_lastSubmitted = 0;
 
     if (!OpenByValue(m.hColor, IID_PPV_ARGS(&g_color))) { LogLine("helper: open color FAIL"); return false; }
     if (!OpenByValue(m.hOut,   IID_PPV_ARGS(&g_out)))   { LogLine("helper: open out FAIL");   return false; }
@@ -191,10 +245,15 @@ static bool ApplySetup(const SetupMsg& m)
         g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_mvIn));
         // force in-loop NGX reinit at new dims
-        s_up = nullptr; s_initW = 0; s_initH = 0;
+        ResetUpscaler();
         s_seedVal = m.startVal;
     }
-    LogLine("helper: setup %ux%u fmt=%u", m.w, m.h, m.fmt);
+    LogLine("helper: setup generation=%llu applied %ux%u fmt=%u ageMs=0",
+        (unsigned long long)g_setupGeneration, m.w, m.h, m.fmt);
+    LogResourceDesc("color", g_color);
+    LogResourceDesc("output", g_out);
+    LogResourceDesc("depth", g_depthIn);
+    LogResourceDesc("motion", g_mvIn);
     return true;
 }
 
@@ -357,7 +416,13 @@ int main(int argc, char** argv)
 
     if (!InitDevice()) { LogLine("helper: init device failed"); return 2; }
 
-    HANDLE pipe = CreateFileA("\\\\.\\pipe\\ScaleNG_NGX", GENERIC_READ | GENERIC_WRITE,
+    char pipeName[128] = {};
+    // argv[1] is the unique endpoint selected by the ASI for this helper
+    // launch; argv[2] remains the parent PID used for exit detection.
+    unsigned long parentPid = (argc > 2) ? strtoul(argv[2], nullptr, 10) : 0;
+    if (argc > 1) strncpy_s(pipeName, sizeof(pipeName), argv[1], _TRUNCATE);
+    LogLine("helper: endpoint=%s parentArg=%lu", pipeName, parentPid);
+    HANDLE pipe = CreateFileA(pipeName, GENERIC_READ | GENERIC_WRITE,
                               0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
         LogLine("helper: pipe connect FAILED err=%lu", GetLastError());
@@ -375,8 +440,17 @@ int main(int argc, char** argv)
     WriteExact(pipe, ackw, sizeof(ackw));
     LogLine("helper: handshake done");
 
-    SetupMsg sm = {};
+    // The game-side sender frames the first setup exactly like later messages:
+    // a one-byte 'S' tag followed by SetupMsg.  Consuming SetupMsg directly
+    // here shifts every field by one byte and makes valid duplicated handles
+    // look like small integers (OpenSharedHandle then returns E_INVALIDARG).
     for (;;) {
+        char setupTag = 0;
+        if (!ReadTag(pipe, &setupTag) || setupTag != 0x53) {
+            LogLine("helper: initial setup tag invalid (%02X)", (unsigned char)setupTag);
+            break;
+        }
+        SetupMsg sm = {};
         if (!ReadExact(pipe, &sm, sizeof(sm))) break;
         if (!ApplySetup(sm)) {
             unsigned int r = 0x4C494146;
@@ -390,10 +464,15 @@ int main(int argc, char** argv)
         unsigned long long v = s_seedVal;
         unsigned long long frames = 0;
         DWORD lastReport = GetTickCount();
-        HANDLE parent = argc > 1 ? OpenProcess(0x00100000L /*PROCESS_SYNCHRONIZE*/, FALSE, atoi(argv[1])) : nullptr;
+        // argv[1] is the named-pipe endpoint; argv[2] is the BeamNG PID.
+        // Using argv[1] here silently disabled parent monitoring because the
+        // pipe name is not a numeric process ID.
+        HANDLE parent = argc > 2 ? OpenProcess(0x00100000L /*PROCESS_SYNCHRONIZE*/, FALSE, atoi(argv[2])) : nullptr;
+        bool parentExited = false;
         for (;;) {
             if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) {
                 LogLine("helper: parent exited - bye");
+                parentExited = true;
                 break;
             }
 
@@ -417,7 +496,12 @@ int main(int argc, char** argv)
                     SetupMsg ms{};
                     if (!ReadExact(pipe, &ms, sizeof(ms))) break;
                     LogLine("helper: mid-stream setup");
-                    if (!ApplySetup(ms)) break;
+                    unsigned int setupAck = ApplySetup(ms) ? 0x59414B4F : 0x4C494146;
+                    // The game-side sender waits synchronously for this result.
+                    // Omitting it leaves the render thread blocked forever on a
+                    // window resize even though the helper itself is healthy.
+                    WriteExact(pipe, &setupAck, sizeof(setupAck));
+                    if (setupAck != 0x59414B4F) break;
                     continue;
                 }
                 if (tg != 0x46) { LogLine("helper: BAD tag %02X", (unsigned)tg); break; }
@@ -431,7 +515,21 @@ int main(int argc, char** argv)
                 }
                 v = fv;
             }
+            // The allocator and command list are reused every frame. D3D12
+            // requires all GPU work recorded with an allocator to finish
+            // before Reset; the output fence is signalled after the complete
+            // frame submission below.
+            if (!WaitForPreviousWork()) {
+                LogLine("helper: previous GPU work wait failed");
+                break;
+            }
             ++frames;
+            // Do not recycle the NGX wrapper during a live session.  The
+            // driver-owned DLSS feature keeps state across evaluations, and
+            // destroying/recreating it while the game continues submitting
+            // shared resources was correlated with the permanent recorded=0
+            // state seen in the 08:10 run.  A resize still performs a full,
+            // fence-guarded teardown through ApplySetup().
             // NGX evaluate on shared color -> shared out (production path).
 
             if (!s_up) {
@@ -487,6 +585,31 @@ int main(int argc, char** argv)
                 ep.sharpness = 0.0f;
 
                 recorded = s_up->Evaluate(ep);
+                if (frames <= 5 || (frames % 600) == 0)
+                    LogLine("helper: eval frame=%llu recorded=%d ngxResult=%d setupGeneration=%llu setupAgeMs=%lu dims=%ux%u",
+                        frames, recorded ? 1 : 0,
+                        static_cast<NvDlssUpscaler*>(s_up)->LastEvaluateResult(),
+                        (unsigned long long)g_setupGeneration,
+                        (unsigned long)(GetTickCount() - g_setupTick),
+                        (unsigned)cd.Width, (unsigned)cd.Height);
+                if (!recorded) {
+                    static unsigned s_evalFailures = 0;
+                    ++s_evalFailures;
+                    g_lastRejectedValue = v;
+                    if (s_evalFailures <= 8 || (s_evalFailures % 120) == 0)
+                        LogLine("helper: eval rejected frame=%llu ngxResult=%d createResult=%d setupGeneration=%llu setupAgeMs=%lu color=%p out=%p depth=%p motion=%p colorDesc=%ux%u fmt=%u flags=0x%X outDesc=%ux%u fmt=%u flags=0x%X",
+                            frames,
+                            static_cast<NvDlssUpscaler*>(s_up)->LastEvaluateResult(),
+                            static_cast<NvDlssUpscaler*>(s_up)->LastCreateResult(),
+                            (unsigned long long)g_setupGeneration,
+                            (unsigned long)(GetTickCount() - g_setupTick),
+                            (void*)g_color, (void*)g_out, (void*)g_depthIn, (void*)g_mvIn,
+                            (unsigned)cd.Width, (unsigned)cd.Height, (unsigned)cd.Format, (unsigned)cd.Flags,
+                            (unsigned)g_out->GetDesc().Width, (unsigned)g_out->GetDesc().Height,
+                            (unsigned)g_out->GetDesc().Format, (unsigned)g_out->GetDesc().Flags);
+                }
+                if (frames <= 5)
+                    LogLine("helper: createResult=%d", static_cast<NvDlssUpscaler*>(s_up)->LastCreateResult());
                 HRESULT chr = g_list->Close();
                 if (SUCCEEDED(chr)) {
                     ID3D12CommandList* l[] = { g_list };
@@ -494,19 +617,56 @@ int main(int argc, char** argv)
                 } else recorded = false;
             }
             if (!recorded && SUCCEEDED(g_list->Reset(g_alloc, nullptr))) {
-                g_list->Close(); // keep allocator warm even on skip
+                // Preserve visible output if NGX rejects a frame.  The shared
+                // textures are same-size here, so copying the captured color
+                // into the output is a safe passthrough fallback instead of
+                // presenting an uninitialized/black output texture.
+                D3D12_RESOURCE_BARRIER fb[2] = {};
+                for (int k = 0; k < 2; ++k) {
+                    fb[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    fb[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                }
+                fb[0].Transition.pResource = g_color;
+                fb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                fb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                fb[1].Transition.pResource = g_out;
+                fb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                fb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g_list->ResourceBarrier(2, fb);
+                D3D12_TEXTURE_COPY_LOCATION dst = { g_out, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                D3D12_TEXTURE_COPY_LOCATION src = { g_color, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                g_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                fb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                fb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                fb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                fb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                g_list->ResourceBarrier(2, fb);
+                g_list->Close();
                 ID3D12CommandList* l[] = { g_list };
                 g_q->ExecuteCommandLists(1, l);
             }
-            g_q->Signal(g_fOut, v); // enqueue BEFORE ack - ASI GPU-waits on this
+            HRESULT signalHr = g_q->Signal(g_fOut, v);
+            if (FAILED(signalHr)) {
+                LogLine("helper: output fence signal FAILED hr=0x%08X", (unsigned)signalHr);
+                break;
+            }
+            g_lastSubmitted = v; // enqueue BEFORE ack - ASI GPU-waits on this
 
             static unsigned s_evalOk = 0, s_evalSkip = 0;
             if (recorded) ++s_evalOk; else ++s_evalSkip;
 
-            // ACK: tell ASI the signal is enqueued (protocol v2)
+            // ACK: tell ASI both that the signal is enqueued and whether NGX
+            // actually recorded a valid evaluation. A fence acknowledgement
+            // alone is not a usable image; treating it as success can copy a
+            // rejected/uninitialized output and turn the game black.
             {
+                struct HelperAck { unsigned long long value; unsigned int recorded; unsigned int reserved; } ack = {};
+                ack.value = v;
+                ack.recorded = recorded ? 1U : 0U;
                 DWORD wr2 = 0;
-                WriteFile(pipe, &v, sizeof(v), &wr2, nullptr);
+                WriteFile(pipe, &ack, sizeof(ack), &wr2, nullptr);
             }
 
             DWORD nowT = GetTickCount();
@@ -519,24 +679,18 @@ int main(int argc, char** argv)
                 lastReport = nowT;
             }
 
-            DWORD avail = 0;
-            if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail >= 1) {
-                // peek tag without consuming via manual look is complex on pipes;
-                // instead: only treat as setup if a tag byte read confirms
-                char t1 = 0;
-                if (ReadTag(pipe, &t1)) {
-                    if (t1 == 0x53) {
-                        SetupMsg m2 = {};
-                        if (!ReadExact(pipe, &m2, sizeof(m2))) break;
-                        LogLine("helper: re-setup");
-                        if (!ApplySetup(m2)) break;
-                    } else if (t1 == 0x46) {
-                        unsigned long long skipV = 0;
-                        if (!ReadExact(pipe, &skipV, sizeof(skipV))) break;
-                        continue; // frame msg consumed out-of-band; loop handles order
-                    }
-                } else break;
-            }
+            // Do not opportunistically consume another message here.  The
+            // next iteration owns the pipe framing; consuming a queued frame
+            // in this post-frame probe could discard it without evaluating or
+            // acknowledging it, leaving the game-side Present path waiting.
+        }
+        if (parent) CloseHandle(parent);
+        if (parentExited) {
+            // The inner frame loop has observed BeamNG termination. Do not
+            // return to the outer setup loop, which would leave this helper
+            // alive forever waiting for another client on the same pipe.
+            LogLine("helper: parent shutdown complete - exit");
+            break;
         }
         LogLine("helper: frame loop ended - waiting for new setup or exit");
     }
