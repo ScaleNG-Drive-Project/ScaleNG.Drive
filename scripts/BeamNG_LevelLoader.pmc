@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PMC Version="2.0">
+  <Settings>
+    <Name>BeamNG_LevelLoader</Name>
+    <Description>Automated BeamNG.drive level loader for GridMap freeroam</Description>
+    <Author>ScaleNG.Drive</Author>
+    <Created>2026-10-02</Created>
+    <Version>1.0</Version>
+    <LoopCount>1</LoopCount>
+    <LoopType>0</LoopType>
+    <DelayBetweenLoops>0</DelayBetweenLoops>
+    <RandomDelayMin>0</RandomDelayMin>
+    <RandomDelayMax>0</RandomDelayMax>
+    <PlaybackSpeed>100</PlaybackSpeed>
+    <SmartPause>1</SmartPause>
+    <PauseOnError>1</PauseOnError>
+  </Settings>
+  <Variables>
+    <Variable Name="GAME_EXE" Value="C:\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe"/>
+    <Variable Name="GAME_ARGS" Value="-console -gfx d3d12"/>
+    <Variable Name="WINDOW_TITLE" Value="BeamNG.drive"/>
+    <Variable Name="FREEROAM_X" Value="500"/>
+    <Variable Name="FREEROAM_Y" Value="400"/>
+    <Variable Name="GRIDMAP_X" Value="300"/>
+    <Variable Name="GRIDMAP_Y" Value="300"/>
+    <Variable Name="PLAY_X" Value="960"/>
+    <Variable Name="PLAY_Y" Value="800"/>
+    <Variable Name="WAIT_MENU" Value="10000"/>
+    <Variable Name="WAIT_LEVEL" Value="30000"/>
+  </Variables>
+  <Actions>
+    <!-- Step 1: Launch BeamNG.drive -->
+    <Action Type="Run" Enabled="1" Description="Launch BeamNG.drive">
+      <Run>
+        <Path>%GAME_EXE%</Path>
+        <Parameters>%GAME_ARGS%</Parameters>
+        <WorkingDir>C:\games\BeamNG.drive\Bin64\</WorkingDir>
+        <WaitForExit>0</WaitForExit>
+        <RunAsAdmin>0</RunAsAdmin>
+        <HideWindow>0</HideWindow>
+      </Run>
+    </Action>
+
+    <!-- Step 2: Wait for main menu to load -->
+    <Action Type="Wait" Enabled="1" Description="Wait for main menu">
+      <Wait>
+        <Type>Window</Type>
+        <WindowTitle>%WINDOW_TITLE%</WindowTitle>
+        <Timeout>%WAIT_MENU%</Timeout>
+        <MatchType>Contains</MatchType>
+      </Wait>
+    </Action>
+
+    <!-- Step 3: Click Freeroam button -->
+    <Action Type="Click" Enabled="1" Description="Click Freeroam button">
+      <Click>
+        <X>%FREEROAM_X%</X>
+        <Y>%FREEROAM_Y%</Y>
+        <Button>Left</Button>
+        <Clicks>1</Clicks>
+        <Delay>1000</Delay>
+        <Relative>0</Relative>
+      </Click>
+    </Action>
+
+    <!-- Step 3b: Wait for level selection -->
+    <Action Type="Wait" Enabled="1" Description="Wait for level selection screen">
+      <Wait>
+        <Type>Time</Type>
+        <Duration>2000</Duration>
+      </Wait>
+    </Action>
+
+    <!-- Step 4: Click GridMap -->
+    <Action Type="Click" Enabled="1" Description="Click GridMap">
+      <Click>
+        <X>%GRIDMAP_X%</X>
+        <Y>%GRIDMAP_Y%</Y>
+        <Button>Left</Button>
+        <Clicks>1</Clicks>
+        <Delay>1000</Delay>
+        <Relative>0</Relative>
+      </Click>
+    </Action>
+
+    <!-- Step 4b: Wait for level options -->
+    <Action Type="Wait" Enabled="1" Description="Wait for level options">
+      <Wait>
+        <Type>Time</Type>
+        <Duration>2000</Duration>
+      </Wait>
+    </Action>
+
+    <!-- Step 5: Click Play/Load button -->
+    <Action Type="Click" Enabled="1" Description="Click Play button">
+      <Click>
+        <X>%PLAY_X%</X>
+        <Y>%PLAY_Y%</Y>
+        <Button>Left</Button>
+        <Clicks>1</Clicks>
+        <Delay>500</Delay>
+        <Relative>0</Relative>
+      </Click>
+    </Action>
+
+    <!-- Step 6: Wait for level to load -->
+    <Action Type="Wait" Enabled="1" Description="Wait for level to load">
+      <Wait>
+        <Type>Time</Type>
+        <Duration>%WAIT_LEVEL%</Duration>
+      </Wait>
+    </Action>
+
+    <!-- Optional: Verify level loaded by checking for camera CB patch in ScaleNG.log -->
+    <Action Type="Custom" Enabled="0" Description="Verify level loaded (custom check)">
+      <Custom>
+        <Script>CheckScaleNGLogForCameraCB()</Script>
+      </Custom>
+    </Action>
+  </Actions>
+</PMC>
