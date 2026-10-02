@@ -1,9 +1,223 @@
 # ScaleNG.Drive — Architectural Rewrite Plan (DRAFT — Awaiting Approval)
 
 > **Status:** Design document — no code changes yet. Awaiting user approval before implementation.
-> **Date:** 2026-08-29
+> **Date:** 2026-10-02 (Updated with ReShade Integration Lessons)
 > **Build baseline:** `src/d3d12_hooks.cpp:2784` `TryVectorB` `EA07D026…` `C316…` `F0EA…` `DBA6…` `B216…` `7E44…` `9CE2…` `E6A7…` `C316…` `F585…` `EA07…` `F585A749…` `C:\games\BeamNG.drive\Bin64\plugins\ScaleNG.asi:EA07D0266B020C1253630C053F84672E554F7165E79D5B0AD6BFB0528B42A6E1` `dist==deployed` `02:41:40` `src\build.bat:56` VC2026
 > **Principle:** Replace the fragile D3D12 integration layer, preserve the 9 days of BeamNG reverse-engineering knowledge, make `ID3D12Resource*` authoritative, observe actual `OMSetRenderTargets` binding, separate generic D3D12 hooking from BeamNG classification, get to one safe visible test.
+> **NEW PRINCIPLE (2026-10-02):** Adopt ReShade's proven DXGI proxy + event-based architecture. Abandon cross-process helper, D3D12 vtable hooks, and custom HUD. ReShade proves this works.
+
+---
+
+## 🎯 ReShade Integration Lessons (2026-10-02)
+
+### ReShade Works — ScaleNG.Drive Should Copy Its Patterns
+
+| ReShade (Works) | ScaleNG.Drive (Blocked) |
+|-----------------|-------------------------|
+| **DXGI proxy DLL** (`dxgi.dll`) | D3D12CreateDevice detour + D3D12 vtable hooks |
+| **Hooks:** `CreateDXGIFactory`, `CreateSwapChainForHwnd` | **Hooks:** D3D12 device vtable + cmdlist vtable |
+| **Addon events:** `init_device`, `init_swapchain`, `init_resource`, `init_effect_runtime` | **Manual hooks:** `CreateRTV`, `CreateSRV`, `CopyTextureRegion`, `Present` |
+| **Resource discovery:** `init_resource` event | **Manual:** `CreateRTV`/`CreateSRV` hooks |
+| **Overlay:** ImGui via `register_overlay` | Custom HUD (broken) |
+| **NGX:** In-process possible | Cross-process helper (required) |
+
+**Key Insight:** ReShade hooks at **DXGI level** (clean, stable). ScaleNG hooks at **D3D12 level** (fragile, crashes).
+
+### ReShade Event System to Port
+```cpp
+// ScaleNG needs these events (mirroring ReShade):
+enum ScaleNgEvent {
+    INIT_DEVICE,              // on_init_device - capture device
+    INIT_SWAPCHAIN,           // on_init_swapchain - get backbuffers
+    INIT_RESOURCE,            // on_init_resource - discover depth/MV/color
+    UPDATE_TEXTURE_REGION,    // on_update_texture - track CPU→GPU
+    COPY_BUFFER_TO_TEXTURE,   // on_copy_buffer_to_texture - uploads
+    COPY_TEXTURE_REGION,      // on_copy_texture_region - pipeline trace
+    INIT_EFFECT_RUNTIME,      // init_effect_runtime - have swapchain+device+queue
+    PRESENT,                  // on_present - evaluate NGX
+};
+```
+
+### Resource Discovery via Events (Not Hooks)
+```cpp
+// ReShade pattern - discover at creation time via events
+static void on_init_resource(device *dev, const resource_desc &desc, ...) {
+    if (is_depth_format(desc.format))       g_depth = res;
+    if (is_motion_vector_format(desc.format)) g_mv = res;
+    if (is_color_format(desc.format))       g_color = res;
+}
+```
+
+### NGX In-Process (Like ReShade Could Do)
+```cpp
+// At init_effect_runtime equivalent:
+g_device = swapchain->get_device();
+g_queue = effect_runtime->get_command_queue();
+g_upscaler->Init({g_device, renderW, renderH, displayW, displayH, ...});
+
+// At Present:
+resource bb = swapchain->get_back_buffer(0);
+// Barrier bb PRESENT→COPY_SOURCE, copy→g_color, barrier g_color→SRV
+// g_upscaler->Evaluate(g_color, g_depth, g_mv, g_output)
+// Barrier g_output→COPY_SOURCE, copy→bb, barrier bb→PRESENT
+```
+
+---
+
+## 1. End Goal — Installation
+
+```
+BeamNG.drive/
+  dxgi.dll                 ← ScaleNG DLL renamed to dxgi.dll (DXGI proxy, no UAL needed)
+  Bin64/
+    dxgi.dll               ← ScaleNG (renamed from ScaleNG.dll)
+    dxgi.ini               ← [ScaleNG] enabled/upscaler/scale... [ngx] ...
+    nvngx_dlss.dll         ← validated 310.6.0 snippet
+    ScaleNG.log            ← kernel32-only logger
+    nvngx.log              ← driver log C:\ProgramData\NVIDIA\NGX\models\nvngx.log
+```
+
+No `winmm.dll`, no UAL, no `d3d12.dll` proxy, no `AppData` config, no helper process.
+
+## 2. Layers
+
+**A. Loader / Process Integration** — `DllMain` → `RegisterAddon` → `RegisterEvents` → `ComputeLogPath`, `ConfigLoad`, `B2CheckIniFlag`.
+
+**B. Generic DXGI/D3D12 Interception** — `CreateDXGIFactory1` detour, `CreateSwapChainForHwnd` hook, `init_device`/`init_swapchain`/`init_resource`/`copy_texture_region` events, `init_effect_runtime` (captures device+queue+swapchain).
+
+**C. Resource/Lifetime Tracking** — `init_resource` event discovers depth/MV/color by format+size, `copy_texture_region` traces render pipeline, `copy_buffer_to_texture` tracks uploads.
+
+**D. Synchronization and Command Submission** — `Present` event → barrier → copy backbuffer→color → NGX evaluate → copy output→backbuffer → Present.
+
+**E. BeamNG-Specific Render Classification** — Format/size/discovery at `init_resource`, pipeline trace via `copy_texture_region`, persistent resource tracking.
+
+**F. Upscaler/Backend Integration** — `IUpscaler` interface, `NvDlssUpscaler` with in-process NGX, ImGui overlay via `register_overlay`.
+
+**G. Output Injection** — Present event: backbuffer PRESENT→COPY_SOURCE, copy to color input, NGX evaluate, output UAV→COPY_SOURCE, copy to backbuffer, backbuffer COPY_DEST→PRESENT.
+
+**H. Configuration/Logging/Diagnostics** — `ScaleNG.ini`, kernel32 logger, DRED, VEH, WER, map/pdb.
+
+---
+
+## 3. Preserve BeamNG Knowledge
+
+All existing knowledge preserved (A-I from original). Key addition:
+
+**J) ReShade proves DXGI proxy works:**
+- BeamNG loads `dxgi.dll` proxy before system DXGI
+- ReShade hooks `CreateDXGIFactory1` and `CreateSwapChainForHwnd`
+- No D3D12 device wrapper issues
+- Stable, crash-free injection
+
+---
+
+## 4. Most Important Change
+
+Replace cross-process bridge + D3D12 hooks with **DXGI proxy + event system + in-process NGX**:
+
+```
+REMOVE: helper process, shared handles, fences, D3D12 vtable hooks, MinHook, custom HUD
+ADD:    dxgi.dll proxy, addon event system, in-process NGX, ImGui overlay
+```
+
+---
+
+## 5. Do Not Recreate Previous Bugs
+
+All existing bugs documented (A-I). New:
+
+**J) Don't hook D3D12 vtables** — ReShade proves DXGI level is sufficient and stable.
+
+**K) Don't use cross-process** — In-process NGX works (ReShade could do it).
+
+---
+
+## 6. Resource Matching Requirement
+
+Same as before, but discovery via `init_resource` event instead of `CreateRTV` hooks.
+
+---
+
+## 7. Do Not Start Test Too Early
+
+Same phases, but Phase 1 now: "Verify DXGI proxy loads and hooks swapchain creation."
+
+---
+
+## 8. First Test Observation-Only
+
+```
+dxgi.dll loads → init_device → init_swapchain → init_resource (depth/MV/color) → init_effect_runtime → NGX init → Present evaluates
+```
+
+---
+
+## 9. SafeOverwriteRTV Not Architecture
+
+Replaced by Present-time backbuffer copy (ReShade pattern).
+
+---
+
+## 10. OptiScaler / ReShade Research
+
+ReShade architecture adopted as primary reference. OptiScaler referenced for DLSS parameter tuning.
+
+---
+
+## 11. ASI / UAL Deployment
+
+**REMOVED:** UAL, winmm.dll, ASI plugin model.
+**NEW:** Native `dxgi.dll` proxy (Windows loads it automatically).
+
+---
+
+## 12. Helper Process Policy
+
+**REMOVED:** Cross-process helper entirely.
+
+---
+
+## 13. BeamNG-Specific Classification
+
+Enhanced with `init_resource` discovery timestamps and `copy_texture_region` pipeline traces.
+
+---
+
+## 14. Required Regression Tests
+
+Add: "ReShade proxy loads without UAL" test case.
+
+---
+
+## 15. Logging
+
+Enhanced with `[RESHADE]` prefix for DXGI events.
+
+---
+
+## 16. Codebase Migration Strategy
+
+**M0** Architecture + ReShade mapping (this doc + `RESHADE_INTEGRATION_LESSONS.md`)
+
+**M1** Generic DXGI/D3D12 hook manager (`src/dxgi_hooks.cpp`, `src/events.cpp`)
+
+**M2** Resource tracker via events (`src/resource_tracker.cpp`)
+
+**M3** Present + NGX evaluation (`src/ngx_evaluator.cpp`)
+
+**M4** BeamNG classifier via events (`src/beamng_classifier.cpp`)
+
+**M5** Prove detection with logs
+
+**M6** Output resource manager (simplified, no bridge)
+
+**M7** Upscaler backend (existing `dlss_ngx.cpp`, in-process)
+
+**M8** Present-time NGX evaluation
+
+**M9** Real visual test
+
+**M10** Remove legacy implementation
 
 ## 1. End Goal — Installation
 

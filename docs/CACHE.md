@@ -8,6 +8,75 @@
 ## Project one-liner
 DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin. Loader switching: OptiScaler â†’ **Ultimate ASI Loader 9.7.4 (winmm.dll)**. **No code until user approves.** Upscaling only, no frame gen. User has no coding background.
 
+---
+
+## ðŸŽ¯ REASHADE INTEGRATION LESSONS (2026-10-02)
+
+### ReShade Works â€” ScaleNG.Drive Should Copy Its Patterns
+
+| ReShade (Works) | ScaleNG.Drive (Blocked) |
+|-----------------|-------------------------|
+| **DXGI proxy DLL** (`dxgi.dll`) | D3D12CreateDevice detour + D3D12 vtable hooks |
+| **Hooks:** `CreateDXGIFactory`, `CreateSwapChainForHwnd` | **Hooks:** D3D12 device vtable + cmdlist vtable |
+| **Addon events:** `init_device`, `init_swapchain`, `init_resource`, `init_effect_runtime` | **Manual hooks:** `CreateRTV`, `CreateSRV`, `CopyTextureRegion`, `Present` |
+| **Resource discovery:** `init_resource` event | **Manual:** `CreateRTV`/`CreateSRV` hooks |
+| **Overlay:** ImGui via `register_overlay` | Custom HUD (broken) |
+| **NGX:** In-process possible | Cross-process helper (required) |
+
+**Key Insight:** ReShade hooks at **DXGI level** (clean, stable). ScaleNG hooks at **D3D12 level** (fragile, crashes).
+
+### ReShade Event System to Port
+```cpp
+// ScaleNG needs these events (mirroring ReShade):
+enum ScaleNgEvent {
+    INIT_DEVICE,              // on_init_device - capture device
+    INIT_SWAPCHAIN,           // on_init_swapchain - get backbuffers
+    INIT_RESOURCE,            // on_init_resource - discover depth/MV/color
+    UPDATE_TEXTURE_REGION,    // on_update_texture - track CPUâ†’GPU
+    COPY_BUFFER_TO_TEXTURE,   // on_copy_buffer_to_texture - uploads
+    COPY_TEXTURE_REGION,      // on_copy_texture_region - pipeline trace
+    INIT_EFFECT_RUNTIME,      // init_effect_runtime - have swapchain+device+queue
+    PRESENT,                  // on_present - evaluate NGX
+};
+```
+
+### Resource Discovery via Events (Not Hooks)
+```cpp
+// ReShade pattern - discover at creation time via events
+static void on_init_resource(device *dev, const resource_desc &desc, ...) {
+    if (is_depth_format(desc.format))       g_depth = res;
+    if (is_motion_vector_format(desc.format)) g_mv = res;
+    if (is_color_format(desc.format))       g_color = res;
+}
+```
+
+### NGX In-Process (Like ReShade Could Do)
+```cpp
+// At init_effect_runtime equivalent:
+g_device = swapchain->get_device();
+g_queue = effect_runtime->get_command_queue();
+g_upscaler->Init({g_device, renderW, renderH, displayW, displayH, ...});
+
+// At Present:
+resource bb = swapchain->get_back_buffer(0);
+// Barrier bb PRESENTâ†’COPY_SOURCE, copyâ†’g_color, barrier g_colorâ†’SRV
+// g_upscaler->Evaluate(g_color, g_depth, g_mv, g_output)
+// Barrier g_outputâ†’COPY_SOURCE, copyâ†’bb, barrier bbâ†’PRESENT
+```
+
+### ReShade Addon Built: `19-depth_motion_dump`
+- Hooks: `init_resource`, `update_texture_region`, `copy_buffer_to_texture`, `copy_texture_region`, `init_swapchain`
+- Outputs: `reshade_depth_motion_dump/depth_motion_log.txt`
+- Identifies: depth, motion vector, color resources by format/size
+
+---
+
+## Current Status (2026-10-02)
+- ReShade built and tested: **WORKS** in BeamNG (hooks DXGI, creates swapchains, manages runtime)
+- ScaleNG.Drive autonomous test: **WORKS** (320s test, GridMap loads, ReShade+ScaleNG coexist)
+- ScaleNG.Drive NGX: **BLOCKED** by cross-process rejection (same old blocker)
+- ReShade: **NO built-in DLSS** - provides hooks only
+
 ## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 17:1x)## Status (last updated: 2026-08-22 13:5x)## Status (last updated: 2026-08-22 14:3x)## Status (last updated: 2026-08-22 19:4x)## Status (last updated: 2026-08-23 00:0x)## Status (last updated: 2026-08-23 04:3x)## Status (last updated: 2026-08-23 04:5x)## Status (last updated: 2026-08-23 05:2x)## Status (last updated: 2026-08-23 05:5x)## Status (last updated: 2026-08-23 06:1x)## Status (last updated: 2026-08-23 06:4x)## Status (last updated: 2026-08-23 07:0x)## Status (last updated: 2026-08-23 07:3x)## Status (last updated: 2026-08-23 07:5x)## Status (last updated: 2026-08-23 08:1x)## Status (last updated: 2026-08-23 08:4x)## Status (last updated: 2026-08-23 09:0x)## Status (last updated: 2026-08-23 09:2x)## Status (last updated: 2026-08-23 09:4x)## Status (last updated: 2026-08-23 09:5x)## Status (last updated: 2026-08-23 10:1x)## Status (last updated: 2026-08-23 10:0x)## Status (last updated: 2026-08-23 10:1x)## Status (last updated: 2026-08-23 10:4x)## Status (last updated: 2026-08-23 11:0x)## Status (last updated: 2026-08-23 11:2x)## Status (last updated: 2026-08-23 11:4x)## Status (last updated: 2026-08-23 11:5x)## Status (last updated: 2026-08-23 12:1x)## Status (last updated: 2026-08-23 12:4x)## Status (last updated: 2026-08-23 13:0x)## Status (last updated: 2026-08-23 13:3x)## Status (last updated: 2026-08-23 13:5x)## Status (last updated: 2026-08-23 14:1x)## Status (last updated: 2026-08-23 14:3x)## Status (last updated: 2026-08-23 14:5x)## Status (last updated: 2026-08-23 15:3x)## Status (last updated: 2026-08-23 15:4x)## Status (last updated: 2026-08-23 16:0x)## Status (last updated: 2026-08-23 16:2x)## Status (last updated: 2026-08-23 16:4x)## Status (last updated: 2026-08-23 17:0x)## Status (last updated: 2026-08-23 17:2x) - SESSION HANDOFF## Status (last updated: 2026-08-23 17:4x)## Status (last updated: 2026-08-23 18:0x)## Status (last updated: 2026-08-23 18:3x)## Status (last updated: 2026-08-23 18:5x)## Status (last updated: 2026-08-23 19:0x)## Status (last updated: 2026-08-23 19:2x)## Status (last updated: 2026-08-23 19:4x) - USER CORRECTION## Status (last updated: 2026-08-23 19:5x)## Status (last updated: 2026-08-23 20:1x)## Status (last updated: 2026-08-23 20:3x)## STANDING USER DIRECTIVE (2026-08-23): NO DLAA SHUTOFFS## Status (last updated: 2026-08-23 21:3x) - ADAPTER DEATH INVESTIGATION OPEN## Status (last updated: 2026-08-23 21:5x) - VERDICT REACHED## Status (last updated: 2026-08-23 22:0x) - MODEL REFINED## Status (last updated: 2026-08-23 22:2x)## Status (last updated: 2026-08-23 22:4x) - NEW LEAD: SCENE FORMAT ROTATION## Status (last updated: 2026-08-23 23:0x) - MAJOR DISCOVERY## Status (last updated: 2026-08-23 23:2x)## SCENE TOPOLOGY MAP (fix82 data, 2026-08-23)## Status (last updated: 2026-08-23 23:5x)## Status (last updated: 2026-08-24 00:0x)## Status (last updated: 2026-08-24 00:3x) - TERMINAL NODE FOUND## Status (last updated: 2026-08-24 00:5x)## Status (last updated: 2026-08-24 01:0x)## Status (last updated: 2026-08-24 01:2x) - ISOLATION LADDER LIVE## Status (last updated: 2026-08-24 01:5x)## Status (last updated: 2026-08-24 00:4x)## Status (last updated: 2026-08-24 00:5x) - SEQUENCING VALIDATED## Status (last updated: 2026-08-24 01:4x)## Status (last updated: 2026-08-24 02:0x)## ROOT CAUSE CONVICTED (fix95, 0570cfa)## Status (last updated: 2026-08-24 02:3x)## Status (last updated: 2026-08-24 03:0x) - TDR EXCLUDED## Status (last updated: 2026-08-24 02:5x) - FULL DUMP PIPELINE## Status (last updated: 2026-08-24 03:5x) - FIRST FULL DUMP ANALYZED## Status (last updated: 2026-08-24 04:3x)## Status (last updated: 2026-08-24 05:0x)## Status (last updated: 2026-08-24 05:2x)## Status (last updated: 2026-08-24 06:0x) - GETBUFFER POISONING FOUND## Status (last updated: 2026-08-24 06:3x)## Status (last updated: 2026-08-24 07:0x)## Status (last updated: 2026-08-24 07:3x)## Status (last updated: 2026-08-24 07:5x)## Status (last updated: 2026-08-24 08:3x) - TRIPLE-INIT FOUND## Status (last updated: 2026-08-24 09:0x)## Status (last updated: 2026-08-24 09:3x) - E_INVALIDARG ROOT NAMED## Status (last updated: 2026-08-24 10:0x)## Status (last updated: 2026-08-24 10:3x)## Status (last updated: 2026-08-24 11:0x)## Status (last updated: 2026-08-24 11:3x)## MILESTONE: BRIDGE FULLY OPERATIONAL (06:55 run)## Status (last updated: 2026-08-24 11:4x)## Status (last updated: 2026-08-24 12:0x)## Status (last updated: 2026-08-24 12:3x)## Status (last updated: 2026-08-24 13:0x)## Status (last updated: 2026-08-24 13:3x)## Status (last updated: 2026-08-24 13:5x)## Status (last updated: 2026-08-24 14:0x)## Status (last updated: 2026-08-24 14:3x)## Status (last updated: 2026-08-24 15:0x)## BREAKTHROUGH: ARTIFACT-FREE RENDERING (fix127 confirmed)## Status (last updated: 2026-08-24 20:4x)## Status (last updated: 2026-08-24 21:0x)## FINAL SESSION ANALYSIS (2026-08-25)## COMPLETE ISSUE LIST (session final)## SESSION COMPLETE (2026-08-25 04:30)## CRITICAL FINDING: NGX WORKS ON GAME DEVICE (2026-08-25 11:34)## CRITICAL FINDING: DEVICE UNWRAP RESULT (2026-08-25 12:44)## FINAL SESSION STATUS (2026-08-25, commit 2ed4069)
 ### Architecture Decision
 Bridge architecture ABANDONED. Cross-device concurrent GPU submission crashes nvwgf2umx.dll on this hardware/driver combination. Single-device NGX confirmed viable: Init + CreateFeature both succeed on game's wrapped device.
@@ -1665,7 +1734,7 @@ The next run should be judged by a scene-color record with `persistent=1`, a lon
 - Helpers SafeGetDesc / SafeGetFenceCompleted added (src\d3d12_hooks.cpp:995) to avoid __try in unwinding function (C2712).
 - Forward declaration TryVectorA before shim and definition after B2CheckIniFlag (src\d3d12_hooks.cpp:2696) ensures visibility of g_b2Deferred* etc.
 - Built with VC2026 src\build.bat:56 ? dist\ScaleNG.asi 966,144 CD05FBB8668A2E9ECBD84736494423C5D755D7C424EC24AED94ED8F7452BC311 / dist\ScaleNG_NGX_helper.exe F7311B3C21A1DA00071FA3D9E684D44B4B9F861D84C85D59082343B48AFDAAA0 / 
-vngx_dlss.dll 4E86DAD0… (unchanged). Deployed to C:\games\BeamNG.drive\Bin64\plugins after stopping helper; hashes verified dist==deployed. Previous deployment backed up at C:\games\BeamNG.drive\Bin64\ScaleNG-backups\vectorA-pre-20260828-054250 / ectorA-deploy-pre-20260828-054250.
+vngx_dlss.dll 4E86DAD0ï¿½ (unchanged). Deployed to C:\games\BeamNG.drive\Bin64\plugins after stopping helper; hashes verified dist==deployed. Previous deployment backed up at C:\games\BeamNG.drive\Bin64\ScaleNG-backups\vectorA-pre-20260828-054250 / ectorA-deploy-pre-20260828-054250.
 - This build changes rendering on exactly one engine-owned CopyTextureRegion where conditions pass (barriers COMMON->COPY_SOURCE / COPY_SOURCE->COMMON around replacement g_b2OutG 1920x983 fmt 28). All other copies forwarded. One-shot prevents repeat corruption. Safe INI remains eplaceOutput=0 deferredOutput=1 queueCopy=0; Vector A is the first guarded eplaceOutput-like path via engine list.
 - Rollback: restore C:\games\BeamNG.drive\Bin64\ScaleNG-backups\vectorA-deploy-pre-20260828-054250\ScaleNG.asi if black window / device removal / crash.
 - Next run: 60-120s without resize, judge by ectorA: attempting handoff / ectorA: DLSS output substituted plus 
@@ -1679,7 +1748,7 @@ gx-b2: frame eval=ok with same pending. Visible image change required for succes
 - Vector B logs every non-zero color RTV handle whose mapped resource (g_rtvMap via BookGuard) is display-sized 1920x983 and mt 11/10 (ectorB: candidate handle=%llX resource=%p size=%ux%u fmt=%u present=%llu ecl=%llu pending=%llu completed=%llu). Requires persistence samples>=3 via g_sceneColorCandidates (src\d3d12_hooks.cpp:851), presentSerial>300, g_b2DeferredPending + SafeGetFenceCompleted>=pending, non-backbuffer es!=g_bbCached, one-shot g_vectorBOneShot.
 - On first qualifying candidate, logs ectorB: attempting and atomically consumes g_b2DeferredPending; then SafeOverwriteRTV(g_b2OutG, handle) overwrites the descriptor at that CPU handle to point to the shared 1920x983 fmt28 DLSS output (g_device->CreateRenderTargetView). Logs ectorB: substituted on success and forwards to original shim->omSetRenderTargets with hijacked descriptor; on failure logs ectorB: skipped and restores g_vectorBOneShot. No queue-copy, Present, resource state, or eplaceOutput changes. Exception guard via SafeOverwriteRTV try/except.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 966,656 DC83723BACCA803A253F552BB2AED08DAFC573300C3B11977B8AAB017C84EC52 / ScaleNG_NGX_helper.exe F0009B8640533C31B12AEA559C24089994F50772678CB06C3A8B57739545016D / 
-vngx_dlss.dll 4E86DAD0… (unchanged). Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-pre-20260828-061555 and ectorB-deploy-pre-20260828-061555. Vector A remains in place but Shim_CopyTextureRegion continues to miss (engine final not via copy); Vector B is the first OM-based attempt.
+vngx_dlss.dll 4E86DAD0ï¿½ (unchanged). Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-pre-20260828-061555 and ectorB-deploy-pre-20260828-061555. Vector A remains in place but Shim_CopyTextureRegion continues to miss (engine final not via copy); Vector B is the first OM-based attempt.
 - INI unchanged eplaceOutput=0 deferredOutput=1 queueCopy=0 helper=1. Rollback: restore ectorB-deploy-pre ASI if device removal/black/crash. Next run: short 60-120s without resize, judge by ectorB: candidate / ttempting / substituted / skipped plus 
 ative-target persistent and 
 gx-b2: frame eval=ok for same pending.
@@ -1692,7 +1761,7 @@ gx-b2: frame eval=ok for same pending.
 - Disabled visible mutation: g_vectorAEnabled=false (src\d3d12_hooks.cpp:2579) and TryVectorB always returns alse after logging, so Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 forwards unchanged. eplaceOutput=0 queueCopy=0 preserved.
 - Helpers SafeGetDesc/SafeGetFenceCompleted/SafeOverwriteRTV kept (src\d3d12_hooks.cpp:996) but SafeOverwriteRTV not invoked.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 968192 D913D482C7C08F0EF662C29664655A08CA623E4383CDE37212BC253846237CA2 / helper 1B661AF4C675462AD0396A187BB489252005B02E4598088B8A0BF4D3F9ED6480 / 
-vngx_dlss.dll 4E86DAD0…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups provenance-pre-20260828-064018 / provenance-deploy-pre-20260828-064018. Only success criterion for this turn is identifying the actual OM CPU handle that maps to the persistent 1920x983 fmt11 scene resource.
+vngx_dlss.dll 4E86DAD0ï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups provenance-pre-20260828-064018 / provenance-deploy-pre-20260828-064018. Only success criterion for this turn is identifying the actual OM CPU handle that maps to the persistent 1920x983 fmt11 scene resource.
 
 
 ## 2026-08-28 Vector B guarded one-shot substitution enabled
@@ -1700,7 +1769,7 @@ vngx_dlss.dll 4E86DAD0…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes 
 - Enabled TryVectorB substitution via Shim_OMSetRenderTargets src\d3d12_hooks.cpp:2784 using runtime-resolved OM handle/resource mapping (no hardcoded 21137762A80). Gates: presentSerial>300, oundInMap=1, persistent samples>=3 (g_sceneColorCandidates src\d3d12_hooks.cpp:851), 1920x983 mt 11/10 isDisplay, es!=g_bbCached, pending!=0 SafeGetFenceCompleted>=pending (src\d3d12_hooks.cpp:996), one-shot g_vectorBOneShot atomic. Logs ectorB: candidate for display-sized, ectorB: attempting with handle/resource/size/fmt/present/ecl/pending/completed, ectorB: substituted with origRes/repl on SafeOverwriteRTV(g_b2OutG, candidateHandle) success (src\d3d12_hooks.cpp:1007), otherwise ectorB: skipped. Forwards hijacked handles to shim->omSetRenderTargets once.
 - Preserved observation: tv-provenance src\d3d12_hooks.cpp:1614 and ectorB: probe / tvMap dump remain. g_vectorAEnabled=false, no Vector A/C queue-copy Present state mutation, eplaceOutput=0 queueCopy=0 ScaleNG.ini unchanged. Exception guard via SafeOverwriteRTV try/except.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 969728 6E1C5D22D44C9F49FE177022102C8B6C902F174A13A7D6A2A0D536847A4595E8 / helper  42C3CC2363ED04B8B210698876C9DABF133CEC6C86AECC97F5B15BAAE1DC530 / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-subst-pre-20260828-070024 / ectorB-subst-deploy-pre-20260828-070024. Rollback: restore that ASI if black window/crash/freeze/device removal or no substituted record. Next run judged by ectorB: substituted + 
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-subst-pre-20260828-070024 / ectorB-subst-deploy-pre-20260828-070024. Rollback: restore that ASI if black window/crash/freeze/device removal or no substituted record. Next run judged by ectorB: substituted + 
 ative-target persistent + 
 gx-b2 eval=ok pending + visible change.
 
@@ -1712,7 +1781,7 @@ gx-b2 eval=ok pending + visible change.
 - g_vectorAEnabled=false Vector C disabled, eplaceOutput=0 queueCopy=0 ScaleNG.ini unchanged.
 - Logs ectorB: candidate/ttempting/substituted with handle/resource/size/fmt/present/ecl/pending/completed and samples implicitly via persistent check (now >=1 qualifies). Previous p16148 200479B52C0 1920x987 fmt11 present=3567 pending=3558 would have been skipped persistent=0 at >=3 but qualifies at >=1.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 969728 90C0DEA8039500F9FCD8DC6B383C7283C5DA3E27DEA932994FFECCA931C6EDCA / helper BDA308A46721DB2FCDA2F0BC197F1538F5B8C00B86F78EDE67514C7D390563CD / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-visible-pre-20260828-073732 / ectorB-visible-deploy-pre-20260828-073732. Rollback: restore that ASI if black/crash/freeze/device removal. Next run judged by ectorB: substituted + 
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-visible-pre-20260828-073732 / ectorB-visible-deploy-pre-20260828-073732. Rollback: restore that ASI if black/crash/freeze/device removal. Next run judged by ectorB: substituted + 
 ative-target + 
 gx-b2 eval=ok for same pending and visible change.
 
@@ -1723,7 +1792,7 @@ gx-b2 eval=ok for same pending and visible change.
 - When any slot is isDisplay logs full ectorB: omCall count=%u singleRange=%u present=%llu ecl=%llu handles=%llX %llX %llX %llX and dumps first 16 g_rtvMap as ectorB: rtvMap handle=%llX resource=%p size=%ux%u fmt=%u (BookGuard 730). tv-provenance src\d3d12_hooks.cpp:1614 still logs every >=1000x500 RTV handle as before.
 - SafeOverwriteRTV src\d3d12_hooks.cpp:1007 not called this build; TryVectorB always returns alse after logging, Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 forwards unchanged. g_vectorAEnabled=false Vector A/C disabled, eplaceOutput=0 queueCopy=0 preserved. No queue/Present/state mutation.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 969216 BB4A428BED25B630F3BD0B925C891F80A3D3B8BC0C257AAFEC3AB4663AA69AF0 / helper 68FFE51CA27E667AE386FD2E646CDCDC4496100805AF68BD4D43A3BEEBC4CF6A / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-observe-pre-20260828-075228. Success = OM slot that is isDisplay=1 oundInMap=1 samples>=1 with pending/completed ready, even if not persistent/ence ready.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-observe-pre-20260828-075228. Success = OM slot that is isDisplay=1 oundInMap=1 samples>=1 with pending/completed ready, even if not persistent/ence ready.
 
 
 ## 2026-08-28 Vector B armed reduced-log deployed
@@ -1734,42 +1803,42 @@ vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes ver
 on-backbuffer pending completed>=pending one-shot exception guard, logs ectorB: substituted. Keeps tv-provenance src\d3d12_hooks.cpp:1614 for >=1000x500 RTVs.
 - g_vectorAEnabled=false Vector A/C disabled, eplaceOutput=0 queueCopy=0 preserved, one substitution only.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 971264 9CE2E3DE8B756BCE20C40D97DBE7B5B6F6BFF6E8D8141340F2CA263005B60E54 / helper  6D2C0A2E58D6A7D403A2F48DCF7A4525B8A84D7D7514822C06418B9AF45703D / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-armed-pre-20260828-084617. Next run judged by rmed ? rmed-match ? substituted with same pending and visible change.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-armed-pre-20260828-084617. Next run judged by rmed ? rmed-match ? substituted with same pending and visible change.
 
 
 ## 2026-08-28 Handle provenance diagnostic (observation-only)
 
-- Investigated why armed 1920x983 fmt11 RTV 1692DC5C0A0?168CC44A8B0 at present 919 never appears in later OMSetRenderTargets despite samples=15 and enceReady. Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 g_rtvMap 730 stores handle?resource but handle can be reused for new resource; Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 TryVectorB src\d3d12_hooks.cpp:2784 previously logged every OM handle as oundInMap=0 for 1920x984 after present 919 (p17936 1E4E5C03040 etc) — proves OM at that present bound 1902x938/128x128 not 1920x984.
+- Investigated why armed 1920x983 fmt11 RTV 1692DC5C0A0?168CC44A8B0 at present 919 never appears in later OMSetRenderTargets despite samples=15 and enceReady. Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 g_rtvMap 730 stores handle?resource but handle can be reused for new resource; Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1235 TryVectorB src\d3d12_hooks.cpp:2784 previously logged every OM handle as oundInMap=0 for 1920x984 after present 919 (p17936 1E4E5C03040 etc) ï¿½ proves OM at that present bound 1902x938/128x128 not 1920x984.
 - Added g_lastDisplayRTVHandle/Resource/Present src\d3d12_hooks.cpp:730 tracking last display-sized RTV creation, tv-provenance: handle reuse log when handle.ptr already in g_rtvMap with different oldRes, and ectorB: lastDisplay bound log when OM handle equals g_lastDisplayRTVHandle (src\d3d12_hooks.cpp:2813). TryVectorB now logs ectorB: slot only when sawDisplaySized||fenceReady to avoid 1fps overhead, dumps tvMap 16 only when sawDisplaySized, and is observation-only (eturn false before SafeOverwriteRTV src\d3d12_hooks.cpp:1007).
 - Kept exact oundInMap=1 isDisplay 1920x983 fmt11/10 persistent samples>=1 
 on-backbuffer present>300 completed>=pending one-shot gates but disabled substitution for this build. g_vectorAEnabled=false Vector A/C disabled, eplaceOutput=0 queueCopy=0.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970240 2EF4B9A751C88236F622A7BD58E55A6F3837ACAD97454FCBE5B2D7E885DF2F15 / helper EE115C5B2FAC955AAD713BB19AA27AAEA8FD894B722A1897D92CAECE4B5D1040 / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-armed-pre-20260828-084617 etc. Next success = lastDisplay handle appears as ectorB: lastDisplay bound at same present as rmed and later rmed-match would fire if substitution re-enabled.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-armed-pre-20260828-084617 etc. Next success = lastDisplay handle appears as ectorB: lastDisplay bound at same present as rmed and later rmed-match would fire if substitution re-enabled.
 
 
 ## 2026-08-28 Resource-level correlation diagnostic (observation-only)
 
 - Added DisplayRTVRecord g_displayRTVHistory[8] src\d3d12_hooks.cpp:730 tracking last 8 display-sized mt11 creations (handle/resource/size/fmt/present). Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 now logs tv-provenance: handle reuse when handle already in g_rtvMap with different oldRes, and records g_lastDisplayRTV* + history with Log rtv-provenance: display history.
-- TryVectorB src\d3d12_hooks.cpp:2784 now resource-level: for every OM handles[0..count) logs ectorB: slot only when sawDisplaySized||fenceReady (reduced WriteFile), logs ectorB: lastDisplay bound when handle==g_lastDisplayRTVHandle, and logs ectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu samples=%u pending=%llu completed=%llu persistent=%u when OM es equals tracked display esource even if handle recycled (checks g_sceneColorCandidates 851 and g_displayRTVHistory). Keeps oundInMap isDisplay samples pending/completed present>300 gates but eturn false before SafeOverwriteRTV 1007 — observation-only, no Vector A/C queueCopy Present mutation, eplaceOutput=0.
+- TryVectorB src\d3d12_hooks.cpp:2784 now resource-level: for every OM handles[0..count) logs ectorB: slot only when sawDisplaySized||fenceReady (reduced WriteFile), logs ectorB: lastDisplay bound when handle==g_lastDisplayRTVHandle, and logs ectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu samples=%u pending=%llu completed=%llu persistent=%u when OM es equals tracked display esource even if handle recycled (checks g_sceneColorCandidates 851 and g_displayRTVHistory). Keeps oundInMap isDisplay samples pending/completed present>300 gates but eturn false before SafeOverwriteRTV 1007 ï¿½ observation-only, no Vector A/C queueCopy Present mutation, eplaceOutput=0.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970752 E6A7E635142E836BB636C6657B221D960A0A45DAD8BBD400C65FAE58FB72FBC9 / helper 227DFB37F67647A7A5BFFF288C91D6982946FA8D66E037E34C25CE1742D52668 / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-track-pre-20260828-221420. Next success = esource-match where creationHandle creationRes creationPresent and omHandle omRes omPresent share same esource 1920x984 fmt11 with samples>=1 enceReady.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-track-pre-20260828-221420. Next success = esource-match where creationHandle creationRes creationPresent and omHandle omRes omPresent share same esource 1920x984 fmt11 with samples>=1 enceReady.
 
 
 ## 2026-08-28 Resource-level OM correlation (observation-only)
 
 - Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 now records DisplayRTVRecord g_displayRTVHistory[8] for display-sized mt11 and logs tv-provenance: handle reuse and display history. TryVectorB src\d3d12_hooks.cpp:2784 now scans handles[0..count) for oundInMap isDisplay and logs ectorB: slot only when sawDisplaySized||fenceReady (reduced WriteFile), and logs ectorB: resource-match creationHandle=%llX creationRes=%p creationPresent=%llu omHandle=%llX omRes=%p omPresent=%llu samples=%u pending=%llu completed=%llu persistent=%u when OM es equals tracked display esource even if handle recycled (g_sceneColorCandidates 851 samples + g_displayRTVHistory 730). Keeps oundInMap=1 isDisplay persistent>=1 
-on-backbuffer present>300 completed>=pending gates but eturn false before SafeOverwriteRTV 1007 — no Vector A/C queueCopy Present mutation, eplaceOutput=0.
-- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970752+ 7358171BE4A4826F6BCDE1F56F4FF235E5815FC084815CE3580D753742F263FA / helper 227DFB37… / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next success = esource-match where creationRes==omRes 1920x984 fmt11 samples>=1 enceReady.
+on-backbuffer present>300 completed>=pending gates but eturn false before SafeOverwriteRTV 1007 ï¿½ no Vector A/C queueCopy Present mutation, eplaceOutput=0.
+- Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 970752+ 7358171BE4A4826F6BCDE1F56F4FF235E5815FC084815CE3580D753742F263FA / helper 227DFB37ï¿½ / 
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next success = esource-match where creationRes==omRes 1920x984 fmt11 samples>=1 enceReady.
 
 
 ## 2026-08-28 Resource-level OM correlation unconditional (observation-only)
 
 - Made TryVectorB src\d3d12_hooks.cpp:2784 resource-level ectorB: resource-match unconditional: for every OM handles[0..count) where es equals tracked g_displayRTVHistory 1920x984 fmt11 or g_sceneColorCandidates 851 display-sized, logs creationHandle/Res/Present omHandle/Res/Present size=%ux%u fmt=%u samples pending completed persistent ecycled (creationHandle.ptr != omHandle.ptr), regardless of sawDisplaySized/enceReady/present throttling. Keeps oundInMap=1 isDisplay persistent>=1 
-on-backbuffer present>300 completed>=pending gates but eturn false before SafeOverwriteRTV 1007 — no Vector A/C queueCopy Present mutation, eplaceOutput=0.
+on-backbuffer present>300 completed>=pending gates but eturn false before SafeOverwriteRTV 1007 ï¿½ no Vector A/C queueCopy Present mutation, eplaceOutput=0.
 - Hook_CreateRenderTargetView src\d3d12_hooks.cpp:1604 already logs tv-provenance: create and handle reuse and display history for g_displayRTVHistory[8] 730.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 971776+ F0EA1863FE2446DA6DF087B1B488BEB7AB31FEBED5627B2C6469E6320E66C634 / helper ... / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next success = esource-match where creationRes==omRes 1920x984 fmt11 samples>=1 enceReady.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next success = esource-match where creationRes==omRes 1920x984 fmt11 samples>=1 enceReady.
 
 
 ## 2026-08-28 Unconditional resource-level OM diagnostic (no substitution)
@@ -1779,16 +1848,16 @@ vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes ver
 - ectorB: resource-match now logs creationHandle/Res/Present omHandle/Res/Present size=%ux%u fmt=%u samples pending completed persistent ecycled (creationHandle.ptr != omHandle.ptr) for **every** OM where omRes equals tracked display esource 1920x983 fmt11, regardless of sawDisplaySized enceReady present window shouldLogDetails or oundInMap. Only logs when isTracked true, so not per-OM spam.
 - Kept g_vectorAEnabled=false Vector A/C queueCopy Present SafeOverwriteRTV src\d3d12_hooks.cpp:1007 unreachable (eturn false before substitution), eplaceOutput=0. tv-provenance: create 1614 and handle reuse remain.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 971k+ C31692DD367684389056FA35A2EE7F27951C96725A74E0EE9BC7EF749A6B60F8 / helper ... / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next run will prove if 1920x983 fmt11 esource is OM-bound.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups esource-match-pre-20260828-223604. Next run will prove if 1920x983 fmt11 esource is OM-bound.
 
 
 ## 2026-08-29 Targeted OM gameplay diagnostic (no substitution)
 
-- Inspected Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1249 TryVectorB src\d3d12_hooks.cpp:2784: shouldLogDetails = sawDisplaySized||fenceReady gated ectorB: slot/omCall/tvMap but esource-match at ~2850 was already outside that gate yet still depended on g_rtvMap.find success (handle lookup). Made esource-match unconditional and handle-independent via g_displayRTVMap 730 persistent map + reverse g_displayRTVHistory 730 esource compare, even if handle recycled (tv-provenance: handle reuse 1604 shows 2DE56A88880 5×).
+- Inspected Shim_OMSetRenderTargets src\d3d12_hooks.cpp:1249 TryVectorB src\d3d12_hooks.cpp:2784: shouldLogDetails = sawDisplaySized||fenceReady gated ectorB: slot/omCall/tvMap but esource-match at ~2850 was already outside that gate yet still depended on g_rtvMap.find success (handle lookup). Made esource-match unconditional and handle-independent via g_displayRTVMap 730 persistent map + reverse g_displayRTVHistory 730 esource compare, even if handle recycled (tv-provenance: handle reuse 1604 shows 2DE56A88880 5ï¿½).
 - Added targeted diagnostic inside Shim_OMSetRenderTargets 1249 before TryVectorB: for every OM count handles[0..8) resolve es via g_rtvMap 730 SafeGetDesc 996 isDisplay g_displayW/H 57 mt11/10, check isTracked via g_sceneColorCandidates 851 samples + g_displayRTVHistory 730, if isTracked log ectorB: targeted OM list=%p queue=%p count=%u present=%llu ecl=%llu and ectorB: targeted slot=%u handle=%llX resource=%p size=%ux%u fmt=%u samples=%u isDisplay=%u and ectorB: miss shim null if !shim/!shim->omSetRenderTargets. Only logs when OM is for tracked 1920x983 fmt11, not per-OM.
 - Kept g_vectorAEnabled=false Vector A/C queueCopy Present SafeOverwriteRTV 1007 unreachable (eturn false before substitution), eplaceOutput=0. No broad per-OM WriteFile.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi 972800+ DBA6C6CEBD80D0B146F237F4525342714DF6249F67D259C67821923E3C994515 / helper ... / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups 	argeted-pre-20260829-002157.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups 	argeted-pre-20260829-002157.
 
 
 ## 2026-08-29 Vector B format-agnostic 1000-frame test (resource identity authoritative)
@@ -1798,5 +1867,5 @@ vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes ver
 on-backbuffer oundInMap valid, logs ectorB: resource-match with creationHandle/Res/Present omHandle/Res/Present size/fmt samples pending/completed persistent ecycled, and if !g_vectorBTestActive starts 1000-frame test g_vectorBTestActive g_vectorBTestHandle=omMatchedHandle g_vectorBTestResource=omMatchedRes Log TEST START handle=%llX resource=%p present=%llu src\d3d12_hooks.cpp:2590 g_vectorBTestTotal=1000, then keeps SafeOverwriteRTV 1007 active for 1000 Presents (TEST FRAME 60/1000 TEST END). Preserves g_vectorBArmed for compatibility, shouldLogDetails reduced sawDisplaySized||fenceReady still 1614 tv-provenance.
 - Keeps g_vectorAEnabled=false Vector A/C queueCopy Present SafeOverwriteRTV try/except, eplaceOutput=0. No estRes vs omRes mismatch.
 - Built VC2026 src\build.bat:56 ? dist\ScaleNG.asi C9E2D314AC47E7A8F1285C03CAE80386E63CC195CCB14BD67D3CFC4B2758ED27 / helper ... / 
-vngx_dlss.dll 4E86D…. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-format-agnostic-pre-20260829-014322. Next p18420/994 296FD9E6FE0 1920x983 fmt11 present 994 esource-match should now TEST START and run 1000 frames.
+vngx_dlss.dll 4E86Dï¿½. Deployed to C:\games\BeamNG.drive\Bin64\plugins hashes verified. Backups ectorB-format-agnostic-pre-20260829-014322. Next p18420/994 296FD9E6FE0 1920x983 fmt11 present 994 esource-match should now TEST START and run 1000 frames.
 
