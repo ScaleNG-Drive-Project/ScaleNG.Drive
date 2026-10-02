@@ -41,17 +41,19 @@ set "RSP=%TEMP%\ScaleNG_build.rsp"
     echo /I"%SRC%vendor\minhook\include"
     echo /I"%SRC%vendor\minhook\src"
     echo /I"%SRC%vendor\nvngx"
-    echo "%SRC%main.cpp"
-    echo "%SRC%camera_cb.cpp"
-    echo "%SRC%d3d12_hooks.cpp"
-    echo "%SRC%dlss_ngx.cpp"
+    echo "%SRC%main_dxgi.cpp"
+    echo "%SRC%dxgi_hooks.cpp"
+    echo "%SRC%events.cpp"
+    echo "%SRC%resource_tracker.cpp"
+    echo "%SRC%ngx_evaluator.cpp"
+    echo "%SRC%present_evaluator.cpp"
     echo "%SRC%vendor\minhook\src\buffer.c"
     echo "%SRC%vendor\minhook\src\hook.c"
     echo "%SRC%vendor\minhook\src\trampoline.c"
     echo "%SRC%vendor\minhook\src\hde\hde64.c"
-    echo user32.lib
-    echo /link /MAP:"%OUT%\ScaleNG.map" /DEBUG
-    echo /Fe:"%OUT%\ScaleNG.dll"
+    echo user32.lib shell32.lib advapi32.lib dxgi.lib d3d12.lib shlwapi.lib
+    echo /link /MAP:"%OUT%\dxgi.map" /DEBUG
+    echo /Fe:"%OUT%\dxgi.dll"
 ) > "%RSP%"
 
 cl @"%RSP%"
@@ -63,45 +65,14 @@ if errorlevel 1 (
 
 del "%RSP%" >nul 2>&1
 
-move /y "%OUT%\ScaleNG.dll" "%OUT%\ScaleNG.asi" >nul
-del /q "%OUT%\ScaleNG.exp" "%OUT%\ScaleNG.lib" >nul 2>&1
-if exist "%OUT%\ScaleNG.asi" (
-    echo [OK] Built %OUT%\ScaleNG.asi
+if exist "%OUT%\dxgi.dll" (
+    echo [OK] Built %OUT%\dxgi.dll
 ) else (
-    echo [ERROR] Output rename failed.
+    echo [ERROR] Output missing.
     exit /b 1
 )
 
-rem ---- NGX helper exe (cross-process bridge worker) ----
-(
-    echo /nologo /O2 /EHsc /std:c++17 /MT /Zi /D_CRT_SECURE_NO_WARNINGS
-    echo /Fo"%OBJDIR%\\"
-    echo "%SRC%ngxc_helper.cpp"
-    echo "%SRC%dlss_ngx.cpp"
-    echo /I"%SRC%vendor\nvngx"
-    echo user32.lib shell32.lib advapi32.lib
-    echo /link /DEBUG
-    echo /Fe:"%OUT%\ScaleNG_NGX_helper.exe"
-) > "%TEMP%\ScaleNG_helper.rsp"
-cl @"%TEMP%\ScaleNG_helper.rsp"
-if errorlevel 1 (
-    echo [ERROR] Helper compilation failed.
-    del "%TEMP%\ScaleNG_helper.rsp" >nul 2>&1
-    exit /b 1
-)
-del /q "%OBJDIR%\helper_*" >nul 2>&1
-del "%TEMP%\ScaleNG_helper.rsp" >nul 2>&1
-if exist "%OUT%\ScaleNG_NGX_helper.exe" (
-    echo [OK] Built %OUT%\ScaleNG_NGX_helper.exe
-) else (
-    echo [ERROR] Helper output missing.
-    exit /b 1
-)
-
-rem ---- DLSS feature snippet required by the NGX core ------------------------
-rem The helper runs from Bin64\plugins, so the snippet must be packaged beside
-rem it.
-
+rem ---- Copy nvngx_dlss.dll to dist folder ----
 set "DLSS_SNIPPET=%SRC%..\dist\nvngx_dlss.dll"
 
 if exist "%DLSS_SNIPPET%" (
@@ -119,3 +90,36 @@ if exist "%DLSS_SNIPPET%" (
     echo [ERROR] Validated nvngx_dlss.dll not found.
     exit /b 1
 )
+
+rem ---- Create default dxgi.ini ----
+set "INI=%OUT%\dxgi.ini"
+if not exist "%INI%" (
+    echo [ScaleNG] > "%INI%"
+    echo enabled=1 >> "%INI%"
+    echo dlaa=1 >> "%INI%"
+    echo render_scale=67 >> "%INI%"
+    echo sharpness=0 >> "%INI%"
+    echo perf_quality=1 >> "%INI%"
+    echo mv_jittered=1 >> "%INI%"
+    echo auto_exposure=1 >> "%INI%"
+    echo app_id=241534720 >> "%INI%"
+    echo dlss_dll_path= >> "%INI%"
+    echo log_path= >> "%INI%"
+    echo [OK] Created default %INI%
+)
+
+echo.
+echo ============================================================
+echo ScaleNG.Drive DXGI Proxy Build Complete
+echo ============================================================
+echo Output: %OUT%\dxgi.dll
+echo Config: %OUT%\dxgi.ini
+echo DLSS:   %OUT%\nvngx_dlss.dll
+echo.
+echo To deploy to BeamNG.drive:
+echo   copy %OUT%\dxgi.dll "C:\games\BeamNG.drive\Bin64\dxgi.dll"
+echo   copy %OUT%\dxgi.ini "C:\games\BeamNG.drive\Bin64\dxgi.ini"
+echo   copy %OUT%\nvngx_dlss.dll "C:\games\BeamNG.drive\Bin64\nvngx_dlss.dll"
+echo.
+echo Then launch BeamNG with: -level GridMap -vehicle pickup -console -gfx d3d12
+echo ============================================================
