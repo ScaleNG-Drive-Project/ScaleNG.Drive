@@ -41,24 +41,48 @@
 | `src/present_evaluator.h/.cpp` | ✅ Created | Present-time NGX evaluation |
 | `dist/ScaleNG.ini` | ✅ Updated | `dlaa=0`, `helper=0`, `replaceOutput=1` |
 | `scripts/autonomous_test.py` | ✅ Working | 320s test runner with log monitoring |
+| `scripts/setup_test_env.bat` | ✅ Working | Creates isolated BeamNGpy 1.35.1 env (TCom v1.26) |
+| `scripts/launch_test.bat` | ✅ Working | Launches test with options (--duration, --require-dlss) |
 
 ---
 
-## Autonomous Test Results
+## Autonomous Test Infrastructure (IMPLEMENTED)
 
-**Latest Run**: 2026-10-02 18:54-18:59
-- Duration: 320s (5.3 min)
-- Success markers: 530
-- Warnings: 0
-- Failures: 0
-- Critical: 0
-- **RESULT: SUCCESS**
+### Test Infrastructure Files
+| File | Purpose |
+|------|---------|
+| `scripts/setup_test_env.bat` | Creates isolated `.venv-test` with BeamNGpy 1.35.1 (TCom v1.26) |
+| `scripts/launch_test.bat` | Entry point, forwards args to `autonomous_test.py` |
+| `scripts/autonomous_test.py` | Full test runner: build → deploy → launch → monitor → report |
+| `scripts/README.md` | Documentation for options and outcomes |
+| `AUTONOMOUS_WORKFLOW.md` | Full workflow documentation |
 
-Test logs show:
-- `hooks: D3D12CreateDevice detour installed`
-- `hooks: CreateDXGIFactory* detour installed`
-- `ScaleNG.asi initialization complete`
-- `hooks: config applied (dlaa=0)`
+### Test Flow
+1. **Build** - Runs `src/build_asi.bat` → builds `ScaleNG.asi` + `ScaleNG_NGX_helper.exe`
+2. **Deploy** - Copies artifacts to `Bin64/plugins/`, backs up existing
+3. **Launch** - Starts BeamNG via BeamNGpy TCom (port 25252 default) with `-tcom -tport -console -gfx d3d12`
+4. **Verify** - Monitors `ScaleNG.log` for:
+   - Plugin loaded/initialized
+   - D3D12 hooks (device, queue, swapchain, Present)
+   - D3D12 render frames + Present counter progression
+   - **DLSS injection marker** (optional, requires `--require-dlss`)
+
+### Test Outcomes
+| Outcome | Meaning |
+|---------|---------|
+| `PASS` | D3D12 render + Present + hooks active |
+| `PASS_DLSS_INJECTION` | PASS + DLSS injection marker found |
+| `INCONCLUSIVE_DLSS` | PASS but no DLSS injection marker (use `--require-dlss`) |
+| `GAME_CRASHED_AFTER_PLUGIN_INIT` | Crashed after plugin init |
+| `FAIL` | Any check failed |
+
+### Test Results (2026-10-02)
+- **Duration**: 320s (5.3 min)
+- **Success markers**: 530
+- **Failures**: 0
+- **Critical**: 0
+- **Outcome**: PASS (D3D12 render + Present + hooks verified)
+- **DLSS injection**: NOT verified (no injection marker logged)
 
 ---
 
@@ -111,18 +135,78 @@ queueCopy=0
 
 ---
 
-## DXGI Proxy Architecture (Prepared)
+## Current Config (dist/ScaleNG.ini)
 
-**Files Created** (not yet tested):
-- `src/dxgi_hooks.h/.cpp` - DXGI proxy hooks (CreateDXGIFactory, CreateSwapChainForHwnd)
-- `src/events.h/.cpp` - ReShade-style event system
-- `src/resource_tracker.h/.cpp` - Resource discovery via hook events
-- `src/ngx_evaluator.h/.cpp` - In-process NGX evaluator
-- `src/present_evaluator.h/.cpp` - Present-time NGX evaluation
-- `src/main_dxgi.cpp` - DXGI proxy entry point
-- `src/dxgi_proxy.def` - Export definitions
-- `src/build_asi.bat` - ASI build script
-- `dist/dxgi.ini` - Config for proxy
+```ini
+[ScaleNG]
+enabled=1
+upscaler=dlss
+scale=0.67
+sharpness=0.0
+perfQuality=1
+mvJittered=1
+autoExposure=1
+appId=241534720
+dlaa=0
+hud=1
+legacyScale=0
+passive=0
+
+[bridge]
+helper=0
+replaceOutput=1
+deferredOutput=1
+queueCopy=0
+```
+
+---
+
+## BeamNG v0.39 Level Loading Issue
+
+**Problem**: BeamNG v0.39.3.0 doesn't load levels via `-level GridMap -vehicle pickup` command line args. Game loads to main menu and exits.
+
+**Working**: Autonomous test with ASI works (320s, 530 success markers)
+**Not Working**: Manual command line `-level GridMap -vehicle pickup` exits immediately
+
+**Tried & Failed**:
+- `-level GridMap -vehicle pickup`
+- `-level gridmap/main.level.json`
+- `-lua "core_levels.loadLevel('GridMap')"`
+- `-lua "load_level('levels/GridMap/GridMap.terrain.json')"`
+- `-scenario scenarios/gm_corridor.json`
+- `-luafile "C:\games\BeamNG.drive\lua\autoload.lua"` with `core_levels.loadLevel('GridMap')`
+- `-luafile` with `load_level('levels/GridMap/GridMap.terrain.json')`
+- `-lua "core_levels.loadLevel('GridMap')"`
+- `-lua "load_level('levels/GridMap/main.level.json')"`
+- `-luafile` with `extensions.load('core_levels'); core_levels.loadLevel('GridMap')`
+
+**Workaround Needed**: Find v0.39 compatible level loading method
+
+---
+
+## Current Config (dist/ScaleNG.ini)
+
+```ini
+[ScaleNG]
+enabled=1
+upscaler=dlss
+scale=0.67
+sharpness=0.0
+perfQuality=1
+mvJittered=1
+autoExposure=1
+appId=241534720
+dlaa=0
+hud=1
+legacyScale=0
+passive=0
+
+[bridge]
+helper=0
+replaceOutput=1
+deferredOutput=1
+queueCopy=0
+```
 
 ---
 
@@ -187,6 +271,7 @@ python scripts\autonomous_test.py
 
 ## Git History
 
+- `2e6a1ee` - docs: add TOOL_REQUIREMENTS.md, PROJECT_LOG.md, and macro template
 - `4885f41` - feat: Single-device NGX path working with ASI architecture
 - `64f98f2` - fix: autonomous test - remove false positive C0000005 marker
 - `13c6ef9` - feat: ReShade integration lessons - DXGI proxy + event-based architecture
@@ -239,6 +324,51 @@ if (!g_upscaler || !g_upscaler->IsReady()) return;
 ## Priority Actions
 
 1. **HIGH**: Find v0.39 level loading method (console cmd, Lua, scenario, BeamNGpy)
-2. **HIGH**: Verify single-device NGX works when level loads
-3. **MEDIUM**: Test DXGI proxy architecture as ASI alternative
-4. **LOW**: Remove ReShade dxgi.dll from Bin64 (conflicts with our proxy)
+2. **HIGH**: Verify single-device NGX evaluation produces "DLSS injection recorded" logs
+3. **MEDIUM**: Test DXGI proxy architecture as alternative to ASI
+5. **LOW**: Remove ReShade dxgi.dll from Bin64 (conflicts with our proxy)
+
+---
+
+## Test Infrastructure Commands
+
+```bat
+# One-time setup (creates isolated BeamNGpy 1.35.1 env with TCom v1.26)
+scripts\setup_test_env.bat
+
+# Run test (30s quick test)
+scripts\launch_test.bat --duration 30
+
+# Run with DLSS injection requirement (fails if no injection marker)
+scripts\launch_test.bat --require-dlss --duration 60
+
+# Skip build/deploy, use existing deployment
+scripts\launch_test.bat --skip-build --no-deploy --duration 60
+
+# Full run with DLSS requirement
+scripts\launch_test.bat --require-dlss --duration 300
+```
+
+### Test Output
+- Results: `logs/test_runs/<UTC timestamp>/result.json`
+- Build logs: `logs/test_runs/<timestamp>/build.stdout.txt`
+- Game stdout: `logs/test_runs/<timestamp>/game.stdout.log`
+- Plugin log before: `logs/test_runs/<timestamp>/plugin_log_before.txt`
+- Plugin log new: `logs/test_runs/<timestamp>/plugin_log_new.txt`
+
+---
+
+## ReShade Integration Lessons (Documented)
+
+**File**: `RESHADE_INTEGRATION_LESSONS.md`
+
+| ReShade (Works) | ScaleNG (Blocked) |
+|----------------|------------------|
+| DXGI proxy DLL (`dxgi.dll`) | D3D12CreateDevice detour + D3D12 vtable hooks |
+| Hooks: `CreateDXGIFactory`, `CreateSwapChainForHwnd` | Hooks: D3D12 device vtable + cmdlist vtable |
+| Addon events: `init_device`, `init_swapchain`, `init_resource` | Manual hooks: `CreateRTV`, `CreateSRV`, `CopyTextureRegion`, `Present` |
+| Resource discovery: `init_resource` event | Manual: `CreateRTV`/`CreateSRV` hooks |
+| Overlay: ImGui via `register_overlay` | Custom HUD (broken) |
+| NGX: In-process possible | Cross-process helper (required) |
+
+**Key Insight**: ReShade hooks at DXGI level (clean, stable). ScaleNG hooks at D3D12 level (fragile).
