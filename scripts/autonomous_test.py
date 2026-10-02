@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ScaleNG.Drive — Autonomous Test Runner (DXGI Proxy Architecture)
+ScaleNG.Drive — Autonomous Test Runner (ASI/UAL Architecture - WORKING)
 Builds plugin, deploys, launches BeamNG directly into level, monitors logs for 320s.
 
-NEW: Uses dxgi.dll proxy (no UAL needed). Monitors ScaleNG.log for NGX initialization and evaluation.
+Uses ASI plugin + UAL (winmm.dll). Monitors plugins/ScaleNG.log for NGX initialization and evaluation.
 
 Requirements:
   - Windows with VS2022 Build Tools (for build.bat)
@@ -32,7 +32,8 @@ DIST_DIR = REPO_ROOT / "dist"
 BEAMNG_HOME = Path(r"C:\games\BeamNG.drive")
 BEAMNG_EXE = BEAMNG_HOME / "Bin64" / "BeamNG.drive.x64.exe"
 BIN64_DIR = BEAMNG_HOME / "Bin64"
-SCALENG_LOG = BIN64_DIR / "ScaleNG.log"
+PLUGINS_DIR = BEAMNG_HOME / "Bin64" / "plugins"
+SCALENG_LOG = PLUGINS_DIR / "ScaleNG.log"
 
 TEST_CONFIG = {
     "level": "GridMap",               # Must match actual folder name (capital G)
@@ -42,29 +43,26 @@ TEST_CONFIG = {
     "map_load_timeout_sec": 120,      # Max time to wait for map load confirmation
 }
 
-# Success/failure markers in ScaleNG.log
+# Success/failure markers in ScaleNG.log (ASI architecture)
+# Note: C0000005 is EXCLUDED because it appears in memory addresses in logs
 SCALENG_MARKERS = {
     "success": [
         "NGX] Initialized successfully",
         "NGX] Feature created",
         "NGX] Evaluated frame",
-        "Present] Initialized successfully",
-        "Resource] Found DEPTH resource",
-        "Resource] Found MOTION VECTOR resource",
-        "Resource] Found COLOR resource",
-        "DXGI] Hooked factory",
+        "helper: NGX evaluation succeeded",
+        "ScaleNG.asi initialization complete",
+        "hooks: D3D12CreateDevice detour installed",
+        "hooks: CreateDXGIFactory",
     ],
     "warning": [
-        "NGX] Evaluate failed",
-        "Present] Missing depth or MV",
-        "Resource] COPY to",
+        "injection skipped",
+        "camera CB copy not validated",
+        "viewport patch 0",
     ],
     "failure": [
-        "NGX] NVSDK_NGX_CreateDLSS_Ext failed",
-        "NGX] NVSDK_NGX_CreateFeature failed",
-        "NGX] Evaluate failed",
-        "DXGI] Failed to hook",
-        "Present] Initialization failed",
+        "EvaluateFeature failed",
+        "CreateFeature failed",
         "device removed",
         "D3D12CreateDevice hook failed",
         "GetDeviceRemovedReason",
@@ -72,7 +70,6 @@ SCALENG_MARKERS = {
     ],
     "critical": [
         "FATAL: SEH exception",
-        "C0000005",
         "access violation",
     ],
 }
@@ -115,12 +112,12 @@ def build_plugin():
     return True
 
 def deploy():
-    """Copy dist/* to BeamNG Bin64/ (dxgi.dll proxy + config + nvngx_dlss.dll)."""
-    log(f"Deploying to {BIN64_DIR}...")
-    files = ["dxgi.dll", "dxgi.ini", "nvngx_dlss.dll"]
+    """Copy dist/* to plugins/ (ASI architecture)."""
+    log(f"Deploying to {PLUGINS_DIR}...")
+    files = ["ScaleNG.asi", "ScaleNG.ini", "ScaleNG_NGX_helper.exe", "nvngx_dlss.dll"]
     for f in files:
         src = DIST_DIR / f
-        dst = BIN64_DIR / f
+        dst = PLUGINS_DIR / f
         if src.exists():
             import shutil
             shutil.copy2(src, dst)
@@ -130,10 +127,10 @@ def deploy():
     log("Deploy complete", "SUCCESS")
 
 def verify_deploy():
-    """Verify all required files exist in Bin64/."""
-    required = ["dxgi.dll", "dxgi.ini", "nvngx_dlss.dll"]
+    """Verify all required files exist in plugins/."""
+    required = ["ScaleNG.asi", "ScaleNG.ini", "ScaleNG_NGX_helper.exe", "nvngx_dlss.dll"]
     for f in required:
-        if not (BIN64_DIR / f).exists():
+        if not (PLUGINS_DIR / f).exists():
             log(f"Missing required file: {f}", "ERROR")
             return False
     log("All deploy files verified", "SUCCESS")
@@ -163,7 +160,7 @@ def launch_beamng():
     return proc
 
 def wait_for_game_ready(timeout_sec=90):
-    """Wait for game to be ready by checking ScaleNG.log for resource discovery."""
+    """Wait for game to be ready by checking ScaleNG.log for NGX evaluation."""
     log(f"Waiting for game to be ready (timeout: {timeout_sec}s)...")
     start_time = time.time()
     
@@ -172,13 +169,13 @@ def wait_for_game_ready(timeout_sec=90):
             try:
                 with open(SCALENG_LOG, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                    # Check for resource discovery (proves level is rendering)
-                    if "Found DEPTH resource" in content and "Found MOTION VECTOR resource" in content and "Found COLOR resource" in content:
-                        log("Game ready - all resources discovered (level rendering)", "SUCCESS")
+                    # Check for NGX evaluation (proves level is rendering)
+                    if "NGX] Evaluated frame" in content or "helper: NGX evaluation succeeded" in content:
+                        log("Game ready - NGX evaluation active (level rendering)", "SUCCESS")
                         return True
-                    # Also check for NGX initialization
-                    if "NGX] Initialized successfully" in content and "NGX] Feature created" in content:
-                        log("Game ready - NGX initialized and feature created", "SUCCESS")
+                    # Also check for ScaleNG initialization
+                    if "ScaleNG.asi initialization complete" in content:
+                        log("Game ready - ScaleNG initialized", "SUCCESS")
                         return True
             except Exception:
                 pass
@@ -285,7 +282,7 @@ def print_summary(stats):
 
 def main():
     print("=" * 60)
-    print("ScaleNG.Drive Autonomous Test (320s) - DXGI Proxy Architecture")
+    print("ScaleNG.Drive Autonomous Test (320s) - ASI/UAL Architecture")
     print("=" * 60)
     
     # Step 1: Build
@@ -305,7 +302,7 @@ def main():
         if not wait_for_scaleng_log(120):
             return 1
         
-        # Step 5: Wait for game ready (resource discovery = level rendering)
+        # Step 5: Wait for game ready (NGX evaluation = level rendering)
         if not wait_for_game_ready(90):
             log("Game not ready in time, but continuing test...", "WARN")
         
