@@ -248,26 +248,34 @@ bool InstallDXGIHooks() {
         return false;
     }
     
-    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
-    if (!dxgi) dxgi = LoadLibraryW(L"dxgi.dll");
+    // Get SYSTEM dxgi.dll from System32, NOT our proxy
+    wchar_t sys_path[MAX_PATH];
+    GetSystemDirectoryW(sys_path, MAX_PATH);
+    wcscat_s(sys_path, L"\\dxgi.dll");
     
-    if (dxgi) {
-        g_orig_CreateDXGIFactory1 = (PFN_CreateDXGIFactory1)GetProcAddress(dxgi, "CreateDXGIFactory1");
-        g_orig_CreateDXGIFactory2 = (PFN_CreateDXGIFactory2)GetProcAddress(dxgi, "CreateDXGIFactory2");
-        g_orig_CreateDXGIFactory = (PFN_CreateDXGIFactory)GetProcAddress(dxgi, "CreateDXGIFactory");
-        
-        if (g_orig_CreateDXGIFactory1) {
-            MH_CreateHook(g_orig_CreateDXGIFactory1, Hook_CreateDXGIFactory1, (void**)&g_orig_CreateDXGIFactory1);
-            MH_EnableHook(g_orig_CreateDXGIFactory1);
-        }
-        if (g_orig_CreateDXGIFactory2) {
-            MH_CreateHook(g_orig_CreateDXGIFactory2, Hook_CreateDXGIFactory2, (void**)&g_orig_CreateDXGIFactory2);
-            MH_EnableHook(g_orig_CreateDXGIFactory2);
-        }
-        if (g_orig_CreateDXGIFactory) {
-            MH_CreateHook(g_orig_CreateDXGIFactory, Hook_CreateDXGIFactory, (void**)&g_orig_CreateDXGIFactory);
-            MH_EnableHook(g_orig_CreateDXGIFactory);
-        }
+    HMODULE dxgi = LoadLibraryExW(sys_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!dxgi) {
+        SNG_LOG("[DXGI] Failed to load system dxgi.dll from %ls", sys_path);
+        return false;
+    }
+    
+    SNG_LOG("[DXGI] Loaded system dxgi.dll from %ls", sys_path);
+    
+    g_orig_CreateDXGIFactory1 = (PFN_CreateDXGIFactory1)GetProcAddress(dxgi, "CreateDXGIFactory1");
+    g_orig_CreateDXGIFactory2 = (PFN_CreateDXGIFactory2)GetProcAddress(dxgi, "CreateDXGIFactory2");
+    g_orig_CreateDXGIFactory = (PFN_CreateDXGIFactory)GetProcAddress(dxgi, "CreateDXGIFactory");
+    
+    if (g_orig_CreateDXGIFactory1) {
+        MH_CreateHook(g_orig_CreateDXGIFactory1, Hook_CreateDXGIFactory1, (void**)&g_orig_CreateDXGIFactory1);
+        MH_EnableHook(g_orig_CreateDXGIFactory1);
+    }
+    if (g_orig_CreateDXGIFactory2) {
+        MH_CreateHook(g_orig_CreateDXGIFactory2, Hook_CreateDXGIFactory2, (void**)&g_orig_CreateDXGIFactory2);
+        MH_EnableHook(g_orig_CreateDXGIFactory2);
+    }
+    if (g_orig_CreateDXGIFactory) {
+        MH_CreateHook(g_orig_CreateDXGIFactory, Hook_CreateDXGIFactory, (void**)&g_orig_CreateDXGIFactory);
+        MH_EnableHook(g_orig_CreateDXGIFactory);
     }
     
     SNG_LOG("[DXGI] DXGI hooks installed");
@@ -288,14 +296,62 @@ void UninstallDXGIHooks() {
 }
 
 // ============================================================================
-// Logging implementation
+// Logging implementation - simple, robust
 // ============================================================================
 
 static FILE* g_log_file = nullptr;
 static std::mutex g_log_mutex;
+static bool g_log_initialized = false;
+static wchar_t g_dll_path[MAX_PATH] = {};
+
+void InitializeLogFile() {
+    if (g_log_initialized) return;
+    g_log_initialized = true;
+    
+    // Use our DLL's path (set by DllMain)
+    wchar_t log_path[MAX_PATH];
+    if (g_dll_path[0]) {
+        wcscpy_s(log_path, g_dll_path);
+        wchar_t* slash = wcsrchr(log_path, L'\\');
+        if (slash) {
+            *(slash + 1) = L'\0';
+            wcscat_s(log_path, L"ScaleNG.log");
+        }
+    } else {
+        // Fallback: use game directory
+        GetModuleFileNameW(nullptr, log_path, MAX_PATH);
+        wchar_t* slash = wcsrchr(log_path, L'\\');
+        if (slash) {
+            *(slash + 1) = L'\0';
+            wcscat_s(log_path, L"ScaleNG.log");
+        } else {
+            wcscpy_s(log_path, L"C:\\ScaleNG.log");
+        }
+    }
+    
+    g_log_file = _wfopen(log_path, L"a");
+    if (g_log_file) {
+        // Write a startup marker
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char marker[256];
+        sprintf_s(marker, "\n\n=== ScaleNG.Drive Started: %02d:%02d:%02d.%03d ===\n", 
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        fwrite(marker, 1, strlen(marker), g_log_file);
+        fflush(g_log_file);
+    }
+}
+
+void SetDllPath(HMODULE hModule) {
+    GetModuleFileNameW(hModule, g_dll_path, MAX_PATH);
+}
 
 void LogMessage(const char* format, ...) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
+    
+    if (!g_log_initialized) {
+        InitializeLogFile();
+    }
     
     char buffer[2048];
     va_list args;
@@ -314,19 +370,6 @@ void LogMessage(const char* format, ...) {
     sprintf_s(output, "%s%s\n", timestamp, buffer);
     
     OutputDebugStringA(output);
-    
-    if (!g_log_file) {
-        if (SNG_CONFIG.log_path[0]) {
-            g_log_file = _wfopen(SNG_CONFIG.log_path, L"a");
-        } else {
-            wchar_t path[MAX_PATH];
-            GetModuleFileNameW(nullptr, path, MAX_PATH);
-            wchar_t* slash = wcsrchr(path, L'\\');
-            if (slash) *(slash + 1) = L'\0';
-            wcscat_s(path, L"ScaleNG.log");
-            g_log_file = _wfopen(path, L"a");
-        }
-    }
     
     if (g_log_file) {
         fwrite(output, 1, strlen(output), g_log_file);

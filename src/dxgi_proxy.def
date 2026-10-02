@@ -1,0 +1,5 @@
+LIBRARY "dxgi"
+EXPORTS
+    CreateDXGIFactory = ScaleNG_CreateDXGIFactory @1
+    CreateDXGIFactory1 = ScaleNG_CreateDXGIFactory1 @2
+    CreateDXGIFactory2 = ScaleNG_CreateDXGIFactory2 @3

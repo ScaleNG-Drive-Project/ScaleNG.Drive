@@ -130,6 +130,7 @@ private:
 // ============================================================================
 
 void LogMessage(const char* format, ...);
+void SetDllPath(HMODULE hModule);
 void SetConfig(const Config& cfg);
 Config GetConfig();
 

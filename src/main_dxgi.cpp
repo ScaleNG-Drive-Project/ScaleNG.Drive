@@ -130,17 +130,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
     switch (fdwReason) {
         case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(hModule);
+            ScaleNG::SetDllPath(hModule);
             g_dll_attached = true;
             
-            LoadConfig();
+            // Note: DllMain not running for dxgi.dll proxy - using ASI architecture instead
+            // This file is kept for reference
+            
+            return TRUE;
             
             if (!SNG_STATE.config.enabled) {
-                SNG_LOG("[Main] ScaleNG disabled, skipping hook installation");
+                OutputDebugStringA("[ScaleNG] ScaleNG disabled, skipping hook installation\n");
                 return TRUE;
             }
             
-            SNG_LOG("[Main] ScaleNG.Drive DXGI Proxy starting...");
-            SNG_LOG("[Main] Module: %p", hModule);
+            OutputDebugStringA("[ScaleNG] ScaleNG.Drive DXGI Proxy starting...\n");
+            OutputDebugStringA("[ScaleNG] Module loaded\n");
             
             // Set up DXGI hook callbacks
             g_on_init_effect_runtime = [](const void* data) {
@@ -163,17 +167,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
             
             // Install DXGI hooks
             if (!InstallDXGIHooks()) {
-                SNG_LOG("[Main] Failed to install DXGI hooks");
+                OutputDebugStringA("[ScaleNG] Failed to install DXGI hooks\n");
                 return FALSE;
             }
             
-            SNG_LOG("[Main] ScaleNG.Drive DXGI Proxy initialized successfully");
+            OutputDebugStringA("[ScaleNG] ScaleNG.Drive DXGI Proxy initialized successfully\n");
             break;
         }
         case DLL_PROCESS_DETACH: {
             if (!g_dll_attached) break;
             
-            SNG_LOG("[Main] ScaleNG.Drive shutting down...");
+            OutputDebugStringA("[ScaleNG] ScaleNG.Drive shutting down...\n");
             
             PresentEvaluator::Get().Shutdown();
             
@@ -184,7 +188,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
             g_initialized = false;
             g_dll_attached = false;
             
-            SNG_LOG("[Main] ScaleNG.Drive shutdown complete");
+            OutputDebugStringA("[ScaleNG] ScaleNG.Drive shutdown complete\n");
             break;
         }
     }
@@ -194,21 +198,25 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
 } // namespace ScaleNG
 
 // ============================================================================
-// DXGI Proxy Exports - These are the functions Windows will call instead of system DXGI
+// DXGI Proxy Exports - renamed to avoid conflicts with system headers
+// Exported via dxgi_proxy.def
 // ============================================================================
 
 extern "C" {
 
-// CreateDXGIFactory
-HRESULT WINAPI CreateDXGIFactory(REFIID riid, void** ppFactory) {
+// CreateDXGIFactory - renamed export
+HRESULT WINAPI ScaleNG_CreateDXGIFactory(REFIID riid, void** ppFactory) {
     return ScaleNG::Hook_CreateDXGIFactory(riid, ppFactory);
 }
 
-// CreateDXGIFactory1
-HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void** ppFactory) {
+// CreateDXGIFactory1 - renamed export
+HRESULT WINAPI ScaleNG_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
     return ScaleNG::Hook_CreateDXGIFactory1(riid, ppFactory);
 }
 
-// Note: We don't export CreateDXGIFactory2 to avoid conflict with system dxgi.dll
+// CreateDXGIFactory2 - renamed export
+HRESULT WINAPI ScaleNG_CreateDXGIFactory2(REFIID riid, void** ppFactory) {
+    return ScaleNG::Hook_CreateDXGIFactory2(riid, ppFactory);
+}
 
 } // extern "C"

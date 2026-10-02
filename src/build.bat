@@ -52,7 +52,7 @@ set "RSP=%TEMP%\ScaleNG_build.rsp"
     echo "%SRC%vendor\minhook\src\trampoline.c"
     echo "%SRC%vendor\minhook\src\hde\hde64.c"
     echo user32.lib shell32.lib advapi32.lib dxgi.lib d3d12.lib shlwapi.lib
-    echo /link /MAP:"%OUT%\dxgi.map" /DEBUG
+    echo /link /MAP:"%OUT%\dxgi.map" /DEBUG /DEF:"%SRC%dxgi_proxy.def"
     echo /Fe:"%OUT%\dxgi.dll"
 ) > "%RSP%"
 
