@@ -1226,6 +1226,519 @@ scene adoption requires fmt-11 UNORM → `boundScene=0` on every vp-diag.
 result copy unwired (`Real_CopyTextureRegion` never assigned). No DLSS success
 claimed.
 
+## Shadow Present-quiet diagnostic (2026-10-04, runs 20261004T173233Z/173336Z)
+
+**Exact change (`src/d3d12_hooks.cpp`, additive only; committed partial, completed here):**
+prior commit `9383609` added `g_lastNewChainPresent` (`volatile LONG64`) +
+`g_chainPresentObserved` (`volatile LONG`) + `HooksGetPresentQuietFrames()`,
+stamped in the same `newNode` block as `g_lastNewChainFrame`. This step wired
+the bounded defer log (same 5-log cap):
+`chain quiet %uf/120f (present-quiet %llup)`. Gate condition
+(`HooksGetQuietFrames() < 120`), threshold, units, NGX call sites,
+scene-selection, and injection path are byte-for-byte unchanged.
+**Thread-safety basis (verified from call graph):** `CopyTexBody` runs on
+engine recording threads (`Shim_CopyTextureRegion` → `CopyTexBody`; concurrent
+ECL workers); `Hook_Present` increments `g_presentSerial` on the Present
+thread; `EnsureUpscalerInit` readers run on both (camera-accept/DoInjection on
+engine threads; `InjectAtPresentImpl` paths on Present thread). Plain fields
+would race, so shadow storage copies the established serial pattern —
+`LONG64` + `InterlockedExchange64` writes / `InterlockedCompareExchange64`
+loads (same as `g_presentSerial`/`g_eclSerial`); flag is `LONG` +
+`InterlockedExchange`/`CompareExchange` (same as `g_loadPhase`/`g_settledOnce`).
+Width is 64-bit like `g_presentSerial`; quiet is `(now - last)` mod 2^64
+(wrap-safe, practically nowrap). `%llu` matches existing `present=%llu` logs.
+**Build/test evidence (verified facts):** build OK (`[OK] Built` both
+artifacts, 20:32:20). 173233Z: freeroam+`thePlayer`, 1 frame, 3 accepts,
+`1f/120f (present-quiet 1p)` x3 (paired clocks agree: single chain observation
+preceded the burst; neither clock advanced after). Game exited 0xC0000005
+mid-run after the measurement (Present 1→125, 0 fatal markers in our log);
+prior identical-code runs show this flake is game-side (cf. 213754Z/201107Z
+triages), but causation is unproven from one run — evidence preserved in the
+run dir. 173336Z: clean PASS (exit 0, 0 fatal), 0 frames / 5 rejects / 0 defers
+— camera-dormant, correctly NOT counted as a quiet-clock result.
+**Limitations (hypotheses kept separate):** paired `1p`/`1f` do NOT prove any
+Present interval is safe — both clocks share the same single `newNode`
+observation, so agreement here reflects one shared event, not coverage of the
+fix87/89/90 churn (CopyResource, submit-time lists, address reuse, and
+creation churn still invisible to both clocks). No NGX contact occurred; no
+threshold/unit/gating change.
+**Reversal:** revert the defer-log line to `chain quiet %uf/120f` +
+remove the two shadow fields, getter, and the two stamp lines in the `newNode`
+block; `src\build_asi.bat`; rerun `--duration 30`. No config/artifact changes.
+**Next blocker:** scene-validity gap is now the binding constraint to measure
+an init attempt against (fmt-28 live binds vs fmt-11 adoption gate); the
+unwired `DoInjection` result copy stays last. No DLSS success claimed.
+
+## Scene-validity audit (2026-10-04, read-only; runs 173233Z/172116Z/170532Z)
+
+**Verified facts (source + logs):**
+- Gameplay binds (all camera-active runs): 1920x1080 fmt-28 `R8G8B8A8_UNORM`
+ LDR (`vp diag bound=... bdesc=1920x1080 fmt=28`, `boundScene=0`, setcount 5–6).
+ Display-sized copies seen: 1920x1080 f45→f45 (fmt-45 = `D24_UNORM_S8_UINT`
+ depth, header-verified) and one 1920x1080 fmt-28→fmt-28 `CopyResource`
+ (`#2`, dim=3=TEXTURE2D); one 1920x1080 fmt-87 (`B8G8R8A8_UNORM`) copy src
+ (`native-usage copy #3`) on an unlinked side branch.
+ **Correction (2026-10-04 recheck):** the swapchain itself is fmt-28
+ (`present on real swapchain ... (format 28)`, backbuffer candidate fmt-28),
+ so the Present path is format-consistent fmt-28→fmt-28 — but the
+ pointer connection is UNPROVEN (CopyResource `#2` dst `80CD43B8B0` vs
+ backbuffer `8042AD48B0` are different pointers; no GetBuffer probe by
+ design). fmt-87 feeds no observed Present input; its consumer is unknown —
+ do NOT cite it as the backbuffer. No pointer-connected fmt-28→fmt-87→Present
+ path exists in the logs.
+- Adoption that ran: 173233Z created scene RTV `80CD3EE760` (1902x1033
+ fmt-11) + ALT `80CD5AB5A0` (1920x983 fmt-11) + ALT `80CD5B0860` (1920x1080
+ fmt-11). So a gameplay-sized UNORM target EXISTS, but the gameplay bind is
+ fmt-28, hence `SceneColorBound()` stays null.
+- `native-candidate` already names better candidates with no new hooks:
+ 1920x1080 fmt-10 `R16G16B16A16_FLOAT` pair (`80CD5E99C0`/`80CD5E90B0`,
+ roles=3=RTV+SRV views created, rtv=1 srv=2).
+ **Correction:** roles/srv counts prove view creation only — NOT that a draw
+ sampled them. Zero `hooks: barrier` lines name any candidate (legacy
+ `Barrier()` helper is state-map-gated and `Real_ResourceBarrier` is null on
+ this path); shim-side `TrackResourceBarriers` logs invocation counts, never
+ per-resource PSR transitions; `roottable` logs carry GPU addresses with no
+ resource linkage. So "rendered AND shader-sampled" is WITHDRAWN: view
+ footprints only. fmt-34 (`R16G16_FLOAT`, MV-shaped) and fmt-10 siblings at
+ 1902x1033/1920x983 also present (same caveat).
+- fmt-11 requirement origin: project assumption since the fix22-era rewrite
+ (`34c95d7` introduced UNORM adoption + `scene color RTV` logs); no NGX/doc
+ citation in code. NGX integration (`src/dlss_ngx.cpp`) sets NO
+ format/colorspace parameter — only resources (color/depth/MV/output),
+ render/display sizes, jitter, sharpness, MV-scale, and flags
+ (MVJittered/AutoExposure, perf quality). Format is inferred by NGX from the
+ resource desc. MV `R16G16_FLOAT` adoption already matches NGX convention;
+ depth is format-agnostic in code (records real fmt, gates MSAA/unknown).
+ Elsewhere the project already accepts FLOAT as scene (`ObservePersistentSceneColor`
+ :1544-1545, batch filter :1180-1181, f10-pair adoption) — only creation /
+ RTV-bind / copy-source adoption + `SceneSetNote` (:663) are UNORM-only.
+- Output constraint (verified): `g_dlssOutFormat` is fmt-11 at display size
+ (`:911`, `CreateDlssOut`); `DoInjection` copies dlssOut→scene, and D3D12
+ copies require identical formats. Adopting a fmt-28 scene under the current
+ output format would make the result copy illegal — a second reason fmt-28
+ needs more than a gate flip.
+**Correction from NGX contract review (2026-10-04):** fmt-28 is not
+automatically invalid as DLSS color input just because it is 8-bit UNORM/LDR.
+NVIDIA's DLSS Programming Guide permits LDR processing when the input values
+are in range and perceptually encoded (not linear); it says to use
+`NVSDK_NGX_DLSS_Feature_Flags_IsHDR=0` for that case, and HDR processing when
+the input is linear or otherwise fails the LDR conditions. The DXGI format
+alone does not reveal the transfer function or pixel-value semantics. The
+current `NvDlssUpscaler::CreateFeature` starts create flags at zero and adds
+MV-jittered/auto-exposure flags only; it does not explicitly set IsHDR. Thus
+the present implementation is effectively relying on the LDR/default flag
+path, but has not established that the game's fmt-28 values meet NVIDIA's LDR
+conditions. Citation: [NVIDIA DLSS Programming Guide](https://github.com/NVIDIA/DLSS/blob/main/doc/DLSS_Programming_Guide_Release.pdf).
+
+**Inferences (not proof):** fmt-28 may be a later LDR composite, and the
+fmt-10 1920x1080 RTV+SRV pair may be a better pre-tonemap HDR candidate. The
+existing observations prove bind/view roles only: RTV+SRV creation counts do
+not prove which draw samples a descriptor, which candidate is the primary
+scene, or whether fmt-28 is encoded correctly for LDR DLSS. Do not label the
+fmt-28 target unsuitable solely from its format, and do not call fmt-10 the
+scene solely from format/size.
+**Unknowns:** which fmt-10 target (if any) is the terminal pre-tonemap scene
+vs. a transient composite; the actual transfer function/value range of fmt-28;
+which descriptor resources are sampled by the relevant draw calls; and the
+resource/encoding that NGX would accept for the live scene. No game NGX init
+or driver verdict has occurred.
+**Proposed next experiment (NOT implemented):** do not add the previously
+proposed Present-only role-count sampler as a decisive test: cumulative RTV,
+SRV, or copy counts cannot identify the descriptor actually consumed by a
+draw or establish fmt-28's encoding. The smallest decisive evidence source is
+a successful GPU-frame capture of an ordinary freeroam frame, if a capture
+path becomes available; inspect the candidate resources' actual contents,
+resource states, descriptor bindings, and pass ordering into Present. PIX
+launch and RenderDoc attach have failed in this environment, so do not repeat
+those workflows unchanged. If no capture route is available, the next
+project-local experiment should be a bounded descriptor shadow-map for only
+the observed scene candidates: inventory shader-visible heap bases/increments,
+track relevant SRV writes/copies and heap binds, then join observed root-table
+handles to exact resource pointers on the same command list/draw window. Before
+implementing, audit hook coverage and descriptor lifetime/copy paths; a
+partial join must be labeled inconclusive, not a negative result. Neither
+option alone proves fmt-28's color encoding; that requires capture/content
+evidence or a separately justified NGX validation experiment. Files/risk/
+rollback for the code option must be scoped after that read-only API audit.
+Other gates remain separate: scene identification proves nothing about quiet
+interval safety and does not wire the `DoInjection` result copy — verified
+2026-10-04 (no source/config changes).
+
+**Assignment follow-up (verified):**
+- *fmt-28 viability:* format alone is inconclusive both ways. Official docs
+ (Streamline `ProgrammingGuideDLSS.md` §4–5; DLSS Guide): DLSS takes
+ render-res color + final-res output + depth + MV; `colorBuffersHDR = eTrue`
+ is the assumed default; LDR mode (`IsHDR=0`, our implicit setting — create
+ flags start 0, only MVJittered+AutoExposure added) needs non-linear in-range
+ input, else banding/shift artifacts. Our fmt-28 is non-sRGB UNORM with
+ unmeasured transfer/values — viability UNPROVEN either way.
+- *fmt-10 draw use:* UNPROVEN (correction above). View counts ≠ draw use; no
+ barrier/PSR/root linkage in logs.
+- *Pointer path fmt-28→Present:* format-consistent, pointer-UNPROVEN. No chain
+ may be cited.
+- *fmt-11 gate + change consequences:* project assumption (fix22-era), not
+ NGX. UNORM-only sites: `SceneSetNote` (:663), creation (:3074,:3107),
+ copy-source (:7854), RTV-bind (:8132). A candidate change also forces
+ `g_dlssOutFormat`/`CreateDlssOut` (identical-format copy law), display-size
+ hysteresis revalidation, viewport/trigger pointer match, `IsHDR` decision,
+ MV-range validation (`mvScale=mvW/mvH` assumes [0,1]-UV deltas — BeamNG MV
+ range NEVER measured), depth re-gating. Multi-site + driver-contact: needs
+ approval.
+**Shadow-map coverage audit (negative stays inconclusive):** record-time-only
+ shims (submit resubmissions bypass); `CopyResource` observe-only (2 calls);
+ SRV counting without heap-bind join; handle-reuse aliasing; Map-path camera
+ unobserved. Success = same-list root-handle→candidate join + PSR footprint
+ on fmt-10 pair with fmt-28 as sink; failure = fmt-28 as upstream SRV into
+ HDR, or fmt-10 pair with no joinable use after coverage-corrected sampling.
+ No NGX contact in plan.
+
+**Descriptor-correlation coverage audit (2026-10-04, read-only, no runs).**
+Rollback note (correction): never revert doc work with whole-file checkout —
+ the tree holds unrelated doc edits. Roll back any section below by deleting
+ only its added paragraphs (exact hunks), leaving all other edits intact.
+*Per-link mapping chain (root-table GPU handle → resource used by a draw):*
+- L1 SRV write (`CreateShaderResourceView`, device slot 18, verified):
+ OBSERVED for discovery (`ObserveNativeCandidate` role=2) but handle→resource
+ is NEVER stored (unlike RTV: `g_rtvMap`+refresh). Same-handle overwrites,
+ lifetime/reuse, and pre-hook creations are untracked. Devices: hooked
+ post-init only.
+- L2 descriptor copies (`CopyDescriptors`/`CopyDescriptorsSimple`): NOT
+ hooked (slots unverified — fresh header count required before any proposal).
+ Copies/overwrites silently stale any shadow map. Critical gap.
+- L3 heap inventory (`CreateDescriptorHeap`, slot 14): OBSERVED (base
+ CPU/GPU, increment via `GetDescriptorHandleIncrementSize`, count, flags).
+ Pre-hook heaps missed; destroy/reuse unobserved.
+- L4 heap bind (`SetDescriptorHeaps`, list slot 28): UNOBSERVED —
+ `Hook_SetDescriptorHeaps` is defined-but-never-installed (no `cloned[]`
+ entry, `Real_` never assigned) and `g_setHeaps` has no writer, so
+ `HooksGetDescriptorHeaps` always returns 0. GPU handles cannot be attributed
+ to a heap. Critical gap.
+- L5 root-table bind (`SetGraphicsRootDescriptorTable`, list slot 32):
+ OBSERVED record-time-only (submit resubmissions bypass via third-heap
+ tables). Logs GPU handle+rootParam+list, but no heap and no root-signature
+ range info — table span unknown, so consumed handles unenumerable.
+ Critical gap.
+- L6 draw timing (`Draw*`/`Dispatch`/`ExecuteBundle`): NOT hooked. Binds
+ without a following draw marker prove nothing. Critical gap.
+- L7 queues/devices: several direct queues exist (first-captured kept);
+ copy/compute queues and pre-hook objects uncovered.
+*Positive vs negative:* a same-list join (handle inside a bound heap range +
+ recorded SRV write + draw marker) proves the draw COULD sample the
+ candidate — never pixel-content proof. A no-match proves NOTHING (any of
+ L2/L4/L5/L6 explains absence).
+*Boundedness (state, not just logs):* SRV slot map cap 64 + heap table cap 16
+ + per-list last-bind cap 8; window/present-stamp expiry with fault-guarded
+ reads (no refs — weak pointers per teardown rules); O(1) inserts, no
+ `GetDesc` on hot paths, sampled join at Present 1/60 under shared locks
+ (exclusive only on insert, never held across guarded reads); log cap 1
+ line/60 presents + distinct-event caps.
+*Staged plan (proposals, NOT implemented):* Stage 0 = this audit (done).
+ Stage 1 (logging-only, no selection/gate/render change): SRV
+ handle→resource writer inside existing `Hook_CreateShaderResourceView` +
+ last-heap recorder requires FIRST installing a `SetDescriptorHeaps` shim
+ (slot 28, header re-verified) + sampled join at Present. No
+ `CopyDescriptors` hook, no root-signature hook, no gating change. If Stage 1
+ joins never resolve, STOP — coverage dominates; do not escalate.
+ (Wording superseded by the Stage 1 revision below: a no-match is
+ inconclusive and answers nothing about the scene.)
+ Failure modes: handle-reuse aliasing (generation/present-stamp
+ invalidation), heap destroy (dangling bases — guarded + expiry), own-heap
+ pollution (exclude HUD/injection heaps by pointer), submit-time bypass
+ (label inconclusive), log I/O (off hot path). Files: `src/d3d12_hooks.cpp`
+ only. Targeted rollback: revert the SRV-writer hunk, the heap-shim hunk,
+ and the join-sampler hunk independently; rebuild; rerun. Scene-audit
+ conclusions stand: fmt-28 encoding unproven, fmt-10 views ≠ draw use,
+ fmt-28→Present pointer path unproven. No NGX contact.
+
+**Stage 1 revision (2026-10-04, read-only; supersedes the "STOP if unresolved"
+ wording above, which is withdrawn — a no-match Stage 1 answers NOTHING about
+ the scene and must not be read as one).**
+*Heap clarification:* `Hook_CreateDescriptorHeap` IS installed (device slot
+ 14, verified) and already inventories heap base CPU/GPU + increment + count +
+ flags. No new heap-creation work is needed. What is missing is (a) an
+ SRV-slot map (writes observed, never stored) and (b) per-list heap-bind state
+ (`Hook_SetDescriptorHeaps` defined-but-never-installed; `g_setHeaps`
+ unwritten). Those two are the actual Stage 1 additions.
+*Full link map GPU-handle → resource-at-draw (slot = SDK 10.0.28000.0
+ DECLSPEC_XFGVIRT order; coverage = current hooks):*
+- A. SRV write (`CreateShaderResourceView`, device slot 18): COVERED for
+ discovery, stores no handle. Missed ⇒ slots unknown, join impossible.
+- B. Descriptor copies (`CopyDescriptors*`, device slots UNVERIFIED — fresh
+ header count required; currently unhooked): NOT covered. Missed ⇒ silent
+ staleness; any match may name a dead occupant.
+- C. Heap bind (`SetDescriptorHeaps`, list slot 28 per prior verification —
+ must be re-confirmed by header count + log-check before install; currently
+ uninstalled): NOT covered. Missed ⇒ handle unattributable to any heap.
+- D. Root-table bind (`SetGraphicsRootDescriptorTable`, list slot 32):
+ COVERED record-time-only (submit bypass). Logs handle+rootParam, no heap,
+ no root-signature ranges (root signatures entirely unobserved). Missed
+ layout ⇒ table span unknown; consumed entries unenumerable.
+- E. Draw/dispatch (`Draw*`/`Dispatch`/`ExecuteIndirect`, list slots —
+ unhooked, slots unverified): NOT covered. Missed ⇒ binds are not draws; NO
+ join may be called draw-correlated.
+- F. Queues/devices/lists: several direct queues (first kept), pre-hook
+ objects and copy/compute streams uncovered. Missed ⇒ whole submission
+ streams invisible.
+*Narrow evidence rule:* an exact pointer match proves ONLY that a candidate
+ is represented in an observed bound table — never that the shader sampled
+ that entry, never that it is the DLSS scene input. A no-match is
+ inconclusive wherever any of B/C/D/E/F gaps remain (i.e., everywhere in
+ Stage 1).
+*Staged experiment:* Stage 1a (source-only, no hooks, no run): add the slot-28
+ re-verification + map-cap/static scaffolding behind a disabled flag and
+ review the diff only. Stage 1b (logging-only run): SRV-writer (cap 64, weak
+ ptrs, present-stamped) + heap-bind recorder (cap 8/list) + sampled
+ same-list join at Present 1/60 (shared locks, exclusive-only inserts, 1
+ line/60). Positive = same-list handle∈bound-range + recorded SRV write for
+ that slot (representation only). Negative = no-match ⇒ INCONCLUSIVE by
+ construction (coverage audit above); it does NOT eliminate any candidate.
+ Stage 1 therefore cannot, even in principle, deliver a meaningful negative
+ for the scene question — stated explicitly so it is never misread.
+ Overhead: O(1) inserts, no hot-path `GetDesc`, off-draw work only; failure
+ modes: reuse aliasing (stamp invalidation), heap destroy (guarded+expiry),
+ own-heap pollution (pointer-excluded), submit bypass (inconclusive label).
+ Files: `src/d3d12_hooks.cpp` only. Targeted rollback: revert the three
+ hunks independently; rebuild; rerun. All prior conclusions and tree changes
+ intact; no NGX contact; gates untouched.
+
+## Route assessment + bind-survey experiment (2026-10-04, runs 180251Z/180445Z)
+
+**Route decision (verified reasoning, committed before implementing):**
+- *GPU capture:* no executable route — PIX/RenderDoc failures stand and may
+ not be repeated unchanged; Nsight would be third-party software needing
+ approval. Documented, not executed.
+- *Full descriptor join (Stage 1 as scoped):* admitted in advance it cannot
+ deliver a meaningful negative (four critical gaps need four new hooks on hot
+ paths with artifact history). Deferred, not deleted — requires its own
+ approval given hot-path expansion.
+- *Chosen — Route C (bind survey on existing hooks):* extends `TrackOMBind`
+ (OM shims fire ~58/run, proven coverage) with format-agnostic logging. No new
+ installs, no selection/gate/render change. Per-class budget (first 3 per
+ w×h×fmt, 32 classes) after the first build proved a global cap is consumed
+ by loading binds. Plain-statics budget counters follow the established
+ racy-benign log-counter practice.
+**Evidence (180445Z PASS, freeroam+`thePlayer`, 1 frame, 0 fatal):**
+ gameplay-window binds ARE format-mixed: 1920x1080 fmt-28 at present=52 AND
+ 1920x1080 fmt-10 `80DA595E30` at present=192 (scene=0, UNORM-set exclusion
+ working as designed). The HDR scene target is LIVE during gameplay, not a
+ stale load-time allocation. Loading binds (1902x1033 fmt-28 + fmt-11 with
+ scene=1) confirm adoption still works where formats match. 180251Z (same
+ code v1, global cap) showed only loading binds — a cap-design negative,
+ correctly re-run rather than misread. Artifacts preserved in both run dirs.
+**Interpretation (narrow):** fmt-10-at-gameplay proves the HDR candidate is
+ bound, NOT that a draw samples it and NOT that it is the DLSS scene input —
+ draw/root-signature gaps stand. fmt-28-at-gameplay keeps the LDR question
+ open (encoding still unmeasured). What changed: "scene elsewhere" now has a
+ live pointer (`80DA595E30`-class), not just view-creation counts.
+**Reversal:** delete the survey block in `TrackOMBind`; rebuild; rerun. No
+ config/artifact changes. Stage 1 descriptor-join stays proposed-only.
+**Next (SUPERSEDED — authorization granted, implementation below):**
+ MV-range via readback stays rejected; fmt-10 adoption + `IsHDR` + output
+ format + forwarding + present-clock gate + Present retry were all authorized
+ and implemented — see next section. No DLSS success claimed.
+
+## MV-readback safety audit + fmt-10 use-trace (2026-10-04, read-only, no runs)
+
+**MV pixel readback: NOT safe with existing paths — rejected, never
+ "read-only".** `GetDesc` is metadata only. Pixel values need: (1) READBACK
+ heap + staging texture creation (creation-burst crash class, fix20-22);
+ (2) MV→COPY_SOURCE barrier on the engine list (state-track desync risk —
+ the 6s-crash killer); (3) copy into staging on a list (submission-order
+ hazard; own-queue = proven cross-queue race); (4) fence + CPU wait (stalls
+ the calling thread — hitch/stall); (5) Map staging (legal) + min/max;
+ (6) barrier back. Assumptions: weak MV pointer still alive (freed-pointer
+ GPU copy = device removal), opaque placed-resource layout, single-reader
+ locking. It perturbs timing/states of exactly what it measures, and range
+ alone still would not prove direction, jitter inclusion, or temporal
+ mapping. Verdict: do NOT build this.
+**Use-trace instead (zero new code — existing 180445Z logs already hold it):**
+ fmt-10 `80DA595E30` at present=192: placed-texture create (initState 0xC0) →
+ SRV+RTV views → barrier 192(PSR)→4(RT) on list `80CD440BE0` → OM binds
+ #22–25 slot=0 + 1920x1080 viewport both on list `80CD448430`
+ (`list-corr` omSeq=vpSeq=1,2; barrier is same present/ecl window,
+ different list). All observations are RECORD-time (shim callbacks during
+ list recording), never execution proof — replay, queue order, list reuse,
+ and intervening barriers can reorder actual GPU execution. Positive proves
+ a raster pass was RECORDED into the HDR candidate at display size during
+ gameplay — the strongest scene-role evidence to date. It does NOT prove
+ draw sampling, final-scene role, or encoding. MV class check (same run): 1920x1080 `R16G16_FLOAT`
+ targets re-adopted as ALT through present~192 (`80DA5939F0`-class) —
+ format+resolution match NGX MV shape; value range/direction/jitter stay
+ UNKNOWN by construction (no safe read path).
+**Recommendation (staged, no approval needed for Stage 1):** Stage 1 =
+ nothing to build — forensics above close the "is HDR live" question.
+ Value-range validation is DEFERRED to post-handoff visual analysis
+ (ghosting/smear direction reveals sign/scale errors with zero GPU risk),
+ not to readback. Next code (logging-only, existing hooks): MV/depth
+ freshness correlation from existing stamps (barrier/copy/bind sightings per
+ present window) — same read-only class as the bind survey, per-class
+ budgets, `src/d3d12_hooks.cpp` only; rollback = delete block, rebuild,
+ rerun. Gates/selection/NGX/rendering untouched; no driver contact.
+ Prerequisite order stands: color role → MV/depth freshness → output compat
+ → init/feature/eval with return codes → handoff + visual → 20-min stability
+ → second clean run (1000 consecutive confirmed frames, loading excluded).
+
+## Authorized implementation stack (2026-10-04, runs 181934Z/182222Z/182403Z/183119Z/183426Z/183813Z)
+
+**Authorization:** user authorized reversible project-local changes incl.
+ gates, scene-format selection, NGX `IsHDR`, output format/copy path.
+ System/install/third-party changes still need approval (none made).
+**Hypothesis:** the live HDR scene is 1920x1080 FLOAT; accepting it plus HDR
+ semantics plus per-list forwarding plus a reachable quiet clock completes the
+ legacy path to an init attempt. Success per stage = new expected log markers
+ with 0 fatals; failure = wrong-target adoption, crash, or device removal —
+ stop and diagnose, do not bypass.
+**Changes (`src/d3d12_hooks.cpp` + `src/dlss_ngx.cpp`, each hunk independently
+ revertible; rebuild + `--duration 30` rerun; no config changes):**
+- `IsSceneColorFormat()` (UNORM|FLOAT) at 6 sites: `SceneSetNote`,
+ creation x2, handle-refresh map, copy-source fallback, RTV-bind adoption;
+ scene RTV logs now print `fmt=%u`; `SceneSetNote` bind call passes real fmt.
+- `g_dlssOutFormat` default → FLOAT (identical-format copy law); DLAA
+ per-present backbuffer override untouched.
+- `CreateFeature` flags start with `IsHDR` (linear-HDR input under LDR flags
+ = banding per NVIDIA).
+- `Barrier()` + `DoInjection` result copy forward via per-list shim
+ originals (`FindCommandListShim`, shared-lock+SEH); unshimmed lists skip
+ with the established diagnostic. Dormant-safe (unreachable until trigger).
+- Quiet gate: present-quiet `< 600` (~6s, restores fix89's 600 on the
+ reachable clock, past the +5s death window); defer log prints both clocks.
+- Present-time init retry (both `Hook_Present`/`Hook_Present1`, 1/60,
+ legacy-only, not-ready-only); camera path alone never re-fires post-burst.
+ Atomic single-attempt guard covers all threads.
+- `upscaler ready (render/display)` success log; set-notation on bind
+ (gameplay fmt-10 enters rotation set without touching classification).
+- `AllocateParameters` made load-optional (resolved, never called anywhere;
+ recent redistributables omit the export) — unblocked first driver contact.
+**Evidence (all PASS freeroam+`thePlayer`, 0 fatal; artifacts preserved):**
+ 181934Z: fmt-10 adopted (ALT chain, `fmt=%u` logs), display converged
+ 1920x1080→render 1286x723, fmt-10 bind scene=1 (set-membership fixed).
+ 182222Z: dormant-clean (0 frames). 182403Z: first quiet trajectory
+ 59p→119p→179p→churn→attempt; 182725Z: FIRST-EVER init attempt
+ (SINGLE-DEVICE, QI blocked E_NOINTERFACE as predicted, proceeded) →
+ alloc=0 failure diagnosed (never-called export) → fixed → 183119Z: load
+ passes, `upscaler ready (1286x723→1920x1080)`. 183426Z: ready + scene=1
+ confirmed. 183813Z (120s, 13325 presents): init OK; shim counters FROZEN
+ post-load (instOk=34, buf=380…) while presents advance — see verdict.
+**Replay-model verdict (verified facts):** record-time clone shims go blind
+ in steady gameplay (engine replays pre-recorded lists/bundles: OM/vp/copy
+ invocation totals freeze; only Present/ECL-queue/camera-burst hooks fire).
+ Viewport patch (needs viewport shim + boundScene) and trigger (needs
+ display-sized scene copy on record lists) cannot align post-load: 120s of
+ gameplay produced 0 patch + 0 trigger legs. Chicken-egg noted: init needs
+ post-load stability, but record-time activity lives only at load.
+**Remaining blockers (in dependency order):** (1) patch/trigger placement
+ incompatible with replay (needs Present/ECL-time mechanism or loading-window
+ luck — luck rejected as strategy); (2) `CreateFeature` vtable-repair probe
+ untested live (runs at first Evaluate); (3) MV range/direction/jitter +
+ depth convention still UNKNOWN (readback rejected; defer to post-handoff
+ ghosting analysis); (4) DLAA-flow veteran gates use stalled camera units
+ (DLAA path only). No DLSS success claimed (no eval/handoff/visuals).
+
+## Fence-timeline verdict + insertion-path audit (2026-10-04, read-only, no runs)
+
+**Fence polling: no engine fences OBSERVED (corrected 2026-10-04 — earlier
+ "none exist" wording was overstated).** Source inventory: every fence
+ object in code is project-owned (bridge shared fences, b2 helper fences,
+ `g_injFence`); there is no `CreateFence` hook and no queue `Signal`/`Wait`
+ hook, so zero engine fence pointers are visible to poll. The game may well
+ use fences — that is UNOBSERVED, not disproven. No polling code was added:
+ it would have nothing to read. Deciding a bounded Signal/Wait observation
+ hook (queue vtable, per-submit rate, not per-draw) is deferred to the
+ ordering design, with hot-path risk explicitly weighed then.
+**Replay composition is already directly measured (not inferred):** ECL
+ detail records carry exact totals — early submissions `shimHit=1`
+ (n=1..3), then `misses=22976 ptrReg=22976` (known list objects, live
+ vtables not ours). The engine reuses the same list objects through
+ non-shim tables at submit. Frozen record-time counters + advancing ECL
+ serials are therefore measurement-backed. No ECL-composition sampler was
+ added: it would duplicate evidence already in hand.
+**Trigger/patch sizing incoherence (static, verified):** the legacy trigger
+ requires a DISPLAY-sized scene copy, but a patched scene pass renders at
+ RENDER size (1286x723) — post-patch copies can never satisfy it, and a
+ pre-patch display-sized scene evaluated with render-sized NGX params is a
+ dimension mismatch. The legacy render-scale trigger/patch pair is
+ self-contradictory as designed; DLAA (native-size, no patch) semantics are
+ the coherent first-eval target. Depth side-note: full-res depth candidates
+ adopt from fmt-34 (`R16G16_FLOAT`) copy sources — MV-shaped, while NGX
+ depth is single-channel; depth convention stays UNKNOWN.
+**Synthetic smoke test:** present but DISABLED (`main.cpp:222` —
+ concurrency caused DEVICE_RESET). Not re-enabled: proven device-reset
+ history outweighs its isolation value while live init already succeeds.
+**Consequence for insertion design:** any own-list eval needs engine state
+ visibility it does not have (stale-frozen `g_resourceStates`,
+ unattributable barriers) plus submit-order proof it cannot get without
+ engine fences. Next safe work is the Present-time native-size eval DESIGN
+ (states/sync/handoff spelled out before any code), not more hooks. No
+ source/config/gate changes this turn; no NGX contact; tree and artifacts
+ intact.
+
+**Present-time native-size eval design (proposal, NOT implemented —
+ first half solved, second half open):**
+- *Solved half (verified reasoning):* intercept in `Hook_Present` BEFORE
+ `Real_Present`: current backbuffer is predictably in PRESENT state (flip
+ model requires it). Own list on the GAME queue (FIFO order, no cross-queue
+ race): PRESENT→PSR(color) + evaluate LDR-mode DLAA at native size into an
+ own fmt-28 dlssOut (known COMMON→UAV, self-consistent) + PSR→COPY_DEST,
+ copy, COPY_DEST→PRESENT, then `Real_Present`. Every backbuffer/dlssOut
+ transition is self-owned from a known entry state. LDR `IsHDR=0` matches a
+ post-tonemap input (mode decision: HDR `IsHDR=1` work stays parked until an
+ HDR input path exists).
+- *Open half (precise blocker):* MV/depth inputs are engine-owned with
+ frozen-unknown states — no legal transition exists without StateBefore,
+ and no read API reveals it. Options ranked: (a) PRESENT-predictability for
+ MV/depth (none — unlike the backbuffer, no contract constrains them);
+ (b) state inference from last-observed + staleness (unsound across replay);
+ (c) dedicated decoy resources (copies need source states — same wall).
+ Until MV/depth states are knowable, own-list eval cannot legally bind them.
+- *Open half (precise blocker):* MV/depth inputs are engine-owned with
+ frozen-unknown states — no legal transition exists without StateBefore,
+ and no read API reveals it. Options ranked: (a) PRESENT-predictability for
+ MV/depth (none — unlike the backbuffer, no contract constrains them);
+ (b) state inference from last-observed + staleness (unsound across replay);
+ (c) dedicated decoy resources (copies need source states — same wall).
+ Until MV/depth states are knowable, own-list eval cannot legally bind them.
+- *Not attempted:* IsHDR/mode flip, dlssOut fmt-28 variant, own-list submit
+ code, queue/fence additions. Design first, code after the state gap has an
+ answer. Scene-audit and fence verdicts stand.
+
+## NGX Init failure investigation (2026-10-04, runs 182725Z–202913Z + out-of-game probe)
+
+**Verified facts (exact codes, no guessing):** first-ever init attempt
+ 182725Z (present-quiet trajectory 59p→119p→179p→churn→600p→attempt).
+ `NVSDK_NGX_D3D12_Init` fails `0xBAD00001`; `Init_Ext` fails `0xBAD00002`
+ (current-header enum: `FeatureNotSupported`|`Fail+1` vs `PlatformError`|`Fail+2`).
+ Driver's own verdict via `GetFeatureRequirements`: rr=1 SUCCESS,
+ supported=0, minHW=0x160, minOS='10.0.0' — SuperSampling SUPPORTED on the
+ RTX 3050. DLL reports `GetAPIVersion=0x13`, snippet `0x1360600` (=310.6.0);
+ still exports no `AllocateParameters` (made load-optional: never called).
+**Eliminated with live evidence (each one variable, all PASS/0-fatal runs):**
+ wrapper/QI (pristine clean device fails identically; QI failure is normal
+ D3D12 behavior — vtable-repair theory FALSIFIED, write DEFUSED to log-only);
+ AppId (241534720, 0, OptiScaler-generic 608174073 — identical);
+ API version (0x13,0x15–0x1B — official macro still 0x15, sweep negative);
+ entry point (classic vs Ext — different codes, both fail);
+ NvAPI (`NvAPI_Initialize`=0); data path (models dir writable);
+ GPU identity (game AND clean devices LUID-match 0x10DE RTX 3050);
+ updater env (removal changed nothing); deny-list (unrelated entry);
+ in-process interference (standalone `tests/ngx_init_probe.cpp` on explicit
+ NVIDIA device, out-of-game: identical `0xBAD00002`).
+**Standing hypothesis:** driver-side NGX platform component absent/broken —
+ `nvngx.dll` exists NOWHERE standard (System32/SysWOW64/DriverStore/
+ NGXCore), while models are cached (NVIDIA App only). Init bring-up fails
+ before any NGX log line is emitted (callback armed, never fires; no
+ `nvngx.log` written). Fixing that is a driver reinstall/repair = EXTERNAL,
+ approval required (risks: reboot, display interruption, installer changes
+ outside the project — NOT attempted).
+**Built along the way (all reversible, zero game impact observed):**
+ shadow-eval own-list path (infra per-step HRESULTs; UPLOAD-float-texture
+ E_INVALIDARG found → DEFAULT+staging-buffer upload design; 2-frame
+ fence rotation, non-blocking skips); `ProbeCleanDeviceInit` (clean-device
+ Init + LUID vendor + requirements query); `Init_Ext`+logging-callback path
+ with classic fallback; `ngxApiVersion` INI plumbing (default 0x15);
+ `tests/ngx_init_probe.cpp` standalone discriminator. Reversal per hunk:
+ revert the named block, rebuild, rerun. No DLSS success claimed — init,
+ feature, eval, handoff, visuals ALL still unverified live.
+
 ## Phase 2a Coverage Run D (2026-10-03T130805Z) — clone-integrity snapshot
 
 **Code change (logging only, `src/d3d12_hooks.cpp`):** new `ShimIntegritySnapshot` +
@@ -1328,6 +1841,25 @@ scripts\launch_test.bat --duration 30
 Use `--require-dlss` to require a DLSS injection marker. Absence yields
 `INCONCLUSIVE_DLSS`, not DLSS success. Refer to [the test guide](../scripts/README.md)
 for all options and outcomes.
+
+## Submit-queue latch + queue-identity correction (2026-10-04, run 190017Z)
+
+**Verified facts:** `g_graphicsQueue` has five writers (ECL-first,
+ CreateCommandQueue capture, `InjectAtPresentImpl`, IDENTITY probe,
+ swapchain hook). Run 180445Z proved capture-time ≠ steady-state
+ (captured `804289D940` vs 13,200 ECLs on `80005B3040`); run 190017Z
+ reproduces the pattern (captured `E2E8B9DB70`, ECLs + latch on
+ `E2E89A5500`). Own-list submit ordering against the first-captured pointer
+ would risk the proven cross-queue crash class.
+**Change (`src/d3d12_hooks.cpp`, additive, no consumers yet):**
+ `g_gameSubmitQueue` single-writer latch (pointer-CAS, once-log) inside the
+ validated GAME ECL branch. Build OK; 190017Z PASS (0 frames dormant, 0
+ fatal), latch logged first observation, init + `upscaler ready` unaffected.
+**Reversal:** delete the declaration + the 3 latch lines; rebuild; rerun.
+**Agenda:** next is the Present-time native-size eval design's open half
+ (MV/depth entry states) OR a bounded queue Signal/Wait observation hook
+ proposal with hot-path risk analysis — whichever first yields ordering
+ proof. No DLSS success claimed (init only; no feature/eval/handoff).
 
 ## Machine-specific setup caveat
 

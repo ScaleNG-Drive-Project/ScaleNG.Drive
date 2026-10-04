@@ -1,4 +1,4 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 #include "d3d12_hooks.h"
 #include <tlhelp32.h>
 #include "log.h"
@@ -654,13 +654,25 @@ static SRWLOCK g_sceneSetLock = SRWLOCK_INIT;
 static unsigned long long SceneSetNow()
 { return (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0); }
 
+// Scene-color formats: the HDR pipeline renders linear HALF-float scene
+// color (R16G16B16A16_FLOAT, verified live: 1920x1080 fmt-10 RTV-bound,
+// barriered PSR->RT, and viewported on one list at present 192); UNORM is
+// retained for compat with targets already adopted. Project assumption is now
+// evidence-backed for FLOAT; NGX infers encoding from the resource desc and
+// the IsHDR create flag (set in dlss_ngx.cpp).
+static bool IsSceneColorFormat(unsigned fmt)
+{
+    return fmt == (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM ||
+           fmt == (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
 // Insert-capable observe: creation / OM-adoption paths pass already-fetched
 // view evidence for a resource that is live-by-construction at that point
 // (just created / just bound on this thread). MV (R16G16F) and UI (small /
-// non-UNORM) targets are excluded by the UNORM + size filter by design.
+// non-scene-color) targets are excluded by the scene-format + size filter by design.
 static void SceneSetNote(ID3D12Resource* res, unsigned w, unsigned h, unsigned viewFmt)
 {
-    if (!res || w < 1000 || h < 500 || viewFmt != (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM)
+    if (!res || w < 1000 || h < 500 || !IsSceneColorFormat(viewFmt))
         return;
     const unsigned long long now = SceneSetNow();
     AcquireSRWLockShared(&g_sceneSetLock);
@@ -875,6 +887,15 @@ bool g_legacyScale = false;
 IDXGISwapChain* g_swapchain = nullptr;
 IDXGIAdapter* g_adapter = nullptr;
 ID3D12CommandQueue* g_graphicsQueue = nullptr;
+// STEADY-STATE SUBMIT QUEUE (single-writer latch): g_graphicsQueue has five
+// writers (ECL-first, CreateCommandQueue capture, InjectAtPresent,
+// IDENTITY probe, swapchain hook) and verified live to differ between
+// capture time (CreateCommandQueue first-direct) and steady state (ECL
+// observations, e.g. capture=804289D940 vs ECL=80005B3040 in one run).
+// Own-list submissions must order against the RENDER stream, so the queue
+// is latched once from validated GAME ECL observations and never rewritten.
+// No consumers yet (ordering design pending); recording only.
+ID3D12CommandQueue* g_gameSubmitQueue = nullptr;
 ID3D12CommandAllocator* g_injAlloc = nullptr;
 ID3D12GraphicsCommandList* g_injList = nullptr;
 ID3D12DescriptorHeap* g_injHeap = nullptr;
@@ -908,7 +929,10 @@ unsigned int g_hudFrames = 0;
 unsigned int g_hudFps = 0;
 unsigned int g_evalOkCount = 0;
 unsigned int g_evalFailCount = 0;
-DXGI_FORMAT g_dlssOutFormat = DXGI_FORMAT_R16G16B16A16_UNORM;
+// DLSS working output: HDR HALF-float to match the linear fmt-10 scene input
+// (identical-format copy law for the dlssOut->scene result copy). DLAA mode
+// re-forces this to the backbuffer format per-present (see below).
+DXGI_FORMAT g_dlssOutFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 unsigned char g_lastPatchedCameraCb[kCameraCbSize] = {};
 bool g_cameraCbValid = false;
@@ -2311,11 +2335,13 @@ ID3D12Resource* SceneColorBound()
 void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES after)
 {
     if (!list || !res) return;
-    // The Real_* command-list forwarding globals are never assigned (two
-    // driver tables exist, so forwarding stays per-list in the shim structs).
-    // Without an original to call, skip rather than null-call; the state map
-    // is left untouched to match.
-    if (!Real_ResourceBarrier) return;
+    // Per-list forwarding: the Real_* globals are never assigned (two driver
+    // tables exist), so resolve the driver original from this list's shim
+    // (shared-lock lookup + SEH, same as all shim paths). A list without a
+    // shim (e.g. submit-time third-heap table) is skipped rather than
+    // null-called, and the state map is left untouched to match.
+    CommandListShim* fwd = FindCommandListShim(list);
+    if (!fwd || !fwd->resourceBarrier) return;
     D3D12_RESOURCE_STATES before;
     bool tracked = false;
     { BookGuard _bg; auto it = g_resourceStates.find(res);
@@ -2328,7 +2354,7 @@ void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURC
     b.Transition.StateBefore = before;
     b.Transition.StateAfter = after;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    Real_ResourceBarrier(list, 1, &b);
+    fwd->resourceBarrier(list, 1, &b);
     { BookGuard _bg; g_resourceStates[res] = after; }
     // Rate-limited: this fires per-transition inside the flow; unlogged it
     // was ~400 lines/sec and the synchronous log I/O contributed to freezes.
@@ -2388,7 +2414,7 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
         candW = w; candH = h; candStable = 1;
         return; // new candidate: wait for confirmation next call
     }
-    // Candidate confirmed stable — commit only if different from current.
+    // Candidate confirmed stable â€” commit only if different from current.
     if (w == g_displayW && h == g_displayH)
         return;
 
@@ -2414,7 +2440,7 @@ void AdoptDisplaySize(unsigned int w, unsigned int h)
     g_patchAborted = false;
     g_patchFramesWithoutInject = 0;
     if (g_dlssOutValid && g_dlssOut) {
-        // Park in the graveyard — released after GPU drain inside ECL flush.
+        // Park in the graveyard â€” released after GPU drain inside ECL flush.
         if (g_graveN < 4) {
             g_grave[g_graveN++] = g_dlssOut;
         } else {
@@ -2439,10 +2465,16 @@ void EnsureUpscalerInit(bool bypassQuietGate)
     // (seen live: exactly one defer line, then init never re-ran).
     // SINGLE-DEVICE: reduced sequencing requirement since no second device.
     // Still need some stability before NGX touches the driver.
-    if (!bypassQuietGate && HooksGetQuietFrames() < 120) {
+    // PRESENT-CLOCK GATE (2026-10-04): the camera-frame clock is unpassable
+    // (game issues ~3 camera copies per loading burst, then dormant: quiet
+    // stuck at 1f/120f across 14k presents). Gate instead on 600 presents of
+    // no-new-chain-nodes (~6s at ~100 presents/s) â€” restoring fix89/90's
+    // original 600 count on the reachable clock, past the +5s nvngx-load
+    // death window with margin. Same protective intent, measurable units.
+    if (!bypassQuietGate && HooksGetPresentQuietFrames() < 600) {
         static int s_seqLogs = 0;
         if (++s_seqLogs <= 5)
-            Log("hooks: NGX init deferred - chain quiet %uf/120f", HooksGetQuietFrames());
+            Log("hooks: NGX init deferred - chain quiet %llup/600p (cam %uf/120f)", HooksGetPresentQuietFrames(), HooksGetQuietFrames());
         return; // retried by later callers
     }
     // Atomic: only one thread may attempt NGX init
@@ -2485,12 +2517,21 @@ void EnsureUpscalerInit(bool bypassQuietGate)
     ip.displayHeight = g_displayH;
     ip.dlssDllPath = g_cfg.dlssDllPath;
     ip.appId = g_cfg.appId;
+    ip.ngxApiVersion = g_cfg.ngxApiVersion;
     ip.perfQuality = g_cfg.perfQuality;
     ip.mvJittered = g_cfg.mvJittered;
     ip.autoExposure = g_cfg.autoExposure;
     if (!g_upscaler->Init(ip)) {
         Log("hooks: DLSS init failed - upscaling disabled");
         g_upscaler->SetEnabled(false);
+    } else {
+        Log("hooks: upscaler ready (render %ux%u display %ux%u)",
+            g_renderW, g_renderH, g_displayW, g_displayH);
+        // One-shot clean-device discriminator (read-only vs the game).
+        // Interprets a game-device Init failure: success here implicates the
+        // wrapper; identical failure implicates AppId/driver platform.
+        int probeRc = g_upscaler->ProbeCleanDeviceInit();
+        Log("hooks: clean-device probe result=%d (0x%08X)", probeRc, (unsigned)probeRc);
     }
 }
 
@@ -2577,18 +2618,18 @@ void DoInjection(ID3D12GraphicsCommandList* list)
     src.pResource = g_dlssOut;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
-    // The Real_* command-list forwarding globals are never assigned (two
-    // driver tables exist, so forwarding stays per-list in the shim structs).
-    // Never null-call and never claim an injection that was not recorded:
-    // per-list forwarding for this copy is stage-2 work once trigger
-    // evaluation ("scene-copy DLSS not ready") is proven in logs.
-    if (!Real_CopyTextureRegion) {
+    // Per-list result-copy forwarding (same shim-struct originals the record
+    // path itself forwards through). Never null-call and never claim an
+    // injection that was not recorded: a list without a shim is skipped with
+    // the established diagnostic.
+    CommandListShim* cshim = FindCommandListShim(list);
+    if (!cshim || !cshim->copyTexture) {
         static int s_noFwdLogs = 0;
         if (++s_noFwdLogs <= 3)
-            Log("hooks: DLSS result copy skipped - no per-list forward wired (frame %u)", g_frameCounter);
+            Log("hooks: DLSS result copy skipped - no per-list forward for list %p (frame %u)", (void*)list, g_frameCounter);
         return;
     }
-    Real_CopyTextureRegion(list, &dst, 0, 0, 0, &src, 0);
+    cshim->copyTexture(list, &dst, 0, 0, 0, &src, 0);
 
     Barrier(list, scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Barrier(list, g_dlssOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3071,8 +3112,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
         // (AddRef-on-observation later is illegal and corrupted teardown.)
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
-            desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
-            // Display-sized UNORM color target - adopt as scene color. The size
+            IsSceneColorFormat((unsigned)desc->Format)) {
+            // Display-sized HDR/UNORM color target - adopt as scene color. The size
             // is NOT hardcoded (the engine may render at e.g. 1920x1001).
             { BookGuard _bg;
                 { BookGuard _bg;
@@ -3085,8 +3126,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 g_sceneColorRtv = handle;
                 g_sceneColorValid = true;
                 AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
-                Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM)", (void*)res,
-                    (unsigned int)rd.Width, (unsigned int)rd.Height);
+                Log("hooks: scene color RTV %p (%ux%u fmt=%u)", (void*)res,
+                    (unsigned int)rd.Width, (unsigned int)rd.Height, (unsigned)desc->Format);
             } else if (res == g_sceneColor) {
                 // The game re-created the RTV view for the same resource
                 // (e.g. renderer re-init). Refresh the stored handle.
@@ -3096,15 +3137,15 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 StoreTracked(&g_sceneColorAlt, res);
                 g_sceneColorRtvAlt = handle;
                 AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
-                Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
-                    (unsigned int)rd.Width, (unsigned int)rd.Height);
+                Log("hooks: scene color RTV %p (%ux%u fmt=%u) (ALT)", (void*)res,
+                    (unsigned int)rd.Width, (unsigned int)rd.Height, (unsigned)desc->Format);
             }
             // Scene-set evidence (rotation tracking): every adopted UNORM view
             // enters the bounded set; matching stays pointer-based.
             SceneSetNote(res, (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)desc->Format);
     } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1) {
-            if (desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
+            if (IsSceneColorFormat((unsigned)desc->Format)) {
                 g_displayW = (unsigned int)rd.Width;
                 g_displayH = (unsigned int)rd.Height;
                 { BookGuard _bg;
@@ -3115,7 +3156,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     StoreTracked(&g_sceneColor, res);
                     g_sceneColorRtv = handle;
                     g_sceneColorValid = true;
-                    Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM)", (void*)res);
+                    Log("hooks: scene color RTV %p (%ux%u fmt=%u)", (void*)res,
+                        (unsigned int)rd.Width, (unsigned int)rd.Height, (unsigned)desc->Format);
                 } else if (res == g_sceneColor) {
                     // The game re-created the RTV view for the same resource
                     // (e.g. renderer re-init). Refresh the stored handle.
@@ -3124,7 +3166,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 } else if (res != g_sceneColorAlt) {
                     StoreTracked(&g_sceneColorAlt, res);
                     g_sceneColorRtvAlt = handle;
-                    Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM) (ALT)", (void*)res);
+                    Log("hooks: scene color RTV %p (%ux%u fmt=%u) (ALT)", (void*)res,
+                        (unsigned int)rd.Width, (unsigned int)rd.Height, (unsigned)desc->Format);
                 }
                 // Scene-set evidence (rotation tracking); see above.
                 SceneSetNote(res, (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)desc->Format);
@@ -3191,7 +3234,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
             }
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                   desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM && rd.MipLevels == 1 &&
+                   IsSceneColorFormat((unsigned)desc->Format) && rd.MipLevels == 1 &&
                    rd.Width >= 1000 && rd.Height >= 500) {
             // View re-created at any time: keep the handle map fresh so
             // OMSetRenderTargets can resolve the scene color even if the
@@ -3383,6 +3426,10 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
             Log("hooks: ECL correlation serial=%llu queue=%p presentSerial=%llu",
                 eclSerial, (void*)queue,
                 (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+        // Latch the steady-state submit queue once (see declaration). Validated
+        // GAME branch only; never rewritten, no behavior change by itself.
+        if (!InterlockedCompareExchangePointer((void**)&g_gameSubmitQueue, queue, nullptr))
+            Log("hooks: submit queue latched=%p (steady-state render stream)", (void*)queue);
         TryQueueOutputCopy(queue);
         // Observation-only for now. Calling the full pipeline from every ECL
         // submission enters BeamNG during render-graph construction and
@@ -4455,7 +4502,7 @@ static bool TryVectorB(ID3D12GraphicsCommandList* list, UINT count, const D3D12_
             if (dumped == 0) Log("vectorB: rtvMap empty at present=%llu", presentSerial);
         }
     }
-    // Resource-level correlation for every OM that binds a tracked display resource — unconditional, handle-independent
+    // Resource-level correlation for every OM that binds a tracked display resource â€” unconditional, handle-independent
     for (UINT i = 0; i < count && i < 8; ++i) {
         if (!handles[i].ptr) continue;
         ID3D12Resource* res = nullptr;
@@ -4629,7 +4676,7 @@ static bool TryVectorB(ID3D12GraphicsCommandList* list, UINT count, const D3D12_
             break;
         }
         if (!omMatchedRes) {
-            // No OM in this call matches a tracked display resource — keep armed for later OM if any bestRes exists
+            // No OM in this call matches a tracked display resource â€” keep armed for later OM if any bestRes exists
             if (bestRes && !g_vectorBArmed) {
                 if (!g_vectorBArmed) {
                     g_vectorBArmedRes = bestRes;
@@ -4641,7 +4688,7 @@ static bool TryVectorB(ID3D12GraphicsCommandList* list, UINT count, const D3D12_
                 }
             } else {
                 Log("vectorB: omMatched found handle=%llX resource=%p present=%llu", (unsigned long long)omMatchedHandle.ptr, (void*)omMatchedRes, presentSerial);
-                // omRes == tracked display resource is authoritative — start test for this exact OM resource, not bestRes
+                // omRes == tracked display resource is authoritative â€” start test for this exact OM resource, not bestRes
                 if (!g_vectorBTestActive && omMatchedHandle.ptr != 0 && omMatchedRes) {
                     g_vectorBTestActive = true;
                     g_vectorBTestFrames = 0;
@@ -5079,6 +5126,7 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     ip.renderWidth = w;  ip.renderHeight = h;
     ip.displayWidth = w; ip.displayHeight = h;
     ip.appId = g_cfg.appId;
+    ip.ngxApiVersion = g_cfg.ngxApiVersion;
     ip.perfQuality = g_cfg.perfQuality;
     ip.mvJittered = g_cfg.mvJittered != 0;
     ip.autoExposure = g_cfg.autoExposure != 0;
@@ -6627,11 +6675,296 @@ static void LogInjectFault(unsigned code)
             (unsigned long long)g_faultCtx.Rcx);
 }
 
+// SHADOW EVAL (mechanics-only NGX proof, zero visible impact): evaluate NGX
+// once per Present on an OWN list submitted to the steady-state game queue,
+// using the just-presented backbuffer as LDR color input plus fully-owned
+// zero MV/depth/output. See ShadowEvalAtPresent body below for hypothesis,
+// state reasoning, and limits. Globals here; function follows LogInjectFault.
+static ID3D12CommandAllocator* g_shAlloc[2] = {};
+static ID3D12GraphicsCommandList* g_shList[2] = {};
+static ID3D12Resource* g_shMv = nullptr;
+static ID3D12Resource* g_shDepth = nullptr;
+static ID3D12Resource* g_shMvUp = nullptr;
+static ID3D12Resource* g_shDepthUp = nullptr;
+static ID3D12Resource* g_shOut = nullptr;
+static ID3D12Fence* g_shFence = nullptr;
+static UINT64 g_shFenceNext = 1;
+static UINT64 g_shFenceDone[2] = {};
+static UINT64 g_shUpFenceVal = 0;
+static unsigned g_shFlip = 0;
+
+static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSerial)
+{
+    if (g_dlaaMode || !g_upscaler || !g_upscaler->IsReady()) return;
+    if (!g_device || g_displayW == 0 || g_displayH == 0) return;
+    ID3D12CommandQueue* queue = g_gameSubmitQueue ? g_gameSubmitQueue : g_graphicsQueue;
+    if (!queue) return;
+    ID3D12Resource* bb = nullptr;
+    __try {
+        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    D3D12_RESOURCE_DESC bbd = {};
+    __try { bbd = bb->GetDesc(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { bb->Release(); return; }
+    if (bbd.Width != g_displayW || bbd.Height != g_displayH ||
+        bbd.Format != DXGI_FORMAT_R8G8B8A8_UNORM) { bb->Release(); return; }
+
+    // Lazy one-time infra (own fence/allocators/lists/inputs/output).
+    static LONG s_shInit = 0;
+    if (!g_shFence || !g_shAlloc[0] || !g_shList[0] || !g_shMv || !g_shDepth || !g_shOut) {
+        if (InterlockedCompareExchange(&s_shInit, 1, 0) != 0) { bb->Release(); return; }
+        bool ok = true;
+        // Per-step HRESULTs (first-failure diagnosis, bounded log below).
+        // f=fence a=allocator l=list m=MV-zero d=depth-zero o=output.
+        HRESULT fhr = S_OK, ahr = S_OK, lhr = S_OK, mhr = S_OK, dhr = S_OK, ohr = S_OK;
+        HRESULT mhrMap = S_OK, dhrMap = S_OK;
+        if (!g_shFence) fhr = g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_shFence));
+        if (FAILED(fhr)) ok = false;
+        for (int i = 0; ok && i < 2; ++i) {
+            if (!g_shAlloc[i]) ahr = g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_shAlloc[i]));
+            if (FAILED(ahr)) { ok = false; break; }
+            if (!g_shList[i]) lhr = g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_shAlloc[i], nullptr, IID_PPV_ARGS(&g_shList[i]));
+            if (FAILED(lhr)) { ok = false; break; }
+            if (g_shList[i]) g_shList[i]->Close();
+        }
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = g_displayW; td.Height = g_displayH;
+        td.DepthOrArraySize = 1; td.MipLevels = 1; td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES up = {};
+        up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_HEAP_PROPERTIES hpDef = {};
+        hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+        // MV/depth live in DEFAULT heaps (UPLOAD float TEXTURES fail on this
+        // device with E_INVALIDARG), filled once from UPLOAD staging BUFFERS
+        // via CopyTextureRegion on our own list below, then parked permanently
+        // in PSR (never transitioned again — no per-frame state tracking).
+        // Staging buffers release once the upload fence completes (see eval
+        // path); releasing earlier would free GPU-read memory mid-flight.
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT mvFoot = {};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT dFoot = {};
+        UINT64 mvBytes = 0, dBytes = 0;
+        if (ok && !g_shMv) {
+            td.Format = DXGI_FORMAT_R16G16_FLOAT;
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            mhr = g_device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_shMv));
+            if (SUCCEEDED(mhr) && g_shMv) {
+                g_device->GetCopyableFootprints(&td, 0, 1, 0, &mvFoot, nullptr, nullptr, &mvBytes);
+                D3D12_RESOURCE_DESC btd = {};
+                btd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                btd.Width = mvBytes ? mvBytes : 1;
+                btd.Height = 1; btd.DepthOrArraySize = 1; btd.MipLevels = 1;
+                btd.SampleDesc.Count = 1; btd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                mhrMap = g_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &btd,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_shMvUp));
+                if (SUCCEEDED(mhrMap) && g_shMvUp) {
+                    void* mem = nullptr; D3D12_RANGE r = { 0, 0 };
+                    mhrMap = g_shMvUp->Map(0, &r, &mem);
+                    if (SUCCEEDED(mhrMap) && mem) {
+                        memset(mem, 0, (size_t)mvBytes);
+                        D3D12_RANGE w = { 0, (SIZE_T)mvBytes };
+                        g_shMvUp->Unmap(0, &w);
+                    } else mhrMap = E_FAIL;
+                }
+                if (FAILED(mhrMap)) { mhr = mhrMap; ok = false; }
+            } else { mhr = FAILED(mhr) ? mhr : E_FAIL; ok = false; }
+        }
+        if (ok && !g_shDepth) {
+            td.Format = DXGI_FORMAT_R32_FLOAT;
+            dhr = g_device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_shDepth));
+            if (SUCCEEDED(dhr) && g_shDepth) {
+                g_device->GetCopyableFootprints(&td, 0, 1, 0, &dFoot, nullptr, nullptr, &dBytes);
+                D3D12_RESOURCE_DESC btd = {};
+                btd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                btd.Width = dBytes ? dBytes : 1;
+                btd.Height = 1; btd.DepthOrArraySize = 1; btd.MipLevels = 1;
+                btd.SampleDesc.Count = 1; btd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                dhrMap = g_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &btd,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_shDepthUp));
+                if (SUCCEEDED(dhrMap) && g_shDepthUp) {
+                    void* mem = nullptr; D3D12_RANGE r = { 0, 0 };
+                    dhrMap = g_shDepthUp->Map(0, &r, &mem);
+                    if (SUCCEEDED(dhrMap) && mem) {
+                        memset(mem, 0, (size_t)dBytes);
+                        D3D12_RANGE w = { 0, (SIZE_T)dBytes };
+                        g_shDepthUp->Unmap(0, &w);
+                    } else dhrMap = E_FAIL;
+                }
+                if (FAILED(dhrMap)) { dhr = dhrMap; ok = false; }
+            } else { dhr = FAILED(dhr) ? dhr : E_FAIL; ok = false; }
+        }
+        if (ok && !g_shOut) {
+            D3D12_RESOURCE_DESC od = td;
+            od.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            od.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            ohr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &od,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_shOut));
+            if (FAILED(ohr)) ok = false;
+        }
+        // One-time upload: staging zeros -> DEFAULT MV/depth, parked in PSR.
+        // Recorded on our own list[0] (fresh allocator, never submitted) and
+        // executed on the game queue; both eval slots stay fence-gated until
+        // this upload completes, so later presents skip non-blockingly.
+        // Staging buffers release in the eval path once fenced (below).
+        HRESULT uhr = S_OK;
+        if (ok && (g_shMvUp || g_shDepthUp) && g_shAlloc[0] && g_shList[0]) {
+            if (FAILED(g_shAlloc[0]->Reset())) uhr = E_FAIL;
+            if (SUCCEEDED(uhr) && FAILED(g_shList[0]->Reset(g_shAlloc[0], nullptr))) uhr = E_FAIL;
+            if (SUCCEEDED(uhr)) {
+                D3D12_TEXTURE_COPY_LOCATION udst = {};
+                udst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                udst.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION usrc = {};
+                usrc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                if (g_shMvUp && mvBytes > 0) {
+                    udst.pResource = g_shMv;
+                    usrc.pResource = g_shMvUp;
+                    usrc.PlacedFootprint = mvFoot;
+                    g_shList[0]->CopyTextureRegion(&udst, 0, 0, 0, &usrc, nullptr);
+                }
+                if (g_shDepthUp && dBytes > 0) {
+                    udst.pResource = g_shDepth;
+                    usrc.pResource = g_shDepthUp;
+                    usrc.PlacedFootprint = dFoot;
+                    g_shList[0]->CopyTextureRegion(&udst, 0, 0, 0, &usrc, nullptr);
+                }
+                D3D12_RESOURCE_BARRIER ub = {};
+                ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                ub.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                UINT ubN = 0;
+                D3D12_RESOURCE_BARRIER ubs[2] = {};
+                if (g_shMvUp) {
+                    ubs[ubN].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    ubs[ubN].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    ubs[ubN].Transition.pResource = g_shMv;
+                    ubs[ubN].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                    ubs[ubN].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    ++ubN;
+                }
+                if (g_shDepthUp) {
+                    ubs[ubN].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    ubs[ubN].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    ubs[ubN].Transition.pResource = g_shDepth;
+                    ubs[ubN].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                    ubs[ubN].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    ++ubN;
+                }
+                if (ubN) g_shList[0]->ResourceBarrier(ubN, ubs);
+                if (FAILED(g_shList[0]->Close())) uhr = E_FAIL;
+            }
+            if (SUCCEEDED(uhr)) {
+                ID3D12CommandList* ul[1] = { g_shList[0] };
+                queue->ExecuteCommandLists(1, ul);
+                UINT64 ufv = g_shFenceNext++;
+                queue->Signal(g_shFence, ufv);
+                g_shFenceDone[0] = ufv;
+                g_shFenceDone[1] = ufv;
+                g_shUpFenceVal = ufv;
+            } else ok = false;
+        }
+        InterlockedExchange(&s_shInit, 0);
+        {
+            static volatile LONG s_shInfraLogs = 0;
+            LONG il = InterlockedIncrement(&s_shInfraLogs);
+            if ((!ok && il <= 3) || (ok && il == 1))
+                Log("hooks: shadow-eval infra %s f=0x%X a=0x%X l=0x%X m=0x%X(mm=0x%X) d=0x%X(dm=0x%X) o=0x%X %ux%u",
+                    ok ? "ready" : "FAILED", (unsigned)fhr, (unsigned)ahr, (unsigned)lhr,
+                    (unsigned)mhr, (unsigned)mhrMap, (unsigned)dhr, (unsigned)dhrMap,
+                    (unsigned)ohr, g_displayW, g_displayH);
+        }
+        if (!ok) { bb->Release(); return; }
+    }
+
+    unsigned slot = (g_shFlip++) & 1;
+    if (SafeGetFenceCompleted(g_shFence) < g_shFenceDone[slot]) {
+        static volatile LONG s_shSkips = 0;
+        if (InterlockedIncrement(&s_shSkips) <= 3)
+            Log("hooks: shadow-eval skipped - prior frame still in flight");
+        bb->Release();
+        return;
+    }
+    if (FAILED(g_shAlloc[slot]->Reset()) || FAILED(g_shList[slot]->Reset(g_shAlloc[slot], nullptr))) {
+        bb->Release();
+        return;
+    }
+    ID3D12GraphicsCommandList* list = g_shList[slot];
+    // Upload staging is GPU-consumed once the upload fence value completes.
+    // MV/depth themselves stay parked in PSR forever.
+    if ((g_shMvUp || g_shDepthUp) && g_shUpFenceVal != 0 &&
+        SafeGetFenceCompleted(g_shFence) >= g_shUpFenceVal) {
+        if (g_shMvUp) { g_shMvUp->Release(); g_shMvUp = nullptr; }
+        if (g_shDepthUp) { g_shDepthUp->Release(); g_shDepthUp = nullptr; }
+    }
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource = bb;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource = g_shOut;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &b);
+
+    UpscalerEvaluateParams ep = {};
+    ep.commandList = list;
+    ep.color = bb;
+    ep.depth = g_shDepth;
+    ep.motionVectors = g_shMv;
+    ep.output = g_shOut;
+    ep.jitterX = 0.0f; ep.jitterY = 0.0f;
+    ep.mvScaleX = 1.0f; ep.mvScaleY = 1.0f;
+    ep.sharpness = g_cfg.sharpness;
+    bool ok = g_upscaler->Evaluate(ep);
+
+    b.Transition.pResource = bb;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource = g_shOut;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &b);
+    list->Close();
+    ID3D12CommandList* lists[1] = { list };
+    queue->ExecuteCommandLists(1, lists);
+    UINT64 fv = g_shFenceNext++;
+    queue->Signal(g_shFence, fv);
+    g_shFenceDone[slot] = fv;
+    bb->Release();
+
+    static volatile LONG s_shOk = 0, s_shFail = 0;
+    if (ok) {
+        LONG n = InterlockedIncrement(&s_shOk);
+        if (n <= 3 || (n % 600) == 0)
+            Log("hooks: shadow-eval ok #%ld (present %llu)", n, presentSerial);
+    } else {
+        LONG n = InterlockedIncrement(&s_shFail);
+        if (n <= 10)
+            Log("hooks: shadow-eval FAILED #%ld (present %llu)", n, presentSerial);
+    }
+}
+
+
 HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UINT flags)
 {
     const unsigned long long presentSerial =
         (unsigned long long)InterlockedIncrement64(&g_presentSerial);
     ObservePersistentSceneColor(presentSerial);
+    // LEGACY INIT RETRY (dlaa=0 only): camera accepts arrive in loading
+    // bursts, then stop â€” so the camera-path Ensure call never re-fires once
+    // present-quiet matures. Retry here at 1/60 presents while the upscaler
+    // is not ready; the 600p gate inside Ensure still decides. Atomic
+    // single-attempt guard makes double-init impossible across threads.
+    // No rendering, selection, or forwarding effect until init succeeds.
+    if (!g_dlaaMode && (!g_upscaler || !g_upscaler->IsReady()) && (presentSerial % 60) == 0)
+        EnsureUpscalerInit(false);
     LogTopoSnapshot(presentSerial, g_b2PresentBb, g_b2OutG, g_b2Ready,
                     (int)InterlockedCompareExchange(&g_b2DeferredPending, 0, 0));
     // Unconditional first-call proof: if THIS never logs, nothing on earth
@@ -6694,6 +7027,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
                         Log("ngx-pipe: present-path guarded fault #%d", s_presFault);
                 }
             }
+            // Shadow eval (legacy only): mechanics proof with zero visible
+            // impact; runs inside the same guarded region, original presents.
+            if (!g_dlaaMode && !g_passiveMode)
+                ShadowEvalAtPresent(sc, presentSerial);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("hooks: present handling guarded (code %08X)", (unsigned)GetExceptionCode());
@@ -6710,6 +7047,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT syncInterval, 
     const unsigned long long presentSerial =
         (unsigned long long)InterlockedIncrement64(&g_presentSerial);
     ObservePersistentSceneColor(presentSerial);
+    // Same legacy init retry as Hook_Present (whichever Present the engine
+    // drives; shared serial keeps the combined cadence bounded).
+    if (!g_dlaaMode && (!g_upscaler || !g_upscaler->IsReady()) && (presentSerial % 60) == 0)
+        EnsureUpscalerInit(false);
     if (sc) {
         __try {
             static unsigned s_present1Diag = 0;
@@ -7097,7 +7438,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* factory, IU
                 g_graphicsQueue = q;
                 Log("SINGLE-DEV: GAME QUEUE CAPTURED %p", (void*)q);
 
-                // GetDevice from the queue → real ID3D12Device
+                // GetDevice from the queue â†’ real ID3D12Device
                 ID3D12Device* dev = nullptr;
                 HRESULT dhr = q->GetDevice(__uuidof(ID3D12Device), (void**)&dev);
                 Log("SINGLE-DEV: queue->GetDevice(ID3D12Device) hr=0x%08X ptr=%p",
@@ -7846,12 +8187,12 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
             // Post-reload fallback: if the scene color was never discovered
             // (plugin re-init after the game created its render targets), the
             // engine still copies the scene color at full-res every frame.
-            // A display-sized UNORM src here is the scene color - adopt it.
+            // A display-sized scene-format src here is the scene color - adopt it.
             if (!g_sceneColorValid && !isMvDst) {
                 D3D12_RESOURCE_DESC sd = src->pResource->GetDesc();
                 if (sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     sd.MipLevels == 1 &&
-                    sd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
+                    IsSceneColorFormat((unsigned)sd.Format)) {
                     StoreTracked(&g_sceneColor, src->pResource);
                     g_sceneColorValid = true;
                     g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -8121,7 +8462,48 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
         auto it = g_rtvMap.find(pRenderTargets[0].ptr);
         if (it != g_rtvMap.end()) {
             g_boundRtvResource = it->second;
-            // Dynamic adoption: if a display-sized UNORM target gets bound as
+            // BIND SURVEY (measurement-only, format-agnostic): which display-sized
+            // targets does the engine actually bind as RTV during gameplay, in any
+            // format. Existing adoption below is UNORM-only, so HDR (fmt-10) or LDR
+            // (fmt-28) binds would otherwise pass unseen. Read-only: no adoption,
+            // no map writes, no gating effect. Same guarded-GetDesc pattern and
+            // lock scope as the surrounding code. Budget is per (w,h,fmt) class
+            // (first 3 each, 32 classes max) so loading-phase binds cannot consume
+            // the gameplay window's quota. Class counters are plain statics like
+            // the other log-budget counters (racy-benign: at most a duplicate
+            // line, never a behavior change).
+            {
+                struct BindClass { unsigned w; unsigned h; unsigned fmt; unsigned logged; };
+                static BindClass s_bindClasses[32] = {};
+                static unsigned s_bindClassN = 0;
+                D3D12_RESOURCE_DESC brd = {};
+                if (g_boundRtvResource && SafeGetDesc(g_boundRtvResource, &brd) &&
+                    brd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    brd.Width >= 1000 && brd.Height >= 500 && brd.MipLevels == 1) {
+                    unsigned cw = (unsigned)brd.Width, ch = (unsigned)brd.Height, cf = (unsigned)brd.Format;
+                    BindClass* cls = nullptr;
+                    for (unsigned i = 0; i < s_bindClassN && i < 32; ++i) {
+                        if (s_bindClasses[i].w == cw && s_bindClasses[i].h == ch && s_bindClasses[i].fmt == cf) {
+                            cls = &s_bindClasses[i];
+                            break;
+                        }
+                    }
+                    if (!cls && s_bindClassN < 32) {
+                        cls = &s_bindClasses[s_bindClassN++];
+                        cls->w = cw; cls->h = ch; cls->fmt = cf; cls->logged = 0;
+                    }
+                    if (cls && cls->logged < 3) {
+                        ++cls->logged;
+                        Log("hooks: bind-survey %ux%u fmt=%u res=%p handle=%llX scene=%d present=%llu ecl=%llu",
+                            cw, ch, cf,
+                            (void*)g_boundRtvResource, (unsigned long long)pRenderTargets[0].ptr,
+                            SceneSetContains(g_boundRtvResource) ? 1 : 0,
+                            (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                            (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+                    }
+                }
+            }
+            // Dynamic adoption: if a display-sized scene-format target gets bound as
             // an RTV and we have never seen it as the scene color, remember it.
             // Covers renderer re-inits that re-create views after our hook
             // (or even the whole plugin) was installed.
@@ -8129,7 +8511,7 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                 D3D12_RESOURCE_DESC rd = {};
                 if (SafeGetDesc(g_boundRtvResource, &rd) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
-                    rd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
+                    IsSceneColorFormat((unsigned)rd.Format)) {
                     StoreTracked(&g_sceneColor, g_boundRtvResource);
                     g_sceneColorRtv = pRenderTargets[0];
                     g_sceneColorValid = true;
@@ -8138,8 +8520,23 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                     Log("hooks: scene color adopted from RTV bind %p (%ux%u)", (void*)g_sceneColor,
                         (unsigned int)rd.Width, (unsigned int)rd.Height);
                     SceneSetNote(g_sceneColor, (unsigned int)rd.Width, (unsigned int)rd.Height,
-                                 (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM);
+                                 (unsigned)rd.Format);
                 }
+            }
+            // SET NOTATION ON BIND (no adoption change): a display-sized
+            // scene-format target bound as RTV joins the rotation set even when
+            // slots are already valid (verified live: gameplay fmt-10 binds
+            // with setcount=8/inset=0 because creation-time views predated the
+            // filter). Membership lets SceneColorBound/trigger resolve the
+            // live target; classification slots are untouched.
+            if (g_boundRtvResource && !SceneSetContains(g_boundRtvResource)) {
+                D3D12_RESOURCE_DESC nrd = {};
+                if (SafeGetDesc(g_boundRtvResource, &nrd) &&
+                    nrd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    nrd.Width >= 1000 && nrd.Height >= 500 && nrd.MipLevels == 1 &&
+                    IsSceneColorFormat((unsigned)nrd.Format))
+                    SceneSetNote(g_boundRtvResource, (unsigned)nrd.Width,
+                                 (unsigned)nrd.Height, (unsigned)nrd.Format);
             }
             // MV TRACK-BY-BIND: the engine binds MV as an RTV every frame it
             // renders it. Adopting here always holds the CURRENT texture -

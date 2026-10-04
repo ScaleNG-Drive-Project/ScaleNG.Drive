@@ -65,6 +65,67 @@ public:
 namespace {
 void NgxModuleAnchor() {}
 
+// NGX app log callback (0x14+): may fire on any thread, concurrently.
+// Bounded copy into Log (thread-safe spinlock writer); volume-capped.
+static void __cdecl NgxAppLogCallback(const char* message, int level, int component)
+{
+    if (!message) return;
+    static volatile LONG s_ngxLogN = 0;
+    LONG n = InterlockedIncrement(&s_ngxLogN);
+    if (n > 40 && (n % 200) != 0) return;
+    char buf[512];
+    size_t i = 0;
+    while (message[i] && i + 1 < sizeof(buf)) { buf[i] = message[i]; ++i; }
+    buf[i] = '\0';
+    Log("NGX: %s", buf);
+    (void)level; (void)component;
+}
+
+// FeatureCommonInfo for Init_Ext (the path working 310.x integrations use):
+// feature discovery paths + verbose app logging. Statics outlive all Init
+// calls (NGX may retain the pointers for later feature discovery).
+static wchar_t s_ngxFeatureDir[MAX_PATH] = {};
+static const wchar_t* s_ngxFeaturePaths[1] = {};
+static NVSDK_NGX_FeatureCommonInfo_Local s_ngxFcInfo = {};
+static bool BuildNgxFeatureInfo(const wchar_t* dllPath)
+{
+    if (!dllPath || !*dllPath) return false;
+    size_t len = 0;
+    while (dllPath[len]) ++len;
+    size_t cut = len;
+    for (size_t i = 0; i < len; ++i)
+        if (dllPath[i] == L'\\') cut = i + 1;
+    size_t n = 0;
+    while (n + 1 < MAX_PATH && n < cut) { s_ngxFeatureDir[n] = dllPath[n]; ++n; }
+    s_ngxFeatureDir[n] = L'\0';
+    if (!s_ngxFeatureDir[0]) return false;
+    s_ngxFeaturePaths[0] = s_ngxFeatureDir;
+    s_ngxFcInfo.PathListInfo.Path = s_ngxFeaturePaths;
+    s_ngxFcInfo.PathListInfo.Length = 1;
+    s_ngxFcInfo.InternalData = nullptr;
+    s_ngxFcInfo.LoggingInfo.LoggingCallback = NgxAppLogCallback;
+    s_ngxFcInfo.LoggingInfo.MinimumLoggingLevel = (int)NVSDK_NGX_LOGGING_LEVEL_VERBOSE_L;
+    s_ngxFcInfo.LoggingInfo.DisableOtherLoggingSinks = false;
+    return true;
+}
+
+// SEH wrapper for NGX Init_Ext - standalone (no C++ unwinding in caller).
+static int SafeNgxInitExt(PFN_NVSDK_NGX_D3D12_Init_Ext f, unsigned long long appId,
+                          const wchar_t* dataPath, ID3D12Device* dev,
+                          NVSDK_NGX_Version version,
+                          const NVSDK_NGX_FeatureCommonInfo_Local* fc,
+                          unsigned* outCode)
+{
+    if (!f) return -1;
+    __try {
+        NVSDK_NGX_Result r = f(appId, dataPath, dev, version, fc);
+        return (int)r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outCode = (unsigned)GetExceptionCode();
+        return -2;
+    }
+}
+
 void CopyW(wchar_t* dst, size_t cap, const wchar_t* src)
 {
     size_t i = 0;
@@ -127,12 +188,38 @@ bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
     // the core's NVSDK_NGX_D3D12_Init fails with 0xBAD00001.
     HMODULE nvapi = LoadLibraryW(L"nvapi64.dll");
     Log("DLSS: preloaded nvapi64.dll = %p", (void*)nvapi);
+    // NvAPI_Initialize probe (once): the NGX platform layer may depend on an
+    // initialized NvAPI (classic Init failure analysis). Discovery uses
+    // NVIDIA's public nvapi_QueryInterface mechanism (0x0150E828 =
+    // NvAPI_Initialize). x64 ABI: no calling-convention risk. Read-only vs
+    // the game (standard API init, SEH-wrapped, result only logged).
+    {
+        static volatile LONG s_nvapiOnce = 0;
+        if (InterlockedCompareExchange(&s_nvapiOnce, 1, 0) == 0 && nvapi) {
+            typedef void* (__cdecl* PFN_nvapi_QI)(unsigned int id);
+            PFN_nvapi_QI qi = (PFN_nvapi_QI)GetProcAddress(nvapi, "nvapi_QueryInterface");
+            Log("DLSS: nvapi_QueryInterface=%p", (void*)qi);
+            if (qi) {
+                typedef int (__cdecl* PFN_NvAPI_Initialize)(void);
+                PFN_NvAPI_Initialize pInitNv = (PFN_NvAPI_Initialize)qi(0x0150E828);
+                Log("DLSS: NvAPI_Initialize=%p", (void*)pInitNv);
+                if (pInitNv) {
+                    int st = -9999;
+                    __try { st = pInitNv(); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { st = -1000 - (int)GetExceptionCode(); }
+                    Log("DLSS: NvAPI_Initialize result=%d", st);
+                }
+            }
+        }
+    }
 
     // Enable the NGX core's own log (C:\ProgramData\NVIDIA\NGX\models\nvngx.log)
     // BEFORE loading it - it names the exact parameter on EvaluateFeature
     // rejections, which ScaleNG.log cannot see.
     SetEnvironmentVariableA("__NGX_LOG_LEVEL", "3");
-    SetEnvironmentVariableA("__NGX_DISABLE_UPDATER", "1");
+    // NOTE (2026-10-04): __NGX_DISABLE_UPDATER intentionally NOT set — the
+    // 310.x NGX Update Module resolves feature DLLs, and disabling it is a
+    // suspect in Init PlatformError. Reversible one-liner.
 
     // PART 2: locate and load the driver's NGX core (nvngx.dll in the driver
     // store). It exports the classic API: Init / AllocateParameters /
@@ -176,15 +263,29 @@ bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
         Log("DLSS: FAILED to load the driver NGX core (no NVIDIA driver store core found)");
         return false;
     }
+    if (BuildNgxFeatureInfo(m_dlssPath))
+        Log("DLSS: feature discovery path + NGX app logging armed");
+    else
+        Log("DLSS: feature discovery path unavailable - Init_Ext will be skipped");
 
     pInit = (PFN_NVSDK_NGX_D3D12_Init)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_Init");
+    pInitExt = (PFN_NVSDK_NGX_D3D12_Init_Ext)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_Init_Ext");
     pAllocateParameters = (PFN_NVSDK_NGX_D3D12_AllocateParameters)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_AllocateParameters");
     pCreateFeature = (PFN_NVSDK_NGX_D3D12_CreateFeature)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_CreateFeature");
     pEvaluateFeature = (PFN_NVSDK_NGX_D3D12_EvaluateFeature)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_EvaluateFeature");
     pShutdown = (PFN_NVSDK_NGX_D3D12_Shutdown)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_Shutdown");
     pGetParameters = (PFN_NVSDK_NGX_D3D12_GetParameters)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_GetParameters");
 
-    if (!pInit || !pAllocateParameters || !pCreateFeature || !pEvaluateFeature || !pShutdown) {
+    // AllocateParameters is OPTIONAL: the integration never calls it (feature
+    // creation uses our own header-layout NgxParamStore because the core's
+    // object has a non-standard vtable). Recent DLSS redistributables
+    // (verified live: nvngx_dlss.dll exports Init/Create/Evaluate/Shutdown
+    // but not AllocateParameters) no longer ship it. Requiring it here
+    // fails load for an export nothing dereferences.
+    if (!pAllocateParameters)
+        Log("DLSS: AllocateParameters absent - continuing with NgxParamStore (never called)");
+
+    if (!pInit || !pCreateFeature || !pEvaluateFeature || !pShutdown) {
         Log("DLSS: driver core missing exports: init=%p alloc=%p create=%p eval=%p shutdown=%p",
             (void*)pInit, (void*)pAllocateParameters, (void*)pCreateFeature,
             (void*)pEvaluateFeature, (void*)pShutdown);
@@ -201,6 +302,7 @@ void NvDlssUpscaler::UnloadNGX()
         m_ngxDll = nullptr;
     }
     pInit = nullptr;
+    pInitExt = nullptr;
     pAllocateParameters = nullptr;
     pCreateFeature = nullptr;
     pEvaluateFeature = nullptr;
@@ -229,6 +331,7 @@ bool NvDlssUpscaler::Init(const UpscalerInitParams& params)
     m_displayWidth = params.displayWidth;
     m_displayHeight = params.displayHeight;
     m_appId = params.appId;
+    m_ngxVersion = params.ngxApiVersion ? params.ngxApiVersion : (uint32_t)NVSDK_NGX_Version_API;
     m_perfQuality = params.perfQuality;
     m_mvJittered = params.mvJittered;
     m_autoExposure = params.autoExposure;
@@ -361,8 +464,30 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     // on a secondary device while the game's primary device is active.
     // Catching here lets the game survive - DLAA just stays disabled.
     unsigned sehCode = 0;
-    int irc = SafeNgxInit(pInit, m_appId, m_ngxDataPath, m_device,
-                          NVSDK_NGX_Version_API, &sehCode);
+    Log("DLSS: Init attempting apiVersion=0x%X appId=%u", m_ngxVersion, m_appId);
+    // Prefer Init_Ext with feature discovery + app logging (the path working
+    // 310.x integrations use); classic Init is the fallback. Result codes are
+    // logged verbatim either way for exact comparison.
+    int irc = -1;
+    if (pInitExt && s_ngxFeaturePaths[0]) {
+        Log("DLSS: calling Init_Ext (discovery + app logging)");
+        irc = SafeNgxInitExt(pInitExt, m_appId, m_ngxDataPath, m_device,
+                             (NVSDK_NGX_Version)m_ngxVersion, &s_ngxFcInfo, &sehCode);
+        if (irc == -2) {
+            Log("DLSS: NVSDK_NGX_D3D12_Init_Ext FAULTED (SEH 0x%08X)", sehCode);
+            s_lastFailTick = GetTickCount();
+            m_lastCreateResult = -3003 - (int)sehCode;
+            return false;
+        }
+        if (irc < 0 || !NVSDK_NGX_SUCCEEDED((NVSDK_NGX_Result)irc))
+            Log("DLSS: Init_Ext failed, result=%d - trying classic Init", irc);
+        else
+            Log("DLSS: Init_Ext SUCCEEDED");
+    }
+    if (irc == -1 || irc < 0 || !NVSDK_NGX_SUCCEEDED((NVSDK_NGX_Result)irc)) {
+        irc = SafeNgxInit(pInit, m_appId, m_ngxDataPath, m_device,
+                          (NVSDK_NGX_Version)m_ngxVersion, &sehCode);
+    }
     if (irc == -2) {
         Log("DLSS: NVSDK_NGX_D3D12_Init FAULTED (SEH 0x%08X) - DLAA unavailable", sehCode);
         s_lastFailTick = GetTickCount();
@@ -382,10 +507,12 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
         HRESULT qhr = m_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev);
         Log("DLSS diag: QI(IDXGIDevice) hr=0x%08X", (unsigned)qhr);
         if (dxgidev) { dxgidev->Release(); dxgidev = nullptr; }
-        // VTABLE REPAIR PROBE: the "device" is believed to be the REAL device
-        // with a game-patched vtable[0] (QI) that blocks IDXGIDevice. Restore
-        // the genuine QI from a clean device we create ourselves, test, and
-        // keep the repair permanent if it unlocks DXGI interop.
+        // VTABLE REPAIR PROBE (FALSIFIED 2026-10-04 — DO NOT RE-ENABLE THE
+        // WRITE): clean-device probe proved pristine D3D12 devices also fail
+        // QI(IDXGIDevice) with E_NOINTERFACE, so the failure is NOT game
+        // wrapper patching — D3D12 devices simply do not expose IDXGIDevice.
+        // This block is now LOG-ONLY comparison; the VirtualProtect write is
+        // removed. See ProbeCleanDeviceInit + STATUS fence/adapter audit.
         {
             static bool s_repairAttempted = false;
             if (!s_repairAttempted) {
@@ -404,12 +531,10 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
                     Log("DLSS diag: genuineQI=%p currentQI=%p patched=%d",
                         genuineQI, currentQI, (int)(genuineQI != currentQI));
                     if (genuineQI != currentQI) {
-                        DWORD oldProt = 0;
-                        if (VirtualProtect(&wrapVt[0], sizeof(void*), PAGE_READWRITE, &oldProt)) {
-                            wrapVt[0] = genuineQI;
-                            VirtualProtect(&wrapVt[0], sizeof(void*), oldProt, &oldProt);
-                            Log("DLSS diag: vtable[0] RESTORED to genuine QI");
-                        }
+                        // Write REMOVED (see header comment): differing slot-0
+                        // does not prove patching, and overwriting a live
+                        // game-device vtable risks game-wide behavior change.
+                        Log("DLSS diag: vtable[0] differs - left UNTOUCHED (repair disproven)");
                     }
                     // Test interop now
                     IDXGIDevice* dg = nullptr;
@@ -445,7 +570,11 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     m_paramStore->SetUI(NVSDK_NGX_Parameter_OutHeight, m_displayHeight);
     m_paramStore->SetI(NVSDK_NGX_Parameter_PerfQualityValue, m_perfQuality);
 
-    int flags = 0;
+    // The legacy scene input is linear HDR HALF-float (verified live:
+    // 1920x1080 fmt-10 RTV-bound + barriered + viewported in gameplay). Per
+    // NVIDIA, linear input under LDR/default flags produces banding/shift
+    // artifacts, so HDR processing is required for this input.
+    int flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     if (m_mvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (m_autoExposure) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
@@ -610,6 +739,126 @@ void NvDlssUpscaler::UpdateSizes(unsigned int rw, unsigned int rh,
         Log("DLSS: feature reset for size change (render %ux%u -> display %ux%u)",
             rw, rh, dw, dh);
     }
+}
+
+// Discriminator probe (see upscaler.h): NGX Init on a self-created clean
+// device. READ-ONLY vs the game: no vtable writes, no game-device calls.
+// Interprets game-device 0xBAD00001: success here => wrapper/device-interop
+// blocks NGX (repair/unwrap route); same failure => AppId or driver platform
+// (AppId/driver route). Runs once per process; all game threads share it.
+int NvDlssUpscaler::ProbeCleanDeviceInit()
+{
+    static volatile LONG s_probeOnce = 0;
+    static int s_probeResult = -9998;
+    if (InterlockedCompareExchange(&s_probeOnce, 1, 0) != 0)
+        return s_probeResult;
+    if (!pInit) {
+        Log("DLSS probe: NGX core not loaded - cannot probe");
+        s_probeResult = -9997;
+        return s_probeResult;
+    }
+    ID3D12Device* clean = nullptr;
+    typedef HRESULT(WINAPI* PFN_D3D12CreateDevice)(void*, unsigned, const IID&, void**);
+    PFN_D3D12CreateDevice mkDev = (PFN_D3D12CreateDevice)(void*)Real_D3D12CreateDevice_Tramp;
+    HRESULT chr = mkDev ? mkDev(nullptr, (unsigned)D3D_FEATURE_LEVEL_11_0,
+                                __uuidof(ID3D12Device), (void**)&clean) : E_FAIL;
+    Log("DLSS probe: clean device hr=0x%08X", (unsigned)chr);
+    if (FAILED(chr) || !clean) {
+        s_probeResult = -9996;
+        return s_probeResult;
+    }
+    // Adapter identity via LUID matching (no IDXGIDevice needed — D3D12
+    // devices do not expose it, wrapped or not). Reports both the clean
+    // device and the game device, so a default-adapter mismatch (e.g. clean
+    // landing on integrated graphics) cannot be mistaken for a wrapper.
+    {
+        auto logAdapter = [](const char* tag, ID3D12Device* dev) {
+            if (!dev) { Log("DLSS probe: %s device=null", tag); return; }
+            LUID luid = dev->GetAdapterLuid();
+            IDXGIFactory* factory = nullptr;
+            HRESULT fhr = CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory);
+            if (FAILED(fhr) || !factory) {
+                Log("DLSS probe: %s factory hr=0x%08X", tag, (unsigned)fhr);
+                return;
+            }
+            bool matched = false;
+            for (UINT i = 0; ; ++i) {
+                IDXGIAdapter* ad = nullptr;
+                if (factory->EnumAdapters(i, &ad) == DXGI_ERROR_NOT_FOUND) break;
+                if (!ad) continue;
+                DXGI_ADAPTER_DESC adesc = {};
+                if (SUCCEEDED(ad->GetDesc(&adesc)) &&
+                    adesc.AdapterLuid.LowPart == luid.LowPart &&
+                    adesc.AdapterLuid.HighPart == luid.HighPart) {
+                    Log("DLSS probe: %s vendor=0x%04X '%ls' (LUID-matched)",
+                        tag, adesc.VendorId, adesc.Description);
+                    matched = true;
+                }
+                ad->Release();
+                if (matched) break;
+            }
+            if (!matched)
+                Log("DLSS probe: %s LUID unmatched by any DXGI adapter", tag);
+            factory->Release();
+        };
+        logAdapter("clean-device", clean);
+        logAdapter("game-device", m_device);
+    }
+    // Ask the DRIVER what it thinks: snippet/API versions + SuperSampling
+    // requirements on the NVIDIA adapter. Read-only; interprets Init codes.
+    {
+        PFN_NVSDK_NGX_GetAPIVersion_Local pGetAPI =
+            (PFN_NVSDK_NGX_GetAPIVersion_Local)GetProcAddress(m_ngxDll, "NVSDK_NGX_GetAPIVersion");
+        PFN_NVSDK_NGX_GetSnippetVersion_Local pGetSnip =
+            (PFN_NVSDK_NGX_GetSnippetVersion_Local)GetProcAddress(m_ngxDll, "NVSDK_NGX_GetSnippetVersion");
+        PFN_NVSDK_NGX_D3D12_GetFeatureRequirements_Local pGetReq =
+            (PFN_NVSDK_NGX_D3D12_GetFeatureRequirements_Local)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_GetFeatureRequirements");
+        Log("DLSS probe: versionFns api=%p snip=%p req=%p", (void*)pGetAPI, (void*)pGetSnip, (void*)pGetReq);
+        if (pGetAPI) Log("DLSS probe: GetAPIVersion=0x%X", pGetAPI());
+        if (pGetSnip) Log("DLSS probe: GetSnippetVersion=0x%X", pGetSnip());
+        if (pGetReq) {
+            IDXGIFactory* factory = nullptr;
+            if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)) && factory) {
+                IDXGIAdapter* nvAd = nullptr;
+                for (UINT i = 0; ; ++i) {
+                    IDXGIAdapter* ad = nullptr;
+                    if (factory->EnumAdapters(i, &ad) == DXGI_ERROR_NOT_FOUND) break;
+                    if (!ad) continue;
+                    DXGI_ADAPTER_DESC adesc = {};
+                    if (SUCCEEDED(ad->GetDesc(&adesc)) && adesc.VendorId == 0x10DE) { nvAd = ad; break; }
+                    ad->Release();
+                }
+                if (nvAd) {
+                    NVSDK_NGX_FeatureDiscoveryInfo_Local di = {};
+                    di.SDKVersion = (int)m_ngxVersion;
+                    di.FeatureID = 1; // SuperSampling
+                    di.Identifier.IdentifierType = 0;
+                    di.Identifier.v.ApplicationId = m_appId;
+                    di.ApplicationDataPath = m_ngxDataPath;
+                    di.FeatureInfo = s_ngxFeaturePaths[0] ? &s_ngxFcInfo : nullptr;
+                    NVSDK_NGX_FeatureRequirement_Local req = {};
+                    req.FeatureSupported = -1;
+                    int rr = -9999;
+                    __try { rr = pGetReq(nvAd, &di, &req); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { rr = -1000 - (int)GetExceptionCode(); }
+                    Log("DLSS probe: GetFeatureRequirements rr=%d supported=%d minHW=0x%X minOS='%s'",
+                        rr, req.FeatureSupported, req.MinHWArchitecture, req.MinOSVersion);
+                    nvAd->Release();
+                } else {
+                    Log("DLSS probe: no 0x10DE adapter enumerated");
+                }
+                factory->Release();
+            }
+        }
+    }
+    unsigned sehCode = 0;
+    int rc = SafeNgxInit(pInit, m_appId, m_ngxDataPath, clean,
+                         (NVSDK_NGX_Version)m_ngxVersion, &sehCode);
+    Log("DLSS probe: clean-device Init result=%d (0x%08X)%s", rc, (unsigned)rc,
+        rc == -2 ? " FAULTED" : "");
+    clean->Release();
+    s_probeResult = rc;
+    return s_probeResult;
 }
 
 void NvDlssUpscaler::Shutdown()

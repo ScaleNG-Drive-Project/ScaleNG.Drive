@@ -2,6 +2,7 @@
 
 #include "upscaler.h"
 #include <d3d12.h>
+#include <dxgi.h>
 #include <cstdint>
 #include <windows.h>
 
@@ -90,6 +91,62 @@ typedef NVSDK_NGX_Result (__cdecl* PFN_NVSDK_NGX_D3D12_EvaluateFeature)(ID3D12Gr
 typedef NVSDK_NGX_Result (__cdecl* PFN_NVSDK_NGX_D3D12_Shutdown)(void);
 typedef NVSDK_NGX_Result (__cdecl* PFN_NVSDK_NGX_D3D12_GetParameters)(NVSDK_NGX_Parameter** OutParameters);
 
+// NGX 0x14+ extended init (the path working 310.x integrations use): feature
+// discovery paths + app log callback. Layout matches current NGX headers
+// (PathListInfo; InternalData; LoggingInfo).
+typedef enum NVSDK_NGX_Logging_Level_Local
+{
+    NVSDK_NGX_LOGGING_LEVEL_OFF_L = 0,
+    NVSDK_NGX_LOGGING_LEVEL_ON_L,
+    NVSDK_NGX_LOGGING_LEVEL_VERBOSE_L,
+} NVSDK_NGX_Logging_Level_Local;
+typedef void (__cdecl* PFN_NVSDK_NGX_AppLogCallback_Local)(const char* message, int loggingLevel, int sourceComponent);
+struct NVSDK_NGX_PathListInfo_Local { const wchar_t* const* Path; unsigned int Length; };
+struct NVSDK_NGX_LoggingInfo_Local {
+    PFN_NVSDK_NGX_AppLogCallback_Local LoggingCallback;
+    int MinimumLoggingLevel;
+    bool DisableOtherLoggingSinks;
+};
+struct NVSDK_NGX_FeatureCommonInfo_Local {
+    NVSDK_NGX_PathListInfo_Local PathListInfo;
+    void* InternalData;
+    NVSDK_NGX_LoggingInfo_Local LoggingInfo;
+};
+typedef NVSDK_NGX_Result (__cdecl* PFN_NVSDK_NGX_D3D12_Init_Ext)(unsigned long long InApplicationId, const wchar_t* InApplicationDataPath, ID3D12Device* InDevice, NVSDK_NGX_Version InSDKVersion, const NVSDK_NGX_FeatureCommonInfo_Local* InFeatureInfo);
+
+// Feature-requirements query types (current NGX layout): ask the driver what
+// IT thinks about SuperSampling on an adapter — no game interaction.
+typedef enum NVSDK_NGX_Feature_Support_Result_Local
+{
+    NVSDK_NGX_FeatureSupportResult_Supported_L = 0,
+    NVSDK_NGX_FeatureSupportResult_DriverVersionUnsupported_L = 2,
+    NVSDK_NGX_FeatureSupportResult_AdapterUnsupported_L = 4,
+} NVSDK_NGX_Feature_Support_Result_Local;
+struct NVSDK_NGX_FeatureRequirement_Local {
+    int FeatureSupported;
+    unsigned int MinHWArchitecture;
+    char MinOSVersion[255];
+};
+struct NVSDK_NGX_Application_Identifier_Local {
+    int IdentifierType;
+    union {
+        unsigned long long ApplicationId;
+        struct { const char* ProjectId; int EngineType; const char* EngineVersion; } ProjectDesc;
+    } v;
+};
+struct NVSDK_NGX_FeatureDiscoveryInfo_Local {
+    int SDKVersion;
+    int FeatureID;
+    NVSDK_NGX_Application_Identifier_Local Identifier;
+    const wchar_t* ApplicationDataPath;
+    const NVSDK_NGX_FeatureCommonInfo_Local* FeatureInfo;
+};
+typedef unsigned int (__cdecl* PFN_NVSDK_NGX_GetAPIVersion_Local)(void);
+typedef unsigned int (__cdecl* PFN_NVSDK_NGX_GetSnippetVersion_Local)(void);
+typedef int (__cdecl* PFN_NVSDK_NGX_D3D12_GetFeatureRequirements_Local)(
+    IDXGIAdapter* Adapter, const NVSDK_NGX_FeatureDiscoveryInfo_Local* Info,
+    NVSDK_NGX_FeatureRequirement_Local* OutSupported);
+
 // NVSDK_NGX_Parameter is a classic 17-slot vtable object (returned by
 // AllocateParameters on the driver core). Slot indices verified against the
 // driver 596.49 core: 0=SetULL 1=SetF 2=SetD 3=SetUI 4=SetI 5=SetD3D11Res
@@ -121,6 +178,7 @@ public:
     bool IsReady() const override { return m_initialized && m_enabled; }
     int LastEvaluateResult() const { return m_lastEvaluateResult; }
     int LastCreateResult() const { return m_lastCreateResult; }
+    int ProbeCleanDeviceInit() override;
     void UpdateSizes(unsigned int rw, unsigned int rh,
                      unsigned int dw, unsigned int dh) override;
 
@@ -138,6 +196,7 @@ private:
     PFN_NVSDK_NGX_D3D12_EvaluateFeature pEvaluateFeature = nullptr;
     PFN_NVSDK_NGX_D3D12_Shutdown pShutdown = nullptr;
     PFN_NVSDK_NGX_D3D12_GetParameters pGetParameters = nullptr;
+    PFN_NVSDK_NGX_D3D12_Init_Ext pInitExt = nullptr;
     PFN_NVSDK_NGX_Parameter_SetUI pSetUI = nullptr;
     PFN_NVSDK_NGX_Parameter_SetI pSetI = nullptr;
     PFN_NVSDK_NGX_Parameter_SetF pSetF = nullptr;
@@ -158,6 +217,7 @@ private:
     uint32_t m_displayWidth = 0;
     uint32_t m_displayHeight = 0;
     uint32_t m_appId = 0;
+    uint32_t m_ngxVersion = (uint32_t)NVSDK_NGX_Version_API;
     int m_perfQuality = 1;
     bool m_mvJittered = true;
     bool m_autoExposure = true;

@@ -14,6 +14,7 @@ struct ScaleNgConfig {
     bool mvJittered = true;
     bool autoExposure = true;
     unsigned int appId = 0xE658700;
+    unsigned int ngxApiVersion = 0x15; // NGX SDK version passed to Init (0x15 headers vs 310.6.0 DLL under test)
     wchar_t dlssDllPath[MAX_PATH] = {};
 };
 

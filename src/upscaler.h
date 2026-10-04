@@ -11,6 +11,7 @@ struct UpscalerInitParams {
     uint32_t displayHeight = 0;
     const wchar_t* dlssDllPath = nullptr;
     uint32_t appId = 0;
+    uint32_t ngxApiVersion = 0x15; // forwarded to NVSDK_NGX_D3D12_Init
     int perfQuality = 1;   // NVSDK_NGX_PerfQuality_Value: 0=MaxPerf 1=Balanced 2=MaxQuality 3=UltraPerf 4=UltraQuality
     bool mvJittered = true;
     bool autoExposure = true;
@@ -46,6 +47,12 @@ public:
     // its render target resolution). Default: no-op.
     virtual void UpdateSizes(unsigned int rw, unsigned int rh,
                              unsigned int dw, unsigned int dh) {}
+
+    // One-shot diagnostic: run NGX Init on a self-created clean device to
+    // discriminate wrapper/device-interop failure from AppId/driver failure.
+    // Read-only vs the game (no vtable writes, no game-device interaction).
+    // Returns the raw NGX result code, or negative internal markers.
+    virtual int ProbeCleanDeviceInit() { return -9999; }
 };
 
 enum UpscalerType {
