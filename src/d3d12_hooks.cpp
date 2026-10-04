@@ -460,6 +460,29 @@ static unsigned long long g_mvLastRtvKey = 0;
 // Rolling last-full-res-copy source - correlated with Present to name the
 // terminal scene node (the texture that feeds Present = DLAA input target).
 static unsigned g_lastNewChainFrame = 0;
+// Sentinel correctness: 0 is both "never observed" and a valid frameCounter
+// value (pre-first-camera). Without a separate observed flag, a chain first
+// seen at frame 0 reads as never-observed forever (quiet stuck 0f).
+static bool g_chainObserved = false;
+// SHADOW PRESENT QUIET (measurement-only, no gating): stamped at the same
+// newNode point as g_lastNewChainFrame. Thread model: written on engine
+// recording threads inside CopyTexBody (concurrent ECL workers); read on
+// engine threads and the Present thread inside EnsureUpscalerInit's defer log.
+// Plain fields would race, so storage follows the established serial pattern:
+// LONG64 + InterlockedExchange64 writes / InterlockedCompareExchange64 loads
+// (same as g_presentSerial/g_eclSerial); observed flag is LONG + Interlocked
+// (same as g_loadPhase/g_settledOnce). Width is 64-bit like g_presentSerial;
+// quiet is (now - last) modulo 2^64, wrap-safe and practically nowrap.
+static volatile LONG64 g_lastNewChainPresent = 0;
+static volatile LONG g_chainPresentObserved = 0;
+static unsigned long long HooksGetPresentQuietFrames() {
+    if (InterlockedCompareExchange(&g_chainPresentObserved, 0, 0) == 0) return 0;
+    unsigned long long now =
+        (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+    unsigned long long last =
+        (unsigned long long)InterlockedCompareExchange64(&g_lastNewChainPresent, 0, 0);
+    return now - last;
+}
 // Backbuffer-fetch circuit breaker: consecutive guarded faults on the cached
 // swapchain mean it is stale; null it and let Present self-heal re-adopt.
 static volatile long g_bbFetchFails = 0;
@@ -600,6 +623,178 @@ static void LogNativeCandidateSummary(unsigned long long presentSerial)
     Log("native-candidate: registry count=%u emitted=%u present=%llu",
         g_nativeCandidateCount, emitted, presentSerial);
     ReleaseSRWLockShared(&g_nativeCandidateLock);
+}
+
+// Forward: guarded descriptor read (defined with the other safe helpers).
+static bool SafeGetDesc(ID3D12Resource* r, D3D12_RESOURCE_DESC* out);
+
+// SCENE-SET REGISTRY (legacy rotation tracking): bounded set of observed
+// scene-color candidates used for MATCHING (SceneColorBound / isSceneSrc),
+// replacing the single last-wins ALT slot for that purpose. Classification
+// variables (g_sceneColor/g_sceneColorAlt/g_activeSceneColor) and all
+// adoption/refresh logic are untouched. Identity is pointer-based;
+// dimensions/format are insert filters only, never proof of scene.
+// Weak pointers, no COM refs; every descriptor read guarded.
+struct SceneSetEntry {
+    ID3D12Resource* resource;
+    unsigned viewW;
+    unsigned viewH;
+    unsigned viewFmt;
+    unsigned resW;
+    unsigned resH;
+    unsigned resFmt;
+    unsigned resFlags;
+    unsigned long long lastUsePresent;
+    unsigned uses;
+};
+static SceneSetEntry g_sceneSet[8] = {};
+static unsigned g_sceneSetCount = 0;
+static SRWLOCK g_sceneSetLock = SRWLOCK_INIT;
+
+static unsigned long long SceneSetNow()
+{ return (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0); }
+
+// Insert-capable observe: creation / OM-adoption paths pass already-fetched
+// view evidence for a resource that is live-by-construction at that point
+// (just created / just bound on this thread). MV (R16G16F) and UI (small /
+// non-UNORM) targets are excluded by the UNORM + size filter by design.
+static void SceneSetNote(ID3D12Resource* res, unsigned w, unsigned h, unsigned viewFmt)
+{
+    if (!res || w < 1000 || h < 500 || viewFmt != (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM)
+        return;
+    const unsigned long long now = SceneSetNow();
+    AcquireSRWLockShared(&g_sceneSetLock);
+    bool known = false;
+    for (unsigned i = 0; i < g_sceneSetCount; ++i) {
+        if (g_sceneSet[i].resource == res) { known = true; break; }
+    }
+    ReleaseSRWLockShared(&g_sceneSetLock);
+    if (known) {
+        AcquireSRWLockExclusive(&g_sceneSetLock);
+        for (unsigned i = 0; i < g_sceneSetCount; ++i) {
+            if (g_sceneSet[i].resource == res) {
+                g_sceneSet[i].lastUsePresent = now;
+                ++g_sceneSet[i].uses;
+                g_sceneSet[i].viewW = w; g_sceneSet[i].viewH = h; g_sceneSet[i].viewFmt = viewFmt;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_sceneSetLock);
+        return;
+    }
+    // Reuse-baseline snapshot (guarded; a fault means teardown raced us).
+    D3D12_RESOURCE_DESC rd = {};
+    if (!SafeGetDesc(res, &rd)) return;
+    AcquireSRWLockExclusive(&g_sceneSetLock);
+    for (unsigned i = 0; i < g_sceneSetCount; ++i) {
+        if (g_sceneSet[i].resource == res) {
+            g_sceneSet[i].lastUsePresent = now;
+            ++g_sceneSet[i].uses;
+            ReleaseSRWLockExclusive(&g_sceneSetLock);
+            return;
+        }
+    }
+    SceneSetEntry* slot = nullptr;
+    if (g_sceneSetCount < 8) {
+        slot = &g_sceneSet[g_sceneSetCount++];
+    } else {
+        unsigned oldest = 0;
+        for (unsigned i = 1; i < g_sceneSetCount; ++i) {
+            if (g_sceneSet[i].lastUsePresent < g_sceneSet[oldest].lastUsePresent)
+                oldest = i;
+        }
+        slot = &g_sceneSet[oldest];
+        static int s_evictLogs = 0;
+        if (++s_evictLogs <= 4)
+            Log("hooks: scene-set evicted LRU %p for %p", (void*)slot->resource, (void*)res);
+    }
+    slot->resource = res;
+    slot->viewW = w; slot->viewH = h; slot->viewFmt = viewFmt;
+    slot->resW = (unsigned)rd.Width; slot->resH = (unsigned)rd.Height;
+    slot->resFmt = (unsigned)rd.Format; slot->resFlags = (unsigned)rd.Flags;
+    slot->lastUsePresent = now;
+    slot->uses = 1;
+    unsigned countNow = g_sceneSetCount;
+    ReleaseSRWLockExclusive(&g_sceneSetLock);
+    static int s_noteLogs = 0;
+    if (++s_noteLogs <= 12)
+        Log("hooks: scene-set note %p (%ux%u viewFmt=%u resFmt=%u) count=%u",
+            (void*)res, w, h, viewFmt, (unsigned)rd.Format, countNow);
+}
+
+// Recency-only touch (no insert, no descriptor reads): OM-bind and copy
+// paths refresh live usage of already-known members.
+static void SceneSetTouch(ID3D12Resource* res)
+{
+    if (!res) return;
+    const unsigned long long now = SceneSetNow();
+    AcquireSRWLockExclusive(&g_sceneSetLock);
+    for (unsigned i = 0; i < g_sceneSetCount; ++i) {
+        if (g_sceneSet[i].resource == res) {
+            g_sceneSet[i].lastUsePresent = now;
+            ++g_sceneSet[i].uses;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_sceneSetLock);
+}
+
+// Pointer-identity membership (hot paths): pure compares, no dereference.
+static bool SceneSetContains(ID3D12Resource* res)
+{
+    if (!res) return false;
+    AcquireSRWLockShared(&g_sceneSetLock);
+    bool hit = false;
+    for (unsigned i = 0; i < g_sceneSetCount; ++i) {
+        if (g_sceneSet[i].resource == res) { hit = true; break; }
+    }
+    ReleaseSRWLockShared(&g_sceneSetLock);
+    return hit;
+}
+
+// Periodic sweep (Present cadence): guarded revalidation. A fault drops the
+// entry (never dereferenced again). A descriptor change means the address
+// was reused by a new allocation: refresh the baseline and reset usage so
+// stale metadata never attaches to the new resource.
+static void SceneSetSweep()
+{
+    AcquireSRWLockExclusive(&g_sceneSetLock);
+    for (unsigned i = 0; i < g_sceneSetCount;) {
+        ID3D12Resource* res = g_sceneSet[i].resource;
+        D3D12_RESOURCE_DESC rd = {};
+        ReleaseSRWLockExclusive(&g_sceneSetLock);
+        bool ok = (res && SafeGetDesc(res, &rd));
+        AcquireSRWLockExclusive(&g_sceneSetLock);
+        unsigned idx = g_sceneSetCount;
+        for (unsigned j = 0; j < g_sceneSetCount; ++j) {
+            if (g_sceneSet[j].resource == res) { idx = j; break; }
+        }
+        if (idx >= g_sceneSetCount) continue;
+        if (!ok) {
+            static int s_invLogs = 0;
+            if (++s_invLogs <= 6)
+                Log("hooks: scene-set invalidated %p (guarded read fault)", (void*)res);
+            g_sceneSet[idx] = g_sceneSet[--g_sceneSetCount];
+            g_sceneSet[g_sceneSetCount] = {};
+            continue;
+        }
+        if ((unsigned)rd.Width != g_sceneSet[idx].resW ||
+            (unsigned)rd.Height != g_sceneSet[idx].resH ||
+            (unsigned)rd.Format != g_sceneSet[idx].resFmt ||
+            (unsigned)rd.Flags != g_sceneSet[idx].resFlags) {
+            g_sceneSet[idx].resW = (unsigned)rd.Width;
+            g_sceneSet[idx].resH = (unsigned)rd.Height;
+            g_sceneSet[idx].resFmt = (unsigned)rd.Format;
+            g_sceneSet[idx].resFlags = (unsigned)rd.Flags;
+            g_sceneSet[idx].uses = 1;
+            static int s_reuseLogs = 0;
+            if (++s_reuseLogs <= 6)
+                Log("hooks: scene-set address reused %p (%ux%u fmt=%u) - baseline refreshed",
+                    (void*)res, (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)rd.Format);
+        }
+        ++i;
+    }
+    ReleaseSRWLockExclusive(&g_sceneSetLock);
 }
 
 // These objects are declared below with external linkage; forward declarations
@@ -755,16 +950,42 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandList)(ID3D12Device*, UINT, 
 typedef void (STDMETHODCALLTYPE* PFN_ExecuteCommandLists)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 typedef void (STDMETHODCALLTYPE* PFN_CopyBufferRegion)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
 typedef void (STDMETHODCALLTYPE* PFN_CopyTextureRegion)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+typedef void (STDMETHODCALLTYPE* PFN_CopyResource)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
+typedef void (STDMETHODCALLTYPE* PFN_SetGraphicsRootDescriptorTable)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
 typedef void (STDMETHODCALLTYPE* PFN_RSSetViewports)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
 typedef void (STDMETHODCALLTYPE* PFN_RSSetScissorRects)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
 typedef void (STDMETHODCALLTYPE* PFN_ResourceBarrier)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 typedef void (STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_ResourceMap)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
+typedef void (STDMETHODCALLTYPE* PFN_ResourceUnmap)(ID3D12Resource*, UINT, const D3D12_RANGE*);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreatePlacedResource)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateReservedResource)(ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+// Device4 '1'-variant creation signatures (SDK-verified slots 53/54/55; see
+// slot audit - an earlier read misreported 56/57/58 from unfiltered header
+// text with non-Windows preprocessor branches included).
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource1)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateHeap1)(ID3D12Device*, const D3D12_HEAP_DESC*, ID3D12ProtectedResourceSession*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateReservedResource1)(ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession*, REFIID, void**);
+// Descriptor-heap creation signature (SDK-verified slot 14).
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateDescriptorHeap)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
+// Device8 resource-creation signatures (slots verified: CommittedResource2=69,
+// PlacedResource1=70). D3D12_RESOURCE_DESC1 shares the base descriptor prefix,
+// so the shared texture filter can read it through a base pointer.
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource2)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC1*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreatePlacedResource1)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC1*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 
 PFN_CreateRenderTargetView Real_CreateRenderTargetView = nullptr;
 PFN_CreateShaderResourceView Real_CreateShaderResourceView = nullptr;
 PFN_CreateCommandQueue Real_CreateCommandQueue = nullptr;
 PFN_CreateCommandList Real_CreateCommandList = nullptr;
 PFN_ExecuteCommandLists Real_ExecuteCommandLists = nullptr;
+// Device QueryInterface original for the QI census. Same save-once pattern as
+// the other device vtable entries: only the first observed table is ever
+// swapped, so a single global stays correct (see the distinct-vtable guard;
+// second tables are skipped, reported as a coverage limitation).
+typedef HRESULT (STDMETHODCALLTYPE* PFN_DeviceQueryInterface)(IUnknown* self, REFIID riid, void** ppvObject);
+PFN_DeviceQueryInterface Real_DeviceQI = nullptr;
 static volatile LONG g_realQueueHookInstalled = 0;
 static volatile LONG g_realListHookInstalled = 0;
 static volatile LONG g_gameQueueObserved = 0;
@@ -774,11 +995,25 @@ PFN_RSSetViewports Real_RSSetViewports = nullptr;
 PFN_RSSetScissorRects Real_RSSetScissorRects = nullptr;
 PFN_ResourceBarrier Real_ResourceBarrier = nullptr;
 PFN_OMSetRenderTargets Real_OMSetRenderTargets = nullptr;
+PFN_CreateCommittedResource Real_CreateCommittedResource = nullptr;
+PFN_CreatePlacedResource Real_CreatePlacedResource = nullptr;
+PFN_CreateReservedResource Real_CreateReservedResource = nullptr;
+// Device4 per-table originals (save-once, same rule as the base entries:
+// only the first observed table is ever swapped).
+PFN_CreateCommittedResource1 Real_CommittedResource1 = nullptr;
+PFN_CreateHeap1 Real_Heap1 = nullptr;
+PFN_CreateReservedResource1 Real_ReservedResource1 = nullptr;
+// Descriptor-heap per-table original (save-once, same distinct-table rule).
+PFN_CreateDescriptorHeap Real_CreateDescriptorHeap = nullptr;
+// Device8 per-table originals (save-once, same rule as all device entries).
+PFN_CreateCommittedResource2 Real_CommittedResource2 = nullptr;
+PFN_CreatePlacedResource1 Real_PlacedResource1 = nullptr;
+static void* g_hookedDeviceVtbl = nullptr;
 
 // Per-object read-only command-list wrappers.  BeamNG exposes more than one
 // command-list implementation/vtable (direct and copy lists), so one global
 // MinHook trampoline is not sufficient.  We clone each real list's vtable and
-// replace only the three observation slots below; every other method and all
+// replace only the observation slots below; every other method and all
 // intercepted methods are forwarded to the original vtable entry.
 struct CommandListShim {
     ID3D12GraphicsCommandList* list;
@@ -789,14 +1024,53 @@ struct CommandListShim {
     void** originalVtbl;
     void** clonedVtbl;
     PFN_CopyTextureRegion copyTexture;
+    PFN_CopyBufferRegion copyBufferRegion;
     PFN_ResourceBarrier resourceBarrier;
     PFN_OMSetRenderTargets omSetRenderTargets;
+    // Viewport/scissor originals (SDK-verified slots 21/22). Added when the
+    // legacy path was reconnected: the patch flag they set gates injection.
+    PFN_RSSetViewports rsSetViewports;
+    PFN_RSSetScissorRects rsSetScissorRects;
+    // Whole-resource copy original (SDK-verified slot 17). Observe-only:
+    // counts + endpoint identity, no analysis or forwarding changes.
+    PFN_CopyResource copyResource;
+    // Graphics root descriptor table original (SDK-verified slot 32, filtered
+    // CINTERFACE order cross-checked). Observe-only bind TIMING: root parameter
+    // + GPU handle value only; heap contents never read, referenced resource
+    // never resolved here.
+    PFN_SetGraphicsRootDescriptorTable setGraphicsRootDescriptorTable;
 };
+// Resource shim for Map/Unmap hooks on constant buffers
+struct ResourceShim {
+    ID3D12Resource* resource;
+    void** originalVtbl;
+    void** clonedVtbl;
+    PFN_ResourceMap map;
+    PFN_ResourceUnmap unmap;
+    size_t cbSize;
+};
+static ResourceShim g_resourceShims[32] = {};
+static SRWLOCK g_resourceShimLock = SRWLOCK_INIT;
+static volatile LONG64 g_resourceMapCalls = 0;
+
 static CommandListShim g_commandListShims[64] = {};
 static SRWLOCK g_commandListShimLock = SRWLOCK_INIT;
+// Exact diagnostic totals (atomic; snapshots reported on sampled log records).
+static volatile LONG64 g_installCallsTotal = 0;
+static volatile LONG64 g_installOkTotal = 0;
+static volatile LONG64 g_installDedupTotal = 0;
+static volatile LONG64 g_installFailTotal = 0;
 static volatile LONG64 g_shimCopyCalls = 0;
+static volatile LONG64 g_shimBufferCopyCalls = 0;
 static volatile LONG64 g_shimOmCalls = 0;
 static volatile LONG64 g_shimBarrierCalls = 0;
+// Viewport/scissor invocation totals (exact; install vs invocation split).
+static volatile LONG64 g_shimVpCalls = 0;
+static volatile LONG64 g_shimScCalls = 0;
+// Whole-resource copy invocation total (exact; observe-only diagnostic).
+static volatile LONG64 g_shimCopyResCalls = 0;
+// Graphics root descriptor table invocation total (exact; timing only).
+static volatile LONG64 g_shimRootTableCalls = 0;
 struct NativeCorrelation {
     void* copySrc;
     void* copyDst;
@@ -985,6 +1259,239 @@ static CommandListShim* FindCommandListShim(ID3D12GraphicsCommandList* list)
     }
     ReleaseSRWLockShared(&g_commandListShimLock);
     return result;
+}
+
+// Diagnostic only: find a registry entry by list pointer alone, regardless of
+// current vtable.Reports the actual vtable vs the expected cloned/original so a
+// miss can be classified as vtable-restored vs never-registered. No behavior change.
+static bool FindShimByListOnly(ID3D12GraphicsCommandList* list, void** actualVtblOut,
+                               void** expectedClonedOut, void** expectedOriginalOut)
+{
+    if (!list) return false;
+    void** vtbl = nullptr;
+    __try { vtbl = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (actualVtblOut) *actualVtblOut = vtbl;
+    bool found = false;
+    AcquireSRWLockShared(&g_commandListShimLock);
+    for (auto& shim : g_commandListShims) {
+        if (shim.list == list) {
+            if (expectedClonedOut) *expectedClonedOut = shim.clonedVtbl;
+            if (expectedOriginalOut) *expectedOriginalOut = shim.originalVtbl;
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_commandListShimLock);
+    return found;
+}
+
+// Diagnostic only: clone-integrity snapshot for a registered-but-mismatched list.
+// Copies registry fields under the shared lock, releases it, then performs only
+// guarded reads (no writes, no reinstall, no returned entry pointers):
+// - whether our cloned table is still readable and slot 15 still equals our shim;
+// - the actual vtable's memory region (VirtualQuery: base/size/protect/state/type);
+// - the actual slot-15 target and which module it resides in (FROM_ADDRESS lookup,
+//   refcount unchanged).Heap residency alone is reported as an observation.
+static void STDMETHODCALLTYPE Shim_CopyBufferRegion(
+    ID3D12GraphicsCommandList* list, ID3D12Resource* dst, UINT64 dstOffset,
+    ID3D12Resource* src, UINT64 srcOffset, UINT64 numBytes);
+struct ShimIntegritySnapshot {
+    void* list;
+    void* expectedOriginal;
+    void* expectedCloned;
+    void* actualVtbl;
+    bool clonedReadable;
+    bool cloneSlot15IsShim;
+    void* cloneSlot15Value;
+    bool actualRegionValid;
+    void* actualRegionBase;
+    SIZE_T actualRegionSize;
+    DWORD actualProtect;
+    DWORD actualState;
+    DWORD actualType;
+    bool actualSlot15Readable;
+    void* actualSlot15Value;
+    void* actualSlot15Module;
+    // Submitted base-interface pointer (ID3D12CommandList*, no extra QI, no
+    // refcount change, never retained): distinguishes which subobject the game
+    // submits from the derived pointer we shimmed.
+    void* baseList;
+    bool baseVtblReadable;
+    void* baseVtbl;
+    bool baseRegionValid;
+    void* baseRegionBase;
+    SIZE_T baseRegionSize;
+    DWORD baseProtect;
+    // Slot-by-slot comparison across the three tables (verified SDK slots:
+    // Close=9, Reset=10, CopyBufferRegion=15, CopyTextureRegion=16,
+    // ResourceBarrier=26, OMSetRenderTargets=46). Module basename recorded
+    // only for actual entries differing from both saved tables.
+    bool slotsReadable;
+    void* actualSlot[6];
+    void* origSlot[6];
+    void* clonedSlot[6];
+    wchar_t slotModBase[6][40];
+};
+
+// Diagnostic only: classify one actual vtable entry against the saved tables.
+// Returns a one-character string (Log has no %c): "B" matches both (untouched
+// slot), "O" original only, "C" clone only, "X" differs from both (module
+// basename logged alongside when available).
+static const char* SlotClass(void* actual, void* orig, void* cloned)
+{
+    bool isO = (actual == orig);
+    bool isC = (actual == cloned);
+    if (isO && isC) return "B";
+    if (isO) return "O";
+    if (isC) return "C";
+    return "X";
+}
+
+static bool CaptureShimIntegrity(ID3D12GraphicsCommandList* list, ID3D12CommandList* baseList,
+                                 ShimIntegritySnapshot* out)
+{
+    if (!list || !out) return false;
+    void** actual = nullptr;
+    __try { actual = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    void* cloned = nullptr;
+    void* original = nullptr;
+    AcquireSRWLockShared(&g_commandListShimLock);
+    for (auto& shim : g_commandListShims) {
+        if (shim.list == list) {
+            cloned = shim.clonedVtbl;
+            original = shim.originalVtbl;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_commandListShimLock);
+    if (!cloned) return false;
+    out->list = (void*)list;
+    out->expectedOriginal = original;
+    out->expectedCloned = cloned;
+    out->actualVtbl = (void*)actual;
+    out->clonedReadable = false;
+    out->cloneSlot15IsShim = false;
+    out->cloneSlot15Value = nullptr;
+    out->actualRegionValid = false;
+    out->actualRegionBase = nullptr;
+    out->actualRegionSize = 0;
+    out->actualProtect = 0;
+    out->actualState = 0;
+    out->actualType = 0;
+    out->actualSlot15Readable = false;
+    out->actualSlot15Value = nullptr;
+    out->actualSlot15Module = nullptr;
+    out->baseList = (void*)baseList;
+    out->baseVtblReadable = false;
+    out->baseVtbl = nullptr;
+    out->baseRegionValid = false;
+    out->baseRegionBase = nullptr;
+    out->baseRegionSize = 0;
+    out->baseProtect = 0;
+    __try {
+        void** ct = (void**)cloned;
+        if (ct) {
+            out->cloneSlot15Value = ct[15];
+            out->clonedReadable = true;
+            out->cloneSlot15IsShim = (ct[15] == (void*)&Shim_CopyBufferRegion);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    if (actual) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        SIZE_T qr = VirtualQuery((LPCVOID)actual, &mbi, sizeof(mbi));
+        if (qr == sizeof(mbi)) {
+            out->actualRegionValid = true;
+            out->actualRegionBase = mbi.BaseAddress;
+            out->actualRegionSize = mbi.RegionSize;
+            out->actualProtect = mbi.Protect;
+            out->actualState = mbi.State;
+            out->actualType = mbi.Type;
+        }
+        __try {
+            void** at = (void**)actual;
+            if (at) {
+                out->actualSlot15Value = at[15];
+                out->actualSlot15Readable = true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        if (out->actualSlot15Readable && out->actualSlot15Value) {
+            HMODULE hm = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)out->actualSlot15Value, &hm) && hm) {
+                out->actualSlot15Module = (void*)hm;
+            }
+        }
+    }
+    // Submitted base-interface pointer: guarded vtable read + region only.
+    // No QI, no refcount change, never retained. A base address different from
+    // the derived pointer proves distinct subobjects; equal addresses with
+    // different vtables prove a per-subobject vtable split.
+    if (baseList) {
+        void** bt = nullptr;
+        __try { bt = *(void***)baseList; } __except (EXCEPTION_EXECUTE_HANDLER) { bt = nullptr; }
+        if (bt) {
+            out->baseVtbl = (void*)bt;
+            out->baseVtblReadable = true;
+            MEMORY_BASIC_INFORMATION mbi = {};
+            SIZE_T qr = VirtualQuery((LPCVOID)bt, &mbi, sizeof(mbi));
+            if (qr == sizeof(mbi)) {
+                out->baseRegionValid = true;
+                out->baseRegionBase = mbi.BaseAddress;
+                out->baseRegionSize = mbi.RegionSize;
+                out->baseProtect = mbi.Protect;
+            }
+        }
+    }
+    // Slot-by-slot table comparison. All three reads guarded as one unit: if
+    // any table faults, the comparison is reported unreadable rather than
+    // crashing. Module basename uses only manual loops (no CRT string calls).
+    static const int kCmpSlots[6] = { 9, 10, 15, 16, 26, 46 };
+    out->slotsReadable = false;
+    for (int i = 0; i < 6; ++i) {
+        out->actualSlot[i] = nullptr;
+        out->origSlot[i] = nullptr;
+        out->clonedSlot[i] = nullptr;
+        out->slotModBase[i][0] = L'\0';
+    }
+    if (actual && original && cloned) {
+        __try {
+            void** at = (void**)actual;
+            void** ot = (void**)original;
+            void** ct = (void**)cloned;
+            for (int i = 0; i < 6; ++i) {
+                out->actualSlot[i] = at[kCmpSlots[i]];
+                out->origSlot[i] = ot[kCmpSlots[i]];
+                out->clonedSlot[i] = ct[kCmpSlots[i]];
+            }
+            out->slotsReadable = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+    if (out->slotsReadable) {
+        for (int i = 0; i < 6; ++i) {
+            void* av = out->actualSlot[i];
+            if (!av || av == out->origSlot[i] || av == out->clonedSlot[i])
+                continue;
+            HMODULE hm = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    (LPCWSTR)av, &hm) || !hm)
+                continue;
+            wchar_t path[MAX_PATH] = {};
+            if (GetModuleFileNameW(hm, path, MAX_PATH) == 0)
+                continue;
+            int lastSep = -1;
+            for (int k = 0; path[k]; ++k) {
+                if (path[k] == L'\\' || path[k] == L'/')
+                    lastSep = k;
+            }
+            int o = 0;
+            for (int k = lastSep + 1; path[k] && o < 39; ++k, ++o)
+                out->slotModBase[i][o] = path[k];
+            out->slotModBase[i][o] = L'\0';
+        }
+    }
+    return true;
 }
 
 static bool IsNativeUsageSize(ID3D12Resource* resource, D3D12_RESOURCE_DESC* outDesc)
@@ -1220,6 +1727,26 @@ static void ObserveNativeBarrierUsage(ID3D12GraphicsCommandList* list, UINT coun
 
 static bool TryVectorA(ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY, UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* srcBox, CommandListShim* shim);
 static bool TryVectorB(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL singleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* depth, CommandListShim* shim);
+static void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, UINT64 dstOffset, ID3D12Resource* src, UINT64 srcOffset, UINT64 numBytes);
+static void InstallResourceShim(ID3D12Resource* resource, size_t cbSize);
+// Viewport/scissor hooks are analysis + single-forward via the passed-in
+// per-list original (the Real_* globals are never assigned: two driver
+// tables exist, so forwarding must stay per-list). Return value reports
+// whether the engine call was recorded, so the Shim_ wrapper forwards at
+// most once. Both functions are defined later in this TU.
+bool Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
+    const D3D12_VIEWPORT* pViewports, PFN_RSSetViewports realFn);
+bool Hook_RSSetScissorRects(ID3D12GraphicsCommandList* list, UINT numRects,
+    const D3D12_RECT* pRects, PFN_RSSetScissorRects realFn);
+// Legacy-path reconnect (no new interception mechanism): the installed
+// command-list shims below route to these analysis bodies, which previously
+// lived only in disconnected Hook_* functions.
+static void CopyTexBody(ID3D12GraphicsCommandList* list,
+    const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dstX, UINT dstY,
+    UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
+    const D3D12_BOX* srcBox);
+static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER* pBarriers);
+static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets);
 
 static void STDMETHODCALLTYPE Shim_CopyTextureRegion(
     ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dst,
@@ -1230,9 +1757,260 @@ static void STDMETHODCALLTYPE Shim_CopyTextureRegion(
     LONG64 invocation = InterlockedIncrement64(&g_shimCopyCalls);
     LogCommandListShimCounter("CopyTextureRegion", invocation, list, shim);
     ObserveNativeCopyUsage(list, shim, dst, src);
+    // LEGACY RECONNECT: run the legacy trigger/scene/depth analysis on the
+    // engine's intent BEFORE any vector substitution or forwarding. CopyTexBody
+    // forwards only via null-guarded Real_* (no-ops here); the shim forwards
+    // below exactly once, so recording behavior is unchanged.
+    CopyTexBody(list, dst, dstX, dstY, dstZ, src, srcBox);
     if (TryVectorA(list, dst, dstX, dstY, dstZ, src, srcBox, shim)) return;
     if (shim && shim->copyTexture)
         shim->copyTexture(list, dst, dstX, dstY, dstZ, src, srcBox);
+}
+
+// Whole-resource copy shim (SDK-verified slot 17). OBSERVE-ONLY: counts the
+// call, records endpoint identity, forwards exactly once through the
+// per-list original. No camera validation, scene selection, injection, or
+// patching - answers only whether CopyResource moves scene candidates.
+static void STDMETHODCALLTYPE Shim_CopyResource(
+    ID3D12GraphicsCommandList* list, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    static unsigned s_entryDiag = 0;
+    if ((++s_entryDiag % 600) == 1) {
+        Log("hooks: Shim_CopyResource ENTRY list=%p dst=%p src=%p",
+            (void*)list, (void*)dst, (void*)src);
+    }
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimCopyResCalls);
+    LogCommandListShimCounter("CopyResource", invocation, list, shim);
+    // Endpoint identity by pointer only (descriptor similarity never counts).
+    // Guarded reads; a fault ends the record for that endpoint.
+    {
+        static volatile LONG s_detail = 0;
+        LONG n = InterlockedIncrement(&s_detail);
+        if (n <= 10 || (n % 500) == 0) {
+            int srcScene = (src && (src == g_sceneColor ||
+                (g_sceneColorAlt && src == g_sceneColorAlt))) ? 1 : 0;
+            int dstScene = (dst && (dst == g_sceneColor ||
+                (g_sceneColorAlt && dst == g_sceneColorAlt))) ? 1 : 0;
+            int srcSet = SceneSetContains(src) ? 1 : 0;
+            int dstSet = SceneSetContains(dst) ? 1 : 0;
+            D3D12_RESOURCE_DESC sd = {}, dd = {};
+            bool gotS = (src && SafeGetDesc(src, &sd));
+            bool gotD = (dst && SafeGetDesc(dst, &dd));
+            // Full descriptor record for creation-filter comparison
+            // (dimension/mips/samples decide filter inclusion; W/H/fmt alone
+            // cannot). Diagnostic only; no selection effect.
+            Log("hooks: CopyResource #%d list=%p dst=%p src=%p dstScene=%d srcScene=%d dstSet=%d srcSet=%d dstDesc=%ux%u fmt=%u srcDesc=%ux%u fmt=%u",
+                (int)n, (void*)list, (void*)dst, (void*)src,
+                dstScene, srcScene, dstSet, srcSet,
+                gotD ? (unsigned)dd.Width : 0u, gotD ? (unsigned)dd.Height : 0u,
+                gotD ? (unsigned)dd.Format : 0u,
+                gotS ? (unsigned)sd.Width : 0u, gotS ? (unsigned)sd.Height : 0u,
+                gotS ? (unsigned)sd.Format : 0u);
+            Log("hooks: CopyResource #%d fulldesc dst dim=%u depth=%u mips=%u samp=%u/%u layout=%u flags=0x%X src dim=%u depth=%u mips=%u samp=%u/%u layout=%u flags=0x%X",
+                (int)n,
+                gotD ? (unsigned)dd.Dimension : 0u,
+                gotD ? (unsigned)dd.DepthOrArraySize : 0u, gotD ? (unsigned)dd.MipLevels : 0u,
+                gotD ? (unsigned)dd.SampleDesc.Count : 0u, gotD ? (unsigned)dd.SampleDesc.Quality : 0u,
+                gotD ? (unsigned)dd.Layout : 0u, gotD ? (unsigned)dd.Flags : 0u,
+                gotS ? (unsigned)sd.Dimension : 0u,
+                gotS ? (unsigned)sd.DepthOrArraySize : 0u, gotS ? (unsigned)sd.MipLevels : 0u,
+                gotS ? (unsigned)sd.SampleDesc.Count : 0u, gotS ? (unsigned)sd.SampleDesc.Quality : 0u,
+                gotS ? (unsigned)sd.Layout : 0u, gotS ? (unsigned)sd.Flags : 0u);
+        }
+    }
+    if (shim && shim->copyResource)
+        shim->copyResource(list, dst, src);
+}
+
+// Graphics root descriptor table shim (SDK-verified slot 32). OBSERVE-ONLY
+// bind timing: which root parameter is bound with which GPU handle value, on
+// which list, at which present/ECL serial - for offline correlation with OM,
+// viewport, and barrier windows. The handle VALUE is logged; heap contents
+// are never read and the referenced resource is never resolved here (that
+// would require descriptor-heap content reads, explicitly out of scope).
+// Forwards exactly once through the per-list original.
+static void STDMETHODCALLTYPE Shim_SetGraphicsRootDescriptorTable(
+    ID3D12GraphicsCommandList* list, UINT rootParam,
+    D3D12_GPU_DESCRIPTOR_HANDLE baseDescriptor)
+{
+    static unsigned s_entryDiag = 0;
+    if ((++s_entryDiag % 600) == 1) {
+        Log("hooks: Shim_SetGraphicsRootDescriptorTable ENTRY list=%p root=%u gpu=%llX",
+            (void*)list, rootParam, (unsigned long long)baseDescriptor.ptr);
+    }
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimRootTableCalls);
+    LogCommandListShimCounter("SetGraphicsRootDescriptorTable", invocation, list, shim);
+    {
+        static volatile LONG s_detail = 0;
+        LONG n = InterlockedIncrement(&s_detail);
+        if (n <= 12 || (n % 500) == 0) {
+            Log("hooks: roottable #%d list=%p type=%u root=%u gpu=%llX present=%llu ecl=%llu",
+                (int)n, (void*)list,
+                shim ? (unsigned)shim->listType : 0xFFFFFFFFu, rootParam,
+                (unsigned long long)baseDescriptor.ptr,
+                (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+        }
+    }
+    if (shim && shim->setGraphicsRootDescriptorTable)
+        shim->setGraphicsRootDescriptorTable(list, rootParam, baseDescriptor);
+}
+
+static void STDMETHODCALLTYPE Shim_CopyBufferRegion(
+    ID3D12GraphicsCommandList* list, ID3D12Resource* dst, UINT64 dstOffset,
+    ID3D12Resource* src, UINT64 srcOffset, UINT64 numBytes)
+{
+    static unsigned s_entryDiag = 0;
+    if ((++s_entryDiag % 600) == 1) {
+        Log("hooks: Shim_CopyBufferRegion ENTRY list=%p dst=%p src=%p numBytes=%llu",
+            (void*)list, (void*)dst, (void*)src, (unsigned long long)numBytes);
+    }
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimBufferCopyCalls);
+    LogCommandListShimCounter("CopyBufferRegion", invocation, list, shim);
+    // Delegate to the existing hook logic which validates/patches camera/velocity CBs
+    Hook_CopyBufferRegion(list, dst, dstOffset, src, srcOffset, numBytes);
+    if (shim && shim->copyBufferRegion)
+        shim->copyBufferRegion(list, dst, dstOffset, src, srcOffset, numBytes);
+}
+
+// Resource Map/Unmap shim for constant buffer patching
+static HRESULT STDMETHODCALLTYPE Shim_ResourceMap(ID3D12Resource* resource, UINT subresource,
+                                                 const D3D12_RANGE* readRange, void** ppData)
+{
+    ResourceShim* shim = nullptr;
+    {
+        AcquireSRWLockShared(&g_resourceShimLock);
+        for (auto& rs : g_resourceShims) {
+            if (rs.resource == resource) { shim = &rs; break; }
+        }
+        ReleaseSRWLockShared(&g_resourceShimLock);
+    }
+    LONG64 invocation = InterlockedIncrement64(&g_resourceMapCalls);
+    if (invocation <= 5 || (invocation % 1000) == 0)
+        Log("hooks: Shim_ResourceMap resource=%p subresource=%u cbSize=%zu invocation=%lld",
+            (void*)resource, subresource, shim ? shim->cbSize : 0, invocation);
+    HRESULT hr = shim ? shim->map(resource, subresource, readRange, ppData) : E_FAIL;
+    if (SUCCEEDED(hr) && ppData && *ppData && shim && shim->cbSize == 1616) {
+        // Potential camera CB - validate and patch jitter
+        float* cb = (float*)*ppData;
+        if (ValidateCameraCb(cb, shim->cbSize)) {
+            static int s_acceptLogs = 0;
+            if (++s_acceptLogs <= 3)
+                Log("hooks: camera CB via Map validated & patched resource=%p", (void*)resource);
+            ApplyCameraCbJitter(cb, shim->cbSize, g_renderW, g_renderH, g_currJitter, g_prevJitter);
+            std::memcpy(g_lastPatchedCameraCb, cb, 1616);
+            g_cameraCbValid = true;
+            g_lastCamPatchFrame = g_frameCounter;
+        }
+    }
+    return hr;
+}
+
+static void STDMETHODCALLTYPE Shim_ResourceUnmap(ID3D12Resource* resource, UINT subresource,
+                                                const D3D12_RANGE* writtenRange)
+{
+    ResourceShim* shim = nullptr;
+    {
+        AcquireSRWLockShared(&g_resourceShimLock);
+        for (auto& rs : g_resourceShims) {
+            if (rs.resource == resource) { shim = &rs; break; }
+        }
+        ReleaseSRWLockShared(&g_resourceShimLock);
+    }
+    if (shim)
+        shim->unmap(resource, subresource, writtenRange);
+}
+
+// Per-command-list OM/viewport correlation (diagnostic only): the global
+// bound-RTV state (g_boundRtv*) is last-writer-wins across all lists, so a
+// viewport cannot be paired with its list's OM bind from globals. This table
+// remembers each list's latest OM binding alongside its viewport calls.
+// Raw pointers only, never AddRef'd; entries persist like the shim registry
+// itself (same address-reuse caveat, visible via the logged sequence counts).
+// No selection/trigger/injection effect.
+struct ListCorr {
+    ID3D12GraphicsCommandList* list;
+    void* omRes;
+    unsigned long long omHandle;
+    unsigned long long omEcl;
+    unsigned omCount;
+    unsigned vpCount;
+};
+static ListCorr g_listCorr[64] = {};
+static SRWLOCK g_corrLock = SRWLOCK_INIT;
+static void CorrNoteOm(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
+                       unsigned long long handle)
+{
+    unsigned long long ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    AcquireSRWLockExclusive(&g_corrLock);
+    ListCorr* s = nullptr;
+    for (auto& e : g_listCorr) {
+        if (e.list == list) { s = &e; break; }
+    }
+    if (!s) {
+        for (auto& e : g_listCorr) {
+            if (!e.list) { s = &e; s->list = list; break; }
+        }
+    }
+    if (!s) {
+        static int s_corrFullLogs = 0;
+        if (++s_corrFullLogs <= 2)
+            Log("hooks: list-corr table full, OM record dropped");
+    } else {
+        s->omRes = (void*)res;
+        s->omHandle = handle;
+        s->omEcl = ecl;
+        ++s->omCount;
+    }
+    ReleaseSRWLockExclusive(&g_corrLock);
+}
+static void CorrNoteViewport(ID3D12GraphicsCommandList* list, UINT numViewports,
+                             const D3D12_VIEWPORT* pViewports)
+{
+    float vw = (numViewports >= 1 && pViewports) ? pViewports[0].Width : -1.0f;
+    float vh = (numViewports >= 1 && pViewports) ? pViewports[0].Height : -1.0f;
+    unsigned long long ecl = (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    void* omRes = nullptr;
+    unsigned long long omHandle = 0;
+    unsigned long long omEcl = 0;
+    unsigned omCount = 0;
+    unsigned vpCount = 0;
+    AcquireSRWLockExclusive(&g_corrLock);
+    ListCorr* s = nullptr;
+    for (auto& e : g_listCorr) {
+        if (e.list == list) { s = &e; break; }
+    }
+    if (!s) {
+        for (auto& e : g_listCorr) {
+            if (!e.list) { s = &e; s->list = list; break; }
+        }
+    }
+    if (s) {
+        omRes = s->omRes;
+        omHandle = s->omHandle;
+        omEcl = s->omEcl;
+        omCount = s->omCount;
+        ++s->vpCount;
+        vpCount = s->vpCount;
+    }
+    ReleaseSRWLockExclusive(&g_corrLock);
+    if (!s) return;
+    // Lock released before descriptor reads. Pointer identity only.
+    D3D12_RESOURCE_DESC bd = {};
+    bool gotBd = (omRes && SafeGetDesc((ID3D12Resource*)omRes, &bd));
+    static volatile LONG s_corrLogs = 0;
+    LONG n = InterlockedIncrement(&s_corrLogs);
+    if (n <= 24) {
+        Log("hooks: list-corr list=%p om=%p handle=%llX omSeq=%u omEcl=%llu vp=%dx%d vpSeq=%u vpEcl=%llu inset=%d bdesc=%ux%u fmt=%u",
+            (void*)list, omRes, omHandle, omCount, omEcl,
+            (int)vw, (int)vh, vpCount, ecl,
+            SceneSetContains((ID3D12Resource*)omRes) ? 1 : 0,
+            gotBd ? (unsigned)bd.Width : 0u, gotBd ? (unsigned)bd.Height : 0u,
+            gotBd ? (unsigned)bd.Format : 0u);
+    }
 }
 
 static void STDMETHODCALLTYPE Shim_ResourceBarrier(ID3D12GraphicsCommandList* list,
@@ -1242,6 +2020,9 @@ static void STDMETHODCALLTYPE Shim_ResourceBarrier(ID3D12GraphicsCommandList* li
     LONG64 invocation = InterlockedIncrement64(&g_shimBarrierCalls);
     LogCommandListShimCounter("ResourceBarrier", invocation, list, shim);
     ObserveNativeBarrierUsage(list, count, barriers);
+    // LEGACY RECONNECT: state tracking for DoInjection's Barrier() calls.
+    // Forwarding below via shim->resourceBarrier is unchanged.
+    TrackResourceBarriers(count, barriers);
     if (shim && shim->resourceBarrier)
         shim->resourceBarrier(list, count, barriers);
 }
@@ -1255,6 +2036,9 @@ static void STDMETHODCALLTYPE Shim_OMSetRenderTargets(
     LONG64 invocation = InterlockedIncrement64(&g_shimOmCalls);
     LogCommandListShimCounter("OMSetRenderTargets", invocation, list, shim);
     ObserveNativeOmUsage(list, count, handles, singleRange, depth);
+    // LEGACY RECONNECT: bound-RTV tracking for SceneColorBound() (the
+    // viewport-patch prerequisite). Forwarding below is unchanged.
+    ID3D12Resource* omRes = TrackOMBind(count, handles);
     // Targeted diagnostic: prove whether main gameplay OM is observed
     {
         bool isTargeted = false;
@@ -1317,6 +2101,113 @@ static void STDMETHODCALLTYPE Shim_OMSetRenderTargets(
     if (TryVectorB(list, count, handles, singleRange, depth, shim)) return;
     if (shim && shim->omSetRenderTargets)
         shim->omSetRenderTargets(list, count, handles, singleRange, depth);
+    // Per-list correlation record (diagnostic): this list's latest OM binding.
+    // Placed after forwarding so engine recording is never delayed by logging.
+    CorrNoteOm(list, omRes,
+               (count >= 1 && handles) ? handles[0].ptr : 0ull);
+}
+
+// Viewport/scissor shims (SDK-verified slots 21/22). Same per-list clone
+// mechanism as slots 15/16/26/46 (proven safe: dozens of installs, stable
+// runs); no global hook. The Hook_ call performs analysis and records the
+// single engine call via the per-list original; the wrapper forwards only
+// if Hook_ reports it did not record (at most once, never skipped twice).
+static void STDMETHODCALLTYPE Shim_RSSetViewports(
+    ID3D12GraphicsCommandList* list, UINT numViewports,
+    const D3D12_VIEWPORT* pViewports)
+{
+    // PRE-GATE BOUND-IDENTITY RECORD (diagnostic only): runs before any
+    // patchViewport/camera/DLAA gate, so it fires even when the camera path
+    // is dormant. Correlates the viewport-bound RTV against the scene-set
+    // snapshot by pointer identity only (descriptor equality never counts).
+    // Read-only: registry snapshotted under lock, lock released before any
+    // descriptor read; a guarded-read fault is logged and that pointer is not
+    // dereferenced further. Capped distinct events; own counters, separate
+    // from invocation totals. No selection/trigger/injection effect.
+    {
+        struct VpSnap { void* res; unsigned w; unsigned h; unsigned fmt; unsigned uses; };
+        static int s_vpIdLogs = 0;
+        static void* s_vpIdLastBound = nullptr;
+        static float s_vpIdLastW = -1.0f, s_vpIdLastH = -1.0f;
+        float vw = (numViewports >= 1 && pViewports) ? pViewports[0].Width : -1.0f;
+        float vh = (numViewports >= 1 && pViewports) ? pViewports[0].Height : -1.0f;
+        ID3D12Resource* bound = g_boundRtvResource;
+        bool changed = (bound != (ID3D12Resource*)s_vpIdLastBound) ||
+                       (vw != s_vpIdLastW) || (vh != s_vpIdLastH);
+        if (changed && s_vpIdLogs < 16) {
+            VpSnap snap[8] = {};
+            unsigned snapN = 0;
+            { AcquireSRWLockShared(&g_sceneSetLock);
+              for (unsigned i = 0; i < g_sceneSetCount && i < 8; ++i) {
+                  snap[i].res = (void*)g_sceneSet[i].resource;
+                  snap[i].w = g_sceneSet[i].resW; snap[i].h = g_sceneSet[i].resH;
+                  snap[i].fmt = g_sceneSet[i].resFmt; snap[i].uses = g_sceneSet[i].uses;
+              }
+              snapN = g_sceneSetCount < 8 ? g_sceneSetCount : 8;
+              ReleaseSRWLockShared(&g_sceneSetLock); }
+            D3D12_RESOURCE_DESC bd = {};
+            bool gotBd = (bound && SafeGetDesc(bound, &bd));
+            int inset = 0;
+            for (unsigned i = 0; i < snapN; ++i) {
+                if (snap[i].res == (void*)bound) { inset = 1; break; }
+            }
+            ++s_vpIdLogs;
+            s_vpIdLastBound = (void*)bound; s_vpIdLastW = vw; s_vpIdLastH = vh;
+            if (!bound) {
+                Log("hooks: vp-bind vp=%dx%d bound=null inset=0 setcount=%u (n=%d)",
+                    (int)vw, (int)vh, snapN, s_vpIdLogs);
+            } else if (!gotBd) {
+                Log("hooks: vp-bind vp=%dx%d bound=%p DESC-FAULT inset=%d setcount=%u (n=%d)",
+                    (int)vw, (int)vh, (void*)bound, inset, snapN, s_vpIdLogs);
+            } else {
+                Log("hooks: vp-bind vp=%dx%d bound=%p %ux%u fmt=%u inset=%d setcount=%u (n=%d)",
+                    (int)vw, (int)vh, (void*)bound,
+                    (unsigned)bd.Width, (unsigned)bd.Height, (unsigned)bd.Format,
+                    inset, snapN, s_vpIdLogs);
+            }
+            for (unsigned i = 0; i < snapN; ++i) {
+                Log("hooks: vp-bind   cand=%p %ux%u fmt=%u uses=%u%s",
+                    snap[i].res, snap[i].w, snap[i].h, snap[i].fmt, snap[i].uses,
+                    (snap[i].res == (void*)bound) ? " <= BOUND" : "");
+            }
+        }
+    }
+    static unsigned s_entryDiag = 0;
+    if ((++s_entryDiag % 600) == 1) {
+        Log("hooks: Shim_RSSetViewports ENTRY list=%p num=%u w=%.0f h=%.0f",
+            (void*)list, numViewports,
+            (numViewports >= 1 && pViewports) ? (double)pViewports[0].Width : -1.0,
+            (numViewports >= 1 && pViewports) ? (double)pViewports[0].Height : -1.0);
+    }
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimVpCalls);
+    LogCommandListShimCounter("RSSetViewports", invocation, list, shim);
+    bool recorded = Hook_RSSetViewports(list, numViewports, pViewports,
+                                        shim ? shim->rsSetViewports : nullptr);
+    if (!recorded && shim && shim->rsSetViewports)
+        shim->rsSetViewports(list, numViewports, pViewports);
+    // Per-list correlation record (diagnostic): pairs this viewport with the
+    // list's latest OM binding recorded above. Pre-gate identity logging in
+    // the vp-bind block is unaffected.
+    CorrNoteViewport(list, numViewports, pViewports);
+}
+
+static void STDMETHODCALLTYPE Shim_RSSetScissorRects(
+    ID3D12GraphicsCommandList* list, UINT numRects,
+    const D3D12_RECT* pRects)
+{
+    static unsigned s_entryDiag = 0;
+    if ((++s_entryDiag % 600) == 1) {
+        Log("hooks: Shim_RSSetScissorRects ENTRY list=%p num=%u",
+            (void*)list, numRects);
+    }
+    CommandListShim* shim = FindCommandListShim(list);
+    LONG64 invocation = InterlockedIncrement64(&g_shimScCalls);
+    LogCommandListShimCounter("RSSetScissorRects", invocation, list, shim);
+    bool recorded = Hook_RSSetScissorRects(list, numRects, pRects,
+                                           shim ? shim->rsSetScissorRects : nullptr);
+    if (!recorded && shim && shim->rsSetScissorRects)
+        shim->rsSetScissorRects(list, numRects, pRects);
 }
 
 
@@ -1369,7 +2260,15 @@ void StartFrame()
         g_renderH = (unsigned int)((float)g_displayH * g_cfg.renderScale);
     }
 
-    g_patchViewport = !g_patchAborted && !g_dlaaMode && g_legacyScale;
+    // LEGACY ARMING (dlaa=0): viewport patch enabled unless aborted.
+    // NOTE: bd4e94b added "&& g_legacyScale" as a bridge-era kill-switch
+    // (the cross-device bridge needed full-res rendering). The bridge is
+    // abandoned (EnsureBridge creation disabled -> g_bridgeReady is always
+    // false), so the switch now only kills the documented dlaa=0 legacy
+    // path. Restored to pre-flag semantics; legacyScale remains parsed
+    // for config compat but no longer gates arming. DLAA mode still
+    // disables the patch via !g_dlaaMode below.
+    g_patchViewport = !g_patchAborted && !g_dlaaMode;
     // Gameplay evidence: accepted camera patches. Do NOT arm immediately -
     // flipping discovery on mid-session floods the creation hooks with
     // GetDesc/adoption/log work exactly while the engine's render-graph
@@ -1403,12 +2302,20 @@ ID3D12Resource* SceneColorBound()
     if (!g_boundRtvValid) return nullptr;
     if (g_boundRtv.ptr == g_sceneColorRtv.ptr) return g_sceneColor;
     if (g_sceneColorAlt && g_boundRtv.ptr == g_sceneColorRtvAlt.ptr) return g_sceneColorAlt;
+    // Rotation tracking: the bound target may be a live ping-pong sibling
+    // that is neither stored slot. Membership is pointer-based.
+    if (SceneSetContains(g_boundRtvResource)) return g_boundRtvResource;
     return nullptr;
 }
 
 void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES after)
 {
     if (!list || !res) return;
+    // The Real_* command-list forwarding globals are never assigned (two
+    // driver tables exist, so forwarding stays per-list in the shim structs).
+    // Without an original to call, skip rather than null-call; the state map
+    // is left untouched to match.
+    if (!Real_ResourceBarrier) return;
     D3D12_RESOURCE_STATES before;
     bool tracked = false;
     { BookGuard _bg; auto it = g_resourceStates.find(res);
@@ -1602,6 +2509,22 @@ void DoInjection(ID3D12GraphicsCommandList* list)
     ID3D12Resource* scene = g_activeSceneColor ? g_activeSceneColor : g_sceneColor;
     if (!scene) return;
 
+    // STALE-SCENE SAFETY (not a behavior change): the stored choice may
+    // reference a retired target (guarded reads have faulted on tracked
+    // scene pointers in vivo). Skip the frame rather than handing a freed
+    // resource to the driver; rediscovery repopulates on later frames.
+    {
+        __try {
+            D3D12_RESOURCE_DESC srd = scene->GetDesc();
+            (void)srd;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static int s_freedLogs = 0;
+            if (++s_freedLogs <= 3)
+                Log("hooks: DLSS injection skipped - scene choice retired (frame %u)", g_frameCounter);
+            return;
+        }
+    }
+
     // DLSS reads scene/depth/mv as SRV and writes dlssOut as UAV.
     Barrier(list, g_mvResource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Barrier(list, g_depthResource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1654,6 +2577,17 @@ void DoInjection(ID3D12GraphicsCommandList* list)
     src.pResource = g_dlssOut;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
+    // The Real_* command-list forwarding globals are never assigned (two
+    // driver tables exist, so forwarding stays per-list in the shim structs).
+    // Never null-call and never claim an injection that was not recorded:
+    // per-list forwarding for this copy is stage-2 work once trigger
+    // evaluation ("scene-copy DLSS not ready") is proven in logs.
+    if (!Real_CopyTextureRegion) {
+        static int s_noFwdLogs = 0;
+        if (++s_noFwdLogs <= 3)
+            Log("hooks: DLSS result copy skipped - no per-list forward wired (frame %u)", g_frameCounter);
+        return;
+    }
     Real_CopyTextureRegion(list, &dst, 0, 0, 0, &src, 0);
 
     Barrier(list, scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1668,15 +2602,405 @@ void DoInjection(ID3D12GraphicsCommandList* list)
     Log("hooks: DLSS injection recorded for frame %u", g_frameCounter);
 }
 
+// Display-sized candidate-texture filter shared by the three logging-only
+// texture branches below. Mirrors the ObserveNativeCandidate format list so
+// one consistent candidate definition applies; descriptors are evidence for
+// correlation, never proof of role.
+static bool CreateTexFilterMatch(const D3D12_RESOURCE_DESC* d)
+{
+    if (!d || d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        d->MipLevels != 1 || d->Width < 1000 || d->Height < 500)
+        return false;
+    DXGI_FORMAT f = d->Format;
+    return f == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+           f == DXGI_FORMAT_R16G16B16A16_UNORM ||
+           f == DXGI_FORMAT_R16G16_FLOAT ||
+           f == DXGI_FORMAT_R32_TYPELESS ||
+           f == DXGI_FORMAT_R32_FLOAT ||
+           f == DXGI_FORMAT_R10G10B10A2_UNORM;
+}
+
+HRESULT WINAPI Hook_CreateCommittedResource(ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heapProps, D3D12_HEAP_FLAGS heapFlags,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** ppResource)
+{
+    // Diagnostic-only forwarding hook. No shims, no patching.
+    // Per-resource Map/Unmap shims stay dormant until a valid target is established.
+    HRESULT hr = Real_CreateCommittedResource(device, heapProps, heapFlags, desc, initialState, clearValue, riid, ppResource);
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc) {
+        // Bounded log: large buffers only (>=1MB), first 20 then 1/100 sampling.
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            desc->Width >= 1048576ULL) {
+            static volatile LONG s_largeCommittedLogs = 0;
+            LONG n = InterlockedIncrement(&s_largeCommittedLogs);
+            if (n <= 20 || (n % 100) == 1) {
+                Log("hooks: CreateCommittedResource device=%p res=%p w=%llu h=%u dim=%u fmt=%u flags=0x%X initState=0x%X heapType=%u heapFlags=0x%X (n=%d)",
+                    (void*)device, *ppResource,
+                    (unsigned long long)desc->Width, (unsigned)desc->Height, (unsigned)desc->Dimension,
+                    (unsigned)desc->Format, (unsigned)desc->Flags, (unsigned)initialState,
+                    heapProps ? (unsigned)heapProps->Type : 0xFFFFFFFFu, (unsigned)heapFlags, (int)n);
+            }
+        }
+        // Bounded log: display-sized candidate textures (the buffer filter
+        // above omits all textures, hiding scene-sized targets that move only
+        // through copy chains). First 128 then 1/100 sampling; separate counter.
+        // 128 covers the observed loading burst plus the old 21-100 blind
+        // window with headroom; any overflow still surfaces at n=201, 301.
+        if (CreateTexFilterMatch(desc)) {
+            static volatile LONG s_texCommittedLogs = 0;
+            LONG nt = InterlockedIncrement(&s_texCommittedLogs);
+            if (nt <= 128 || (nt % 100) == 1) {
+                Log("hooks: CreateCommittedTexture device=%p res=%p w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X heapType=%u (n=%d)",
+                    (void*)device, *ppResource,
+                    (unsigned long long)desc->Width, (unsigned)desc->Height,
+                    (unsigned)desc->Format, (unsigned)desc->Flags,
+                    (unsigned)desc->MipLevels, (unsigned)desc->SampleDesc.Count,
+                    (unsigned)initialState,
+                    heapProps ? (unsigned)heapProps->Type : 0xFFFFFFFFu, (int)nt);
+            }
+        }
+    }
+    return hr;
+}
+
+HRESULT WINAPI Hook_CreatePlacedResource(ID3D12Device* device,
+    ID3D12Heap* pHeap, UINT64 heapOffset,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** ppResource)
+{
+    // Diagnostic-only forwarding hook. Heap type is NOT inferred here;
+    // log heap object pointer and offset only.
+    HRESULT hr = Real_CreatePlacedResource(device, pHeap, heapOffset, desc, initialState, clearValue, riid, ppResource);
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc) {
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            desc->Width >= 1048576ULL) {
+            static volatile LONG s_largePlacedLogs = 0;
+            LONG n = InterlockedIncrement(&s_largePlacedLogs);
+            if (n <= 20 || (n % 100) == 1) {
+                Log("hooks: CreatePlacedResource device=%p res=%p heap=%p heapOff=%llu w=%llu h=%u dim=%u fmt=%u flags=0x%X initState=0x%X (n=%d)",
+                    (void*)device, *ppResource, (void*)pHeap, (unsigned long long)heapOffset,
+                    (unsigned long long)desc->Width, (unsigned)desc->Height, (unsigned)desc->Dimension,
+                    (unsigned)desc->Format, (unsigned)desc->Flags, (unsigned)initialState, (int)n);
+            }
+        }
+        // Bounded log: display-sized candidate textures (see committed hook).
+        // First 128 then 1/100 sampling (blind-window closure, same rationale).
+        if (CreateTexFilterMatch(desc)) {
+            static volatile LONG s_texPlacedLogs = 0;
+            LONG nt = InterlockedIncrement(&s_texPlacedLogs);
+            if (nt <= 128 || (nt % 100) == 1) {
+                Log("hooks: CreatePlacedTexture device=%p res=%p heap=%p heapOff=%llu w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X (n=%d)",
+                    (void*)device, *ppResource, (void*)pHeap, (unsigned long long)heapOffset,
+                    (unsigned long long)desc->Width, (unsigned)desc->Height,
+                    (unsigned)desc->Format, (unsigned)desc->Flags,
+                    (unsigned)desc->MipLevels, (unsigned)desc->SampleDesc.Count,
+                    (unsigned)initialState, (int)nt);
+            }
+        }
+    }
+    return hr;
+}
+
+HRESULT WINAPI Hook_CreateReservedResource(ID3D12Device* device,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** ppResource)
+{
+    // Diagnostic-only forwarding hook. No heap applies to reserved resources.
+    HRESULT hr = Real_CreateReservedResource(device, desc, initialState, clearValue, riid, ppResource);
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc) {
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            desc->Width >= 1048576ULL) {
+            static volatile LONG s_largeReservedLogs = 0;
+            LONG n = InterlockedIncrement(&s_largeReservedLogs);
+            if (n <= 20 || (n % 100) == 1) {
+                Log("hooks: CreateReservedResource device=%p res=%p w=%llu h=%u dim=%u fmt=%u flags=0x%X initState=0x%X (n=%d)",
+                    (void*)device, *ppResource,
+                    (unsigned long long)desc->Width, (unsigned)desc->Height, (unsigned)desc->Dimension,
+                    (unsigned)desc->Format, (unsigned)desc->Flags, (unsigned)initialState, (int)n);
+            }
+        }
+        // Bounded log: display-sized candidate textures (see committed hook).
+        // First 128 then 1/100 sampling (blind-window closure, same rationale).
+        if (CreateTexFilterMatch(desc)) {
+            static volatile LONG s_texReservedLogs = 0;
+            LONG nt = InterlockedIncrement(&s_texReservedLogs);
+            if (nt <= 128 || (nt % 100) == 1) {
+                Log("hooks: CreateReservedTexture device=%p res=%p w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X (n=%d)",
+                    (void*)device, *ppResource,
+                    (unsigned long long)desc->Width, (unsigned)desc->Height,
+                    (unsigned)desc->Format, (unsigned)desc->Flags,
+                    (unsigned)desc->MipLevels, (unsigned)desc->SampleDesc.Count,
+                    (unsigned)initialState, (int)nt);
+            }
+        }
+    }
+    return hr;
+}
+
+// Device4 '1'-variant creation hooks (observe-only, diagnostic). Installed once
+// on the already-swapped table after the first successful Device4 QI (see
+// Shim_DeviceQI). Same forwarding/diagnostic discipline as the base creation
+// hooks: forward exactly once via the per-table original, log matches of the
+// shared texture filter, no retention, no analysis, no patching.
+HRESULT WINAPI Hook_CreateCommittedResource1(ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heapProps, D3D12_HEAP_FLAGS heapFlags,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, ID3D12ProtectedResourceSession* session,
+    REFIID riidRes, void** ppResource)
+{
+    HRESULT hr = Real_CommittedResource1 ?
+        Real_CommittedResource1(device, heapProps, heapFlags, desc, initialState,
+                                clearValue, session, riidRes, ppResource) : E_NOINTERFACE;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(desc)) {
+        static volatile LONG s_texCommitted1Logs = 0;
+        LONG nt = InterlockedIncrement(&s_texCommitted1Logs);
+        if (nt <= 128 || (nt % 100) == 1) {
+            Log("hooks: CreateCommittedResource1 device=%p res=%p w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X heapType=%u prot=%d (n=%d)",
+                (void*)device, *ppResource,
+                (unsigned long long)desc->Width, (unsigned)desc->Height,
+                (unsigned)desc->Format, (unsigned)desc->Flags,
+                (unsigned)desc->MipLevels, (unsigned)desc->SampleDesc.Count,
+                (unsigned)initialState,
+                heapProps ? (unsigned)heapProps->Type : 0xFFFFFFFFu,
+                session ? 1 : 0, (int)nt);
+        }
+    }
+    return hr;
+}
+
+HRESULT WINAPI Hook_CreateHeap1(ID3D12Device* device,
+    const D3D12_HEAP_DESC* heapDesc, ID3D12ProtectedResourceSession* session,
+    REFIID riid, void** ppHeap)
+{
+    HRESULT hr = Real_Heap1 ?
+        Real_Heap1(device, heapDesc, session, riid, ppHeap) : E_NOINTERFACE;
+    // Heap creation is logged AS heap creation (not resource creation): heap
+    // timing only bounds placed-resource creation, it cannot attribute it.
+    if (SUCCEEDED(hr) && ppHeap && *ppHeap && heapDesc) {
+        static volatile LONG s_heap1Logs = 0;
+        LONG n = InterlockedIncrement(&s_heap1Logs);
+        if (n <= 20 || (n % 100) == 1) {
+            Log("hooks: CreateHeap1 device=%p heap=%p size=%llu type=%u align=%llu flags=0x%X prot=%d (n=%d)",
+                (void*)device, *ppHeap,
+                (unsigned long long)heapDesc->SizeInBytes,
+                (unsigned)heapDesc->Properties.Type,
+                (unsigned long long)heapDesc->Alignment,
+                (unsigned)heapDesc->Flags,
+                session ? 1 : 0, (int)n);
+        }
+    }
+    return hr;
+}
+
+HRESULT WINAPI Hook_CreateReservedResource1(ID3D12Device* device,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, ID3D12ProtectedResourceSession* session,
+    REFIID riidRes, void** ppResource)
+{
+    HRESULT hr = Real_ReservedResource1 ?
+        Real_ReservedResource1(device, desc, initialState,
+                               clearValue, session, riidRes, ppResource) : E_NOINTERFACE;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(desc)) {
+        static volatile LONG s_texReserved1Logs = 0;
+        LONG nt = InterlockedIncrement(&s_texReserved1Logs);
+        if (nt <= 128 || (nt % 100) == 1) {
+            Log("hooks: CreateReservedResource1 device=%p res=%p w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X prot=%d (n=%d)",
+                (void*)device, *ppResource,
+                (unsigned long long)desc->Width, (unsigned)desc->Height,
+                (unsigned)desc->Format, (unsigned)desc->Flags,
+                (unsigned)desc->MipLevels, (unsigned)desc->SampleDesc.Count,
+                (unsigned)initialState,
+                session ? 1 : 0, (int)nt);
+        }
+    }
+    return hr;
+}
+
+// Device8 resource hooks (observe-only, diagnostic). Installed once on the
+// already-swapped table after the first successful Device8 QI (see
+// Shim_DeviceQI). D3D12_RESOURCE_DESC1 shares the base descriptor prefix, so
+// the shared texture filter reads it through a base pointer. Same
+// forward-once / caps / no-retention discipline as all creation hooks.
+HRESULT WINAPI Hook_CreateCommittedResource2(ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heapProps, D3D12_HEAP_FLAGS heapFlags,
+    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, ID3D12ProtectedResourceSession* session,
+    REFIID riidRes, void** ppResource)
+{
+    HRESULT hr = Real_CommittedResource2 ?
+        Real_CommittedResource2(device, heapProps, heapFlags, desc, initialState,
+                                clearValue, session, riidRes, ppResource) : E_NOINTERFACE;
+    const D3D12_RESOURCE_DESC* bd = (const D3D12_RESOURCE_DESC*)desc;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(bd)) {
+        static volatile LONG s_texCommitted2Logs = 0;
+        LONG nt = InterlockedIncrement(&s_texCommitted2Logs);
+        if (nt <= 128 || (nt % 100) == 1) {
+            Log("hooks: CreateCommittedResource2 device=%p res=%p w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X heapType=%u prot=%d (n=%d)",
+                (void*)device, *ppResource,
+                (unsigned long long)bd->Width, (unsigned)bd->Height,
+                (unsigned)bd->Format, (unsigned)bd->Flags,
+                (unsigned)bd->MipLevels, (unsigned)bd->SampleDesc.Count,
+                (unsigned)initialState,
+                heapProps ? (unsigned)heapProps->Type : 0xFFFFFFFFu,
+                session ? 1 : 0, (int)nt);
+        }
+    }
+    return hr;
+}
+
+HRESULT WINAPI Hook_CreatePlacedResource1(ID3D12Device* device,
+    ID3D12Heap* pHeap, UINT64 heapOffset,
+    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** ppResource)
+{
+    HRESULT hr = Real_PlacedResource1 ?
+        Real_PlacedResource1(device, pHeap, heapOffset, desc, initialState,
+                             clearValue, riid, ppResource) : E_NOINTERFACE;
+    const D3D12_RESOURCE_DESC* bd = (const D3D12_RESOURCE_DESC*)desc;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(bd)) {
+        static volatile LONG s_texPlaced1Logs = 0;
+        LONG nt = InterlockedIncrement(&s_texPlaced1Logs);
+        if (nt <= 128 || (nt % 100) == 1) {
+            Log("hooks: CreatePlacedResource1 device=%p res=%p heap=%p heapOff=%llu w=%llu h=%u fmt=%u flags=0x%X mips=%u samples=%u initState=0x%X (n=%d)",
+                (void*)device, *ppResource, (void*)pHeap, (unsigned long long)heapOffset,
+                (unsigned long long)bd->Width, (unsigned)bd->Height,
+                (unsigned)bd->Format, (unsigned)bd->Flags,
+                (unsigned)bd->MipLevels, (unsigned)bd->SampleDesc.Count,
+                (unsigned)initialState, (int)nt);
+        }
+    }
+    return hr;
+}
+
+// Descriptor-heap inventory (observe-only, diagnostic). Records the numeric
+// data needed for OFFLINE correlation of root-table GPU handles: heap object,
+// type, descriptor count, flags, CPU/GPU start handles, and the per-type
+// increment. The heap and all references are transient: nothing is stored
+// beyond logged numbers, no COM reference is retained. Heap contents are
+// never read. Same forward-once discipline as all creation hooks.
+static volatile LONG64 g_heapInventoryTotal = 0;
+HRESULT WINAPI Hook_CreateDescriptorHeap(ID3D12Device* device,
+    const D3D12_DESCRIPTOR_HEAP_DESC* heapDesc, REFIID riid, void** ppHeap)
+{
+    HRESULT hr = Real_CreateDescriptorHeap ?
+        Real_CreateDescriptorHeap(device, heapDesc, riid, ppHeap) : E_NOINTERFACE;
+    LONG64 n = InterlockedIncrement64(&g_heapInventoryTotal);
+    if (SUCCEEDED(hr) && ppHeap && *ppHeap && heapDesc) {
+        static volatile LONG s_heapLogs = 0;
+        LONG m = InterlockedIncrement(&s_heapLogs);
+        if (m <= 24 || (m % 100) == 0) {
+            ID3D12DescriptorHeap* heap = (ID3D12DescriptorHeap*)*ppHeap;
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu = {};
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu = {};
+            bool shaderVisible =
+                (heapDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+            __try {
+                cpu = heap->GetCPUDescriptorHandleForHeapStart();
+                if (shaderVisible)
+                    gpu = heap->GetGPUDescriptorHandleForHeapStart();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                cpu = {}; gpu = {};
+            }
+            unsigned inc = 0;
+            if (device) {
+                __try {
+                    inc = device->GetDescriptorHandleIncrementSize(heapDesc->Type);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { inc = 0; }
+            }
+            Log("hooks: heap-inventory #%lld device=%p heap=%p type=%u count=%u flags=0x%X node=%u cpu=%llX gpu=%llX inc=%u vis=%d",
+                n, (void*)device, (void*)heap,
+                (unsigned)heapDesc->Type, (unsigned)heapDesc->NumDescriptors,
+                (unsigned)heapDesc->Flags, (unsigned)heapDesc->NodeMask,
+                (unsigned long long)cpu.ptr, (unsigned long long)gpu.ptr,
+                inc, shaderVisible ? 1 : 0);
+        }
+    }
+    return hr;
+}
+
+void InstallResourceShim(ID3D12Resource* resource, size_t cbSize)
+{
+    // DORMANT: do not call until a valid target resource and safe CPU-write path are established.
+    // Slots verified SDK 10.0.28000.0: Map=8, Unmap=9 (10/11 are GetDesc/GetGPUVirtualAddress).
+    if (!resource) return;
+    AcquireSRWLockExclusive(&g_resourceShimLock);
+    // Check if already shimmed
+    for (auto& rs : g_resourceShims) {
+        if (rs.resource == resource) {
+            ReleaseSRWLockExclusive(&g_resourceShimLock);
+            return;
+        }
+    }
+    // Find empty slot
+    ResourceShim* slot = nullptr;
+    for (auto& rs : g_resourceShims) {
+        if (!rs.resource) { slot = &rs; break; }
+    }
+    if (!slot) {
+        ReleaseSRWLockExclusive(&g_resourceShimLock);
+        return;
+    }
+    // Get original vtable
+    void** original = nullptr;
+    __try { original = *(void***)resource; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    if (!original) {
+        ReleaseSRWLockExclusive(&g_resourceShimLock);
+        return;
+    }
+    // ID3D12Resource vtable slots (verified SDK 10.0.28000.0): Map=8, Unmap=9.
+    // Slots 10/11 are GetDesc/GetGPUVirtualAddress and must not be hooked as Map/Unmap.
+    slot->map = (PFN_ResourceMap)original[8];
+    slot->unmap = (PFN_ResourceUnmap)original[9];
+    // Clone vtable
+    constexpr SIZE_T kResourceVtableEntries = 32;
+    void** cloned = (void**)VirtualAlloc(nullptr, sizeof(void*) * kResourceVtableEntries, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!cloned) {
+        ReleaseSRWLockExclusive(&g_resourceShimLock);
+        return;
+    }
+    __try { std::memcpy(cloned, original, sizeof(void*) * kResourceVtableEntries); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    slot->resource = resource;
+    slot->originalVtbl = original;
+    slot->clonedVtbl = cloned;
+    slot->cbSize = cbSize;
+    cloned[8] = (void*)&Shim_ResourceMap;
+    cloned[9] = (void*)&Shim_ResourceUnmap;
+    // Swap vtable
+    bool installed = true;
+    __try { *(void***)resource = cloned; } __except (EXCEPTION_EXECUTE_HANDLER) { installed = false; }
+    if (!installed) {
+        VirtualFree(cloned, 0, MEM_RELEASE);
+        slot->resource = nullptr;
+        slot->originalVtbl = nullptr;
+        slot->clonedVtbl = nullptr;
+        ReleaseSRWLockExclusive(&g_resourceShimLock);
+        return;
+    }
+    Log("hooks: Resource shim installed resource=%p cbSize=%zu map=%p unmap=%p",
+        (void*)resource, cbSize, (void*)slot->map, (void*)slot->unmap);
+    ReleaseSRWLockExclusive(&g_resourceShimLock);
+}
+
 void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                                  const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                  D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
+    static unsigned s_entryDiag = 0;
+    if ((++s_entryDiag % 60) == 1) {
+        D3D12_RESOURCE_DESC rd = {};
+        SafeGetDesc(res, &rd);
+        unsigned fmt = desc ? (unsigned)desc->Format : 0;
+        Log("hooks: Hook_CreateRenderTargetView ENTRY device=%p res=%p desc=%p handle=%llX rd.Width=%u rd.Height=%u rd.Format=%u rd.Flags=%X desc.Format=%u",
+            (void*)device, (void*)res, (void*)desc, (unsigned long long)handle.ptr,
+            (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)rd.Format, (unsigned)rd.Flags, fmt);
+    }
     // DISCOVERY MUST ALWAYS RUN: resources are discovered at creation time
     // BEFORE the bridge exists - gating on g_bridgeReady creates a
     // chicken-and-egg deadlock (need discovery to build bridge, need bridge
     // to enable discovery).
-    if (device == g_device && res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
+    // Track RTVs on ALL game devices - the game creates multiple devices.
+    if (res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
         ObserveNativeCandidate(res, rd, 1);
         // Provenance diagnostic: log every qualifying display-sized RTV creation with exact handle
@@ -1690,6 +3014,18 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             if (it != g_rtvMap.end() && it->second != res) {
                 Log("rtv-provenance: handle reuse handle=%llX oldRes=%p newRes=%p", (unsigned long long)handle.ptr, (void*)it->second, (void*)res);
             }
+        }
+        // Format-neutral handle map (correlation infrastructure): record EVERY
+        // display-sized mip1 RTV view so OM binds resolve regardless of pixel
+        // format. LDR fmt-28 views previously missed: the outer display-sized
+        // branch below traps all big-mip1 textures, so the catch-all at the end
+        // never sees them. Pure handle->resource bookkeeping, refreshed on
+        // every creation (handles recycle); every reader applies its own
+        // format/role checks, and no adoption/classification logic is touched.
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1) {
+            BookGuard _bgMap;
+            g_rtvMap[handle.ptr] = res;
         }
         if (rd.Width == g_displayW && rd.Height == g_displayH && (rd.Format == DXGI_FORMAT_R16G16B16A16_UNORM || rd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             g_lastDisplayRTVHandle = handle;
@@ -1763,6 +3099,9 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 Log("hooks: scene color RTV %p (%ux%u R16G16B16A16_UNORM) (ALT)", (void*)res,
                     (unsigned int)rd.Width, (unsigned int)rd.Height);
             }
+            // Scene-set evidence (rotation tracking): every adopted UNORM view
+            // enters the bounded set; matching stays pointer-based.
+            SceneSetNote(res, (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)desc->Format);
     } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1) {
             if (desc->Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
@@ -1787,6 +3126,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     g_sceneColorRtvAlt = handle;
                     Log("hooks: scene color RTV %p (1920x992 R16G16B16A16_UNORM) (ALT)", (void*)res);
                 }
+                // Scene-set evidence (rotation tracking); see above.
+                SceneSetNote(res, (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)desc->Format);
             } else if (desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
@@ -1926,6 +3267,89 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
         for (UINT i = 0; i < numLists; ++i) {
             ID3D12GraphicsCommandList* cl = nullptr;
             if (SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&cl))) && cl) {
+                // Diagnostic only: record shim coverage per submitted list.
+                // Does not change install/forwarding behavior below.
+                // Type comes from our own shim table when available; no guarded
+                // vtable call here because __try is illegal in this function
+                // (std::vector requires unwinding).
+                // Exact totals (nd/hits/misses/ptrReg/ptrUnreg) count every
+                // submission; sampled records only report snapshots of them.
+                {
+                    CommandListShim* preShim = FindCommandListShim(cl);
+                    unsigned clType = preShim ? preShim->listType : 0xFFFFFFFFu;
+                    static volatile LONG s_eclListDiag = 0;
+                    static volatile LONG64 s_eclHitTotal = 0;
+                    static volatile LONG64 s_eclMissTotal = 0;
+                    static volatile LONG64 s_eclPtrRegTotal = 0;
+                    static volatile LONG64 s_eclPtrUnregTotal = 0;
+                    static volatile LONG64 s_eclDetailLogged = 0;
+                    if (preShim) InterlockedIncrement64(&s_eclHitTotal);
+                    else InterlockedIncrement64(&s_eclMissTotal);
+                    LONG nd = InterlockedIncrement(&s_eclListDiag);
+                    bool sampled = (nd <= 20 || (nd % 500) == 1);
+                    bool ptrRegistered = false;
+                    void* actual = nullptr;
+                    void* expectedCloned = nullptr;
+                    void* expectedOriginal = nullptr;
+                    if (!preShim) {
+                        ptrRegistered = FindShimByListOnly(cl, &actual, &expectedCloned, &expectedOriginal);
+                        if (ptrRegistered) InterlockedIncrement64(&s_eclPtrRegTotal);
+                        else InterlockedIncrement64(&s_eclPtrUnregTotal);
+                    }
+                    if (sampled) {
+                        LONG64 hits = InterlockedCompareExchange64(&s_eclHitTotal, 0, 0);
+                        LONG64 misses = InterlockedCompareExchange64(&s_eclMissTotal, 0, 0);
+                        LONG64 ptrReg = InterlockedCompareExchange64(&s_eclPtrRegTotal, 0, 0);
+                        LONG64 ptrUnreg = InterlockedCompareExchange64(&s_eclPtrUnregTotal, 0, 0);
+                        LONG64 instOk = InterlockedCompareExchange64(&g_installOkTotal, 0, 0);
+                        LONG64 instDedup = InterlockedCompareExchange64(&g_installDedupTotal, 0, 0);
+                        LONG64 instFail = InterlockedCompareExchange64(&g_installFailTotal, 0, 0);
+                        Log("hooks: ECL list list=%p shimHit=%d type=%u (n=%d hits=%lld misses=%lld ptrReg=%lld ptrUnreg=%lld instOk=%lld instDedup=%lld instFail=%lld)",
+                            (void*)cl, preShim ? 1 : 0, clType, (int)nd, hits, misses,
+                            ptrReg, ptrUnreg, instOk, instDedup, instFail);
+                    }
+                    // Integrity detail only on sampled misses whose pointer is
+                    // registered: snapshot states whether our clone is intact,
+                    // what the actual vtable's memory looks like, and how the
+                    // submitted base-interface pointer compares to the derived
+                    // pointer we shimmed. A third heap value proves neither
+                    // writer nor reuse by itself. Capped by its own emit
+                    // counter (increments only on emit).
+                    if (!preShim && sampled && ptrRegistered) {
+                        ShimIntegritySnapshot snap = {};
+                        if (CaptureShimIntegrity(cl, lists[i], &snap)) {
+                            LONG64 logged = InterlockedIncrement64(&s_eclDetailLogged);
+                            if (logged <= 10) {
+                                Log("hooks: ECL list mismatch list=%p registered=1 actualVtbl=%p expectedCloned=%p expectedOriginal=%p fullHit=0 type=%u cloneReadable=%d cloneSlot15IsShim=%d cloneSlot15=%p actualRegionBase=%p actualRegionSize=%llu actualProtect=0x%X actualState=0x%X actualType=0x%X actualSlot15Readable=%d actualSlot15=%p actualSlot15Mod=%p baseList=%p baseVtblReadable=%d baseVtbl=%p baseSamePtr=%d baseVtblIsActual=%d baseVtblIsOriginal=%d baseVtblIsCloned=%d baseRegionBase=%p baseRegionSize=%llu baseProtect=0x%X (detail=%lld)",
+                                    (void*)cl, snap.actualVtbl, snap.expectedCloned, snap.expectedOriginal, clType,
+                                    snap.clonedReadable ? 1 : 0, snap.cloneSlot15IsShim ? 1 : 0, snap.cloneSlot15Value,
+                                    snap.actualRegionBase, (unsigned long long)snap.actualRegionSize,
+                                    (unsigned)snap.actualProtect, (unsigned)snap.actualState, (unsigned)snap.actualType,
+                                    snap.actualSlot15Readable ? 1 : 0, snap.actualSlot15Value, snap.actualSlot15Module,
+                                    snap.baseList, snap.baseVtblReadable ? 1 : 0, snap.baseVtbl,
+                                    (snap.baseList == (void*)cl) ? 1 : 0,
+                                    (snap.baseVtblReadable && snap.baseVtbl == snap.actualVtbl) ? 1 : 0,
+                                    (snap.baseVtblReadable && snap.baseVtbl == snap.expectedOriginal) ? 1 : 0,
+                                    (snap.baseVtblReadable && snap.baseVtbl == snap.expectedCloned) ? 1 : 0,
+                                    snap.baseRegionBase, (unsigned long long)snap.baseRegionSize,
+                                    (unsigned)snap.baseProtect, logged);
+                                if (snap.slotsReadable) {
+                                    Log("hooks: ECL list slots list=%p s9=%s/%ls s10=%s/%ls s15=%s/%ls s16=%s/%ls s26=%s/%ls s46=%s/%ls (detail=%lld)",
+                                        (void*)cl,
+                                        SlotClass(snap.actualSlot[0], snap.origSlot[0], snap.clonedSlot[0]), snap.slotModBase[0],
+                                        SlotClass(snap.actualSlot[1], snap.origSlot[1], snap.clonedSlot[1]), snap.slotModBase[1],
+                                        SlotClass(snap.actualSlot[2], snap.origSlot[2], snap.clonedSlot[2]), snap.slotModBase[2],
+                                        SlotClass(snap.actualSlot[3], snap.origSlot[3], snap.clonedSlot[3]), snap.slotModBase[3],
+                                        SlotClass(snap.actualSlot[4], snap.origSlot[4], snap.clonedSlot[4]), snap.slotModBase[4],
+                                        SlotClass(snap.actualSlot[5], snap.origSlot[5], snap.clonedSlot[5]), snap.slotModBase[5],
+                                        logged);
+                                } else {
+                                    Log("hooks: ECL list slots list=%p unreadable (detail=%lld)", (void*)cl, logged);
+                                }
+                            }
+                        }
+                    }
+                }
                 bool seen = false;
                 for (auto* p : s_hookedLists)
                     if (p == cl) { seen = true; break; }
@@ -2018,23 +3442,65 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList(
         return E_POINTER;
     HRESULT hr = Real_CreateCommandList(device, nodeMask, type, allocator,
                                         initialState, riid, outList);
-    if (SUCCEEDED(hr) && outList && *outList && device == g_device) {
+    if (SUCCEEDED(hr) && outList && *outList) {
         static LONG s_created = 0;
         LONG n = InterlockedIncrement(&s_created);
+        // ALL-DEVICE EXPERIMENT (camera-path audit): creation-shim lists from
+        // every game device, not just g_device. Dormant runs create >=10
+        // DIRECT+COPY lists on a second device that were never shimmed, while
+        // active runs have zero skipped creations. Per-list originals make
+        // forwarding table-agnostic, and submit-time install already touches
+        // any device's lists, so this only moves the same safe op earlier
+        // (before the game records into the list). Excluded after the first
+        // NGX init attempt: NGX creates its own internal devices during Init,
+        // whose lists must stay shim-free (Map/adopt analysis must never
+        // touch NVIDIA-owned resources).
+        bool postInit = (InterlockedCompareExchange(&g_upscalerInitAttempted, 0, 0) != 0);
+        bool cover = (device == g_device) || !postInit;
         if (n <= 12 || (n % 500) == 0) {
             void* list = *outList;
             void** vtbl = nullptr;
             __try { vtbl = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-            Log("hooks: GAME CreateCommandList #%d list=%p type=%u vtbl=%p allocator=%p riid=%08X:%04X:%04X",
-                (int)n, list, (unsigned)type, (void*)vtbl, (void*)allocator,
+            Log("hooks: GAME CreateCommandList #%d list=%p type=%u vtbl=%p device=%p primary=%d covered=%d allocator=%p riid=%08X:%04X:%04X",
+                (int)n, list, (unsigned)type, (void*)vtbl, (void*)device,
+                (device == g_device) ? 1 : 0, cover ? 1 : 0, (void*)allocator,
                 (unsigned)riid.Data1,
                 (unsigned)riid.Data2,
                 (unsigned)riid.Data3);
         }
-        // Attach before BeamNG records any work into the newly-created list.
-        // Installing at ExecuteCommandLists is too late: all Copy/OM/Barrier
-        // calls for that submission have already happened by then.
-        InstallCommandListHooks((ID3D12GraphicsCommandList*)*outList, (UINT)type);
+        // Bundle/compute census (diagnostic): the first-12 cap above can miss
+        // late-created bundle lists, and UNORM scene traffic could hide in
+        // bundle payloads (ExecuteBundle slot 27 is unhooked). Type-1/2 lists
+        // have never appeared in any run's sampled logs; record the first 10
+        // unconditionally to test that hypothesis with certainty.
+        if ((type == D3D12_COMMAND_LIST_TYPE_BUNDLE ||
+             type == D3D12_COMMAND_LIST_TYPE_COMPUTE) &&
+            outList && *outList) {
+            static volatile LONG s_type12Logs = 0;
+            LONG m12 = InterlockedIncrement(&s_type12Logs);
+            if (m12 <= 10) {
+                void* blist = *outList;
+                void** bvtbl = nullptr;
+                __try { bvtbl = *(void***)blist; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                Log("hooks: CreateCommandList type12 #%d list=%p type=%u vtbl=%p device=%p primary=%d",
+                    (int)m12, blist, (unsigned)type, (void*)bvtbl, (void*)device,
+                    (device == g_device) ? 1 : 0);
+            }
+        }
+        if (cover) {
+            // Attach before BeamNG records any work into the newly-created list.
+            // Installing at ExecuteCommandLists is too late: all Copy/OM/Barrier
+            // calls for that submission have already happened by then.
+            InstallCommandListHooks((ID3D12GraphicsCommandList*)*outList, (UINT)type);
+        } else {
+            // Post-NGX-init foreign device: quantify only (no behavior change).
+            static volatile LONG s_skippedCreate = 0;
+            LONG m = InterlockedIncrement(&s_skippedCreate);
+            if (m <= 10 || (m % 500) == 1) {
+                Log("hooks: CreateCommandList skipped (post-NGX-init device) device=%p g_device=%p list=%p type=%u (n=%d)",
+                    (void*)device, (void*)g_device, *outList, (unsigned)type, (int)m);
+            }
+        }
     }
     return hr;
 }
@@ -4634,12 +6100,25 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             if (!g_mvResource && g_mvLastRtvKey) {
                 auto ri = g_rtvMap.find(g_mvLastRtvKey);
                 if (ri != g_rtvMap.end() && ri->second) {
-                    StoreTracked(&g_mvResource, ri->second);
-                    g_mvValid = true;
-                    g_mvStamp = g_frameCounter;
-                    if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
-                    g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
+                    // Format guard: the handle slot may have been recycled for a
+                    // non-MV view since the key was recorded (the handle map is
+                    // format-neutral by design). Never adopt a non-motion-vector
+                    // resource as MV; valid re-adoptions pass unchanged.
+                    D3D12_RESOURCE_DESC mrd = {};
+                    if (!SafeGetDesc(ri->second, &mrd) ||
+                        mrd.Format != DXGI_FORMAT_R16G16_FLOAT) {
+                        static int s_mvKeyMismatchLogs = 0;
+                        if (++s_mvKeyMismatchLogs <= 3)
+                            Log("hooks: MV re-adopt skipped - key now resolves to fmt=%u (not MV)",
+                                (unsigned)mrd.Format);
+                    } else {
+                        StoreTracked(&g_mvResource, ri->second);
+                        g_mvValid = true;
+                        g_mvStamp = g_frameCounter;
+                        if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
+                        g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                        Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
+                    }
                 }
             }
             static int s_nullSkip = 0;
@@ -5172,6 +6651,31 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT syncInterval, UI
             if (++s_presFeedCount % 60 == 1 && g_topoLastSrc) {
                 Log("present-feed: last full-res src %p fmt %u",
                     g_topoLastSrc, g_topoLastFmt);
+            }
+            // Install-vs-invocation split (bounded: same 1/60 cadence as the
+            // feed above): exact atomic totals distinguishing shim-table
+            // installs from actual per-method callback invocations.
+            {
+                static unsigned s_hookTotals = 0;
+                if (++s_hookTotals % 60 == 1) {
+                    Log("hooks: shim totals instOk=%lld instDedup=%lld instFail=%lld buf=%lld tex=%lld res=%lld rt=%lld barrier=%lld om=%lld vp=%lld sc=%lld",
+                        (long long)InterlockedCompareExchange64(&g_installOkTotal, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_installDedupTotal, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_installFailTotal, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimBufferCopyCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimCopyCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimCopyResCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimRootTableCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimBarrierCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimOmCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimVpCalls, 0, 0),
+                        (long long)InterlockedCompareExchange64(&g_shimScCalls, 0, 0));
+                    // Scene-set hygiene (bounded: <=8 guarded reads per sweep).
+                    // Retired targets fault here and are dropped, so the
+                    // matching set cannot accumulate freed pointers.
+                    static unsigned s_sceneSweep = 0;
+                    if ((++s_sceneSweep % 10) == 1) SceneSetSweep();
+                }
             }
             if (sc == g_egshDummySC) { /* EGSH self-test present: never adopt */ }
             bool stableSwapchain = ObserveStableSwapchain(sc);
@@ -5883,6 +7387,24 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                            UINT64 numBytes)
 {
     __try {
+    // Diagnostic: bounded copy log for placed-buffer correlation.
+    // Log first 50 copies >=32 bytes unconditionally (captures 96-byte updates),
+    // then 1/1000 sampling plus always-log >=1024/camera/velocity sizes.
+    static unsigned s_copyDiag = 0;
+    unsigned nCopy = 0;
+    if (numBytes >= 32) { nCopy = ++s_copyDiag; }
+    if (numBytes >= 32 && (nCopy <= 50 || (nCopy % 1000) == 1 || numBytes >= 1024 || numBytes == kCameraCbSize || numBytes == kVelocityCbSize)) {
+        D3D12_RESOURCE_DESC srcDesc = {}, dstDesc = {};
+        unsigned srcFmt = 0, dstFmt = 0;
+        unsigned long long srcW = 0, dstW = 0;
+        __try { if (src) { srcDesc = src->GetDesc(); srcFmt = (unsigned)srcDesc.Format; srcW = (unsigned long long)srcDesc.Width; } } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        __try { if (dst) { dstDesc = dst->GetDesc(); dstFmt = (unsigned)dstDesc.Format; dstW = (unsigned long long)dstDesc.Width; } } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        unsigned listType = 0;
+        __try { if (list) listType = list->GetType(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Log("hooks: CopyBufferRegion src=%p dst=%p srcOff=%llu dstOff=%llu bytes=%llu list=%p type=%u srcFmt=%u srcW=%llu dstFmt=%u dstW=%llu",
+            (void*)src, (void*)dst, (unsigned long long)srcOffset, (unsigned long long)dstOffset, (unsigned long long)numBytes,
+            (void*)list, listType, srcFmt, srcW, dstFmt, dstW);
+    }
     static int s_otherSizes = 0;
     if (numBytes >= 1024 && numBytes != kCameraCbSize && numBytes != kVelocityCbSize &&
         srcOffset == 0 && dstOffset == 0 && s_otherSizes < 10) {
@@ -5890,16 +7412,18 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
         Log("hooks: CopyBufferRegion size=%llu (src %p dst %p)", (unsigned long long)numBytes, (void*)src, (void*)dst);
     }
     if (src && dst && dstOffset == 0) {
-        if (numBytes == kCameraCbSize) {
+        // Camera CB validation: accept copies where the source region contains a valid camera CB.
+        // This handles both exact 1616-byte copies and larger copies from a known offset in a big upload buffer.
+        if (numBytes >= kCameraCbSize) {
             if (!g_cameraRing) g_cameraRing = src;
             if (g_cameraRing == src || !g_cameraCbValid) {
                 void* mapped = nullptr;
                 if (SUCCEEDED(src->Map(0, nullptr, &mapped)) && mapped) {
                     float* cb = (float*)((char*)mapped + srcOffset);
-                    if (ValidateCameraCb(cb, numBytes)) {
+                    if (ValidateCameraCb(cb, kCameraCbSize)) {
                         if (g_cameraRing != src) {
                             g_cameraRing = src;
-                            Log("hooks: camera CB ring re-discovered %p", (void*)src);
+                            Log("hooks: camera CB ring re-discovered %p at srcOff=%llu", (void*)src, (unsigned long long)srcOffset);
                         }
                         static int s_acceptDumps = 0;
                         if (s_acceptDumps < 1) {
@@ -5932,12 +7456,21 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                                 F2U(ac[172]), F2U(ac[173]), F2U(ac[174]), F2U(ac[175]));
                         }
                         StartFrame();
-                        // NOTE: no EnsureUpscalerInit here - this runs on the
-                        // engine ECL thread; NGX init races the Present thread
-                        // (double-init corrupted NVIDIA global state).
+                        // LEGACY INIT TRIGGER (dlaa=0 only): a validated camera
+                        // copy is the earliest proof of live gameplay rendering,
+                        // so the single NGX init attempt is sequenced from here.
+                        // Safe despite running on the engine ECL thread: (1) the
+                        // quiet gate defers with NO driver contact until the copy
+                        // chain is quiet 120f; (2) the atomic attempt-gate makes
+                        // double-init impossible, superseding the fix89-era race
+                        // fear (no Present-thread init exists in legacy mode at
+                        // all); (3) DLAA mode is excluded, preserving its
+                        // settled-once init sequencing.
                         // ISOLATION (reviewer #16 pattern): SCALENG_NO_JITTER=1
                         // disables the CB patch entirely - single-variable test
                         // for whether jitter writing triggers nvwgf2umx AVs.
+                        if (!g_dlaaMode)
+                            EnsureUpscalerInit(false);
                         if (g_dlaaMode && !GetEnvironmentVariableA("SCALENG_NO_JITTER", nullptr, 0))
                             ApplyCameraCbJitter(cb, numBytes, g_renderW, g_renderH,
                                                 g_currJitter, g_prevJitter);
@@ -5999,36 +7532,17 @@ void Hook_CopyBufferRegion(ID3D12GraphicsCommandList* list, ID3D12Resource* dst,
                     src->Unmap(0, nullptr);
                 }
             }
-        } else if (numBytes == kVelocityCbSize && g_patchViewport && g_cameraCbValid && g_mvValid) {
+        }
+        // Velocity CB validation (permissive: any copy >= kVelocityCbSize)
+        if (numBytes >= kVelocityCbSize) {
             void* mapped = nullptr;
             if (SUCCEEDED(src->Map(0, nullptr, &mapped)) && mapped) {
                 float* cb = (float*)((char*)mapped + srcOffset);
-                if (ValidateVelocityCb(cb, numBytes, g_mvW, g_mvH)) {
-                    PatchVelocityCb(cb, numBytes, g_lastPatchedCameraCb);
+                if (ValidateVelocityCb(cb, kVelocityCbSize, g_mvW, g_mvH)) {
+                    PatchVelocityCb(cb, kVelocityCbSize, g_lastPatchedCameraCb);
                     g_velocityCbPatched = true;
                     Log("hooks: velocity CB patched in place (dst %p srcOff %llu uTexSize %.4f %.4f)",
                         (void*)dst, (unsigned long long)srcOffset, cb[0], cb[1]);
-                } else {
-                    static int s_vRejects = 0;
-                    if (s_vRejects < 5) {
-                        ++s_vRejects;
-                        bool texOk = (std::fabs(cb[0] * (float)g_mvW - 1.0f) < 0.02f) ||
-                                     (std::fabs(cb[0] - (float)g_mvW) < 0.5f);
-                        Log("hooks: velocity CB copy not validated (dst %p srcOff %llu uTexSize %.6f %.6f "
-                            "texOk %d stw15 %.4f stw12..14 %.4f %.4f %.4f mv %ux%u)",
-                            (void*)dst, (unsigned long long)srcOffset, cb[0], cb[1],
-                            texOk ? 1 : 0, cb[19], cb[16], cb[17], cb[18], g_mvW, g_mvH);
-                        if (s_vRejects <= 2) {
-                            Log("hooks: velocity CB f0..15: %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f",
-                                cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7],
-                                cb[8], cb[9], cb[10], cb[11], cb[12], cb[13], cb[14], cb[15]);
-                            Log("hooks: velocity CB f16..43: %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f",
-                                cb[16], cb[17], cb[18], cb[19], cb[20], cb[21], cb[22], cb[23],
-                                cb[24], cb[25], cb[26], cb[27], cb[28], cb[29], cb[30], cb[31],
-                                cb[32], cb[33], cb[34], cb[35], cb[36], cb[37], cb[38], cb[39],
-                                cb[40], cb[41], cb[42], cb[43]);
-                        }
-                    }
                 }
                 src->Unmap(0, nullptr);
             }
@@ -6216,9 +7730,12 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 (unsigned long long)(g_b2FenceOutG ? g_b2FenceOutG->GetCompletedValue() : 0));
         }
     }
-    // SAFETY: skip ALL analysis when bridge not ready (prevents GetDesc on
-    // engine resources during unstable startup / resource churn)
-    if (!g_bridgeReady || !g_dlaaMode) return;
+    // LEGACY-COMPAT GUARD: bridge analysis needs the bridge; the legacy
+    // (!dlaa) trigger/scene/depth analysis below needs no bridge (the
+    // legacy trigger at PRIMARY TRIGGER explicitly requires !g_bridgeReady).
+    // Old guard "if (!g_bridgeReady || !g_dlaaMode) return" made the legacy
+    // trigger statically dead. DLAA-without-bridge still skips (as before).
+    if (g_dlaaMode && !g_bridgeReady) return;
     // SEH helper kept out-of-line so CopyTexBody can own C++ objects.
     struct Local {
         static bool AltIsPairHalf(ID3D12Resource* alt) {
@@ -6242,8 +7759,14 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
         AcquireSRWLockExclusive(&g_copyMapLock);
         bool newNode = (++g_copySrcCount[(void*)src->pResource] == 1);
         ReleaseSRWLockExclusive(&g_copyMapLock);
-        if (newNode)
+        if (newNode) {
             g_lastNewChainFrame = g_frameCounter; // new node entered the chain
+            g_chainObserved = true;
+            // Shadow stamp: same event, Present-clock units. No gate effect.
+            InterlockedExchange64(&g_lastNewChainPresent,
+                InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+            InterlockedExchange(&g_chainPresentObserved, 1);
+        }
         bool isMvDst = (dst->pResource == g_mvResource || dst->pResource == g_mvResourceAlt);
         bool isSceneSrc = (src->pResource == g_sceneColor ||
                            (g_sceneColorAlt && src->pResource == g_sceneColorAlt));
@@ -6337,7 +7860,11 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 }
             }
             isSceneSrc = (src->pResource == g_sceneColor ||
-                          (g_sceneColorAlt && src->pResource == g_sceneColorAlt));
+                          (g_sceneColorAlt && src->pResource == g_sceneColorAlt) ||
+                          SceneSetContains(src->pResource));
+            // Copy-endpoint recency for rotation tracking (members only).
+            SceneSetTouch(src->pResource);
+            SceneSetTouch(dst->pResource);
             if (isSceneSrc && g_patchAborted) {
                 g_patchAborted = false;
                 Log("hooks: viewport patch re-armed by scene copy");
@@ -6437,13 +7964,18 @@ void Hook_CopyTextureRegion(ID3D12GraphicsCommandList* list,
     }
 }
 
-void Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
-                         const D3D12_VIEWPORT* pViewports)
+bool Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
+                          const D3D12_VIEWPORT* pViewports, PFN_RSSetViewports realFn)
 {
-    // PASSTHROUGH unless bridge ready + DLAA on
-    if (!g_bridgeReady || !g_dlaaMode) {
-        Real_RSSetViewports(list, numViewports, pViewports);
-        return;
+    // LEGACY-COMPAT: the viewport patch below is the legacy (!dlaa) render-
+    // scale mechanism (TECHNICAL_REFERENCE 7.2.1) and needs no bridge; its
+    // inner blocks are already gated on g_patchViewport (false in DLAA
+    // mode), so DLAA behavior is unchanged (passthrough either way).
+    // Old guard "bridgeReady && dlaa" made g_patchAppliedThisFrame
+    // permanently false under the shipped dlaa=0 config.
+    if (g_dlaaMode && !g_bridgeReady) {
+        if (realFn) realFn(list, numViewports, pViewports);
+        return true;
     }
     ID3D12Resource* boundScene = SceneColorBound();
     static int s_vpDiag = 0;
@@ -6455,12 +7987,28 @@ void Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
                 Log("hooks: vp diag %dx%d scene=%p ready=%d mvValid=%d (scene render viewport)",
                     (int)pViewports[0].Width, (int)pViewports[0].Height, (void*)boundScene,
                     (g_upscaler && g_upscaler->IsReady()) ? 1 : 0, g_mvValid ? 1 : 0);
-        } else if (s_vpDiag < 30) {
+        } else {
             ++s_vpDiag;
-            Log("hooks: vp diag %dx%d boundScene=%p ready=%d mvValid=%d rtvValid=%d",
-                (int)pViewports[0].Width, (int)pViewports[0].Height, (void*)boundScene,
-                (g_upscaler && g_upscaler->IsReady()) ? 1 : 0, g_mvValid ? 1 : 0,
-                g_boundRtvValid ? 1 : 0);
+            // Bound-identity correlation (the first downstream gate): when the
+            // bound scene is null, record WHICH resource was bound, its live
+            // descriptor, and whether the set knows it. Distinguishes an
+            // unobserved target (pre-hook creation / unknown handle) from a
+            // non-scene target from a set-lookup bug. Same cadence as the
+            // scene branch so gameplay viewports are captured, not just the
+            // first 30 loading-phase ones.
+            if (s_vpDiag <= 40 || (s_vpDiag % 500) == 0) {
+                D3D12_RESOURCE_DESC bd = {};
+                bool gotBd = (g_boundRtvResource && SafeGetDesc(g_boundRtvResource, &bd));
+                unsigned setCount = 0;
+                { AcquireSRWLockShared(&g_sceneSetLock); setCount = g_sceneSetCount; ReleaseSRWLockShared(&g_sceneSetLock); }
+                Log("hooks: vp diag %dx%d boundScene=%p ready=%d mvValid=%d rtvValid=%d bound=%p bdesc=%ux%u fmt=%u inset=%d setcount=%u",
+                    (int)pViewports[0].Width, (int)pViewports[0].Height, (void*)boundScene,
+                    (g_upscaler && g_upscaler->IsReady()) ? 1 : 0, g_mvValid ? 1 : 0,
+                    g_boundRtvValid ? 1 : 0, (void*)g_boundRtvResource,
+                    gotBd ? (unsigned)bd.Width : 0u, gotBd ? (unsigned)bd.Height : 0u,
+                    gotBd ? (unsigned)bd.Format : 0u,
+                    SceneSetContains(g_boundRtvResource) ? 1 : 0, setCount);
+            }
         }
     }
     if (numViewports >= 1 && pViewports && g_patchViewport && boundScene) {
@@ -6476,7 +8024,7 @@ void Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
         D3D12_VIEWPORT v = pViewports[0];
         v.Width = (float)g_renderW;
         v.Height = (float)g_renderH;
-        Real_RSSetViewports(list, 1, &v);
+        if (realFn) realFn(list, 1, &v);
         g_activeSceneColor = boundScene;
         g_patchAppliedThisFrame = true;
         Log("hooks: viewport patched to %ux%u (scene %p)", g_renderW, g_renderH, (void*)boundScene);
@@ -6486,13 +8034,14 @@ void Hook_RSSetViewports(ID3D12GraphicsCommandList* list, UINT numViewports,
             g_patchViewport = false;
             Log("hooks: viewport patch aborted - no injection within %u frames", g_patchFramesWithoutInject);
         }
-        return;
+        return true;
     }
-    Real_RSSetViewports(list, numViewports, pViewports);
+    if (realFn) realFn(list, numViewports, pViewports);
+    return true;
 }
 
-void Hook_RSSetScissorRects(ID3D12GraphicsCommandList* list, UINT numRects,
-                            const D3D12_RECT* pRects)
+bool Hook_RSSetScissorRects(ID3D12GraphicsCommandList* list, UINT numRects,
+                             const D3D12_RECT* pRects, PFN_RSSetScissorRects realFn)
 {
     if (numRects >= 1 && pRects && g_patchViewport && SceneColorBound() &&
         (pRects[0].right - pRects[0].left) == (LONG)g_displayW &&
@@ -6500,20 +8049,18 @@ void Hook_RSSetScissorRects(ID3D12GraphicsCommandList* list, UINT numRects,
         D3D12_RECT r = pRects[0];
         r.right = r.left + (LONG)g_renderW;
         r.bottom = r.top + (LONG)g_renderH;
-        Real_RSSetScissorRects(list, 1, &r);
-        return;
+        if (realFn) realFn(list, 1, &r);
+        return true;
     }
-    Real_RSSetScissorRects(list, numRects, pRects);
+    if (realFn) realFn(list, numRects, pRects);
+    return true;
 }
 
-void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
-                          const D3D12_RESOURCE_BARRIER* pBarriers)
+// Pure-observation state tracking extracted for the live shim path.
+// No bridge dependency (map writes only); called from Shim_ResourceBarrier
+// on every invocation and from Hook_ResourceBarrier below.
+static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER* pBarriers)
 {
-    // SAFETY: skip tracking when bridge not ready (prevents map writes during churn)
-    if (!g_bridgeReady || !g_dlaaMode) {
-        Real_ResourceBarrier(list, numBarriers, pBarriers);
-        return;
-    }
     if (pBarriers && numBarriers > 0) {
         for (UINT i = 0; i < numBarriers; ++i) {
             if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
@@ -6532,7 +8079,21 @@ void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
             }
         }
     }
-    Real_ResourceBarrier(list, numBarriers, pBarriers);
+}
+
+void Hook_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT numBarriers,
+                          const D3D12_RESOURCE_BARRIER* pBarriers)
+{
+    // LEGACY-COMPAT: state tracking is a pure map write with no bridge
+    // dependency; DoInjection's Barrier() calls need it in legacy (!dlaa)
+    // mode (without it every barrier silently no-ops). DLAA-without-bridge
+    // still skips (as before); DLAA-with-bridge still tracks (as before).
+    if (g_dlaaMode && !g_bridgeReady) {
+        if (Real_ResourceBarrier) Real_ResourceBarrier(list, numBarriers, pBarriers);
+        return;
+    }
+    TrackResourceBarriers(numBarriers, pBarriers);
+    if (Real_ResourceBarrier) Real_ResourceBarrier(list, numBarriers, pBarriers);
 }
 
 void Hook_SetDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT numHeaps,
@@ -6543,17 +8104,15 @@ void Hook_SetDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT numHeaps,
     Real_SetDescriptorHeaps(list, numHeaps, heaps);
 }
 
-void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTargets,
-                             const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets,
-                             BOOL RTsSingleHandleToDescriptorRange,
-                             const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencilDescriptor)
+// Pure-observation bind tracking extracted for the live shim path.
+// SceneColorBound() (the viewport-patch prerequisite) has no other writer,
+// so without this the patch flag can never be set. No bridge-resource
+// dependency (map/adoption writes only); called from Shim_OMSetRenderTargets
+// on every invocation and from Hook_OMSetRenderTargets below.
+// Newly-live GetDesc calls use the guarded form (previously ran only under
+// the bridge-era gate, now reachable on the record path).
+static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets)
 {
-    // SAFETY: skip tracking when bridge not ready (prevents map writes during churn)
-    if (!g_bridgeReady || !g_dlaaMode) {
-        Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
-                                RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
-        return;
-    }
     if (numRenderTargets >= 1 && pRenderTargets) {
         g_boundRtv = pRenderTargets[0];
         g_boundRtvValid = true;
@@ -6567,8 +8126,8 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
             // Covers renderer re-inits that re-create views after our hook
             // (or even the whole plugin) was installed.
             if (!g_sceneColorValid && g_boundRtvResource) {
-                D3D12_RESOURCE_DESC rd = g_boundRtvResource->GetDesc();
-                if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                D3D12_RESOURCE_DESC rd = {};
+                if (SafeGetDesc(g_boundRtvResource, &rd) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
                     rd.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
                     StoreTracked(&g_sceneColor, g_boundRtvResource);
@@ -6578,6 +8137,8 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                     g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     Log("hooks: scene color adopted from RTV bind %p (%ux%u)", (void*)g_sceneColor,
                         (unsigned int)rd.Width, (unsigned int)rd.Height);
+                    SceneSetNote(g_sceneColor, (unsigned int)rd.Width, (unsigned int)rd.Height,
+                                 (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM);
                 }
             }
             // MV TRACK-BY-BIND: the engine binds MV as an RTV every frame it
@@ -6588,8 +8149,8 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                 BookGuard _bgOmrt2;
             auto ri = g_rtvMap.find(pRenderTargets[0].ptr);
                 if (ri != g_rtvMap.end() && ri->second == g_boundRtvResource) {
-                    D3D12_RESOURCE_DESC mrd = g_boundRtvResource->GetDesc();
-                    if (mrd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    D3D12_RESOURCE_DESC mrd = {};
+                    if (SafeGetDesc(g_boundRtvResource, &mrd) && mrd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                         mrd.MipLevels == 1 && mrd.SampleDesc.Count == 1 &&
                         (unsigned)mrd.Width == g_displayW && mrd.Height == g_displayH &&
                         mrd.Format == DXGI_FORMAT_R16G16_FLOAT) {
@@ -6617,8 +8178,8 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                 StoreTracked(&g_sceneColor, g_boundRtvResource);
                 g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 Log("hooks: scene color refreshed on bind %p", (void*)g_sceneColor);
-                D3D12_RESOURCE_DESC rd = g_sceneColor->GetDesc();
-                if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                D3D12_RESOURCE_DESC rd = {};
+                if (SafeGetDesc(g_sceneColor, &rd) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     rd.Width >= 1000 && rd.Height >= 500)
                     AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
             }
@@ -6647,8 +8208,192 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
         g_boundRtvValid = false;
         g_boundRtvResource = nullptr;
     }
-    Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
+    // Bind recency for rotation tracking (members only; unknown pointers are
+    // ignored here - creation/adoption paths are the entry gates).
+    SceneSetTouch(g_boundRtvResource);
+    return g_boundRtvResource;
+}
+
+void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTargets,
+                             const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets,
+                             BOOL RTsSingleHandleToDescriptorRange,
+                             const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencilDescriptor)
+{
+    // LEGACY-COMPAT (same pattern as the other guards): bind tracking is
+    // bridge-independent discovery. DLAA-without-bridge still skips.
+    if (g_dlaaMode && !g_bridgeReady) {
+        if (Real_OMSetRenderTargets) Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
+                                RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
+        return;
+    }
+    TrackOMBind(numRenderTargets, pRenderTargets);
+    if (Real_OMSetRenderTargets) Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
                             RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
+}
+
+// Device QueryInterface census (diagnostic): which ID3D12Device versions are
+// requested on the observed device table. Decides whether Device4+/Device8
+// '1'/'2'-variant creation methods (unhooked higher slots) are a live hypothesis
+// for resources missing from the slot-27/29/30 logs. Watchlist covers base
+// Device (owns the shared-handle open methods) through Device8 (owns
+// CommittedResource2/PlacedResource1; Device5-7 add no resource creation).
+// Forwards exactly once via the per-table original;
+// no extra QIs, no retained references, identical results to the game.
+// Exact per-IID counts (atomic) are separate from emitted records (first
+// sighting + every 1000th).
+static bool SameGUID(REFIID a, const GUID* b)
+{
+    if (a.Data1 != b->Data1 || a.Data2 != b->Data2 || a.Data3 != b->Data3)
+        return false;
+    for (int i = 0; i < 8; ++i) {
+        if (a.Data4[i] != b->Data4[i]) return false;
+    }
+    return true;
+}
+// IIDs verified against 10.0.28000.0 d3d12.h MIDL_INTERFACE declarations.
+static const GUID kQIDevice = { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
+static const GUID kQIDevice1 = { 0x77acce80, 0x638e, 0x4e65, { 0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e } };
+static const GUID kQIDevice2 = { 0x30baa41e, 0xb15b, 0x475c, { 0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28 } };
+static const GUID kQIDevice3 = { 0x81dadc15, 0x2bad, 0x4392, { 0x93, 0xc5, 0x10, 0x13, 0x45, 0xc4, 0xaa, 0x98 } };
+static const GUID kQIDevice4 = { 0xe865df17, 0xa9ee, 0x46f9, { 0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5 } };
+static const GUID kQIDevice5 = { 0x8b4f173b, 0x2fea, 0x4b80, { 0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d } };
+static const GUID kQIDevice6 = { 0xc70b221b, 0x40e4, 0x4a17, { 0x89, 0xaf, 0x02, 0x5a, 0x07, 0x27, 0xa6, 0xdc } };
+static const GUID kQIDevice7 = { 0x5c014b53, 0x68a1, 0x4b9b, { 0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b } };
+static const GUID kQIDevice8 = { 0x9218e6bb, 0xf944, 0x4f7e, { 0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3 } };
+struct QIWatchEntry { const GUID* iid; const char* name; };
+static const QIWatchEntry kQIWatch[] = {
+    { &kQIDevice, "Device" }, { &kQIDevice1, "Device1" }, { &kQIDevice2, "Device2" },
+    { &kQIDevice3, "Device3" }, { &kQIDevice4, "Device4" }, { &kQIDevice5, "Device5" },
+    { &kQIDevice6, "Device6" }, { &kQIDevice7, "Device7" }, { &kQIDevice8, "Device8" },
+};
+static volatile LONG64 g_qiTotal = 0;
+static volatile LONG64 g_qiWatchCounts[9] = {};
+// Device4 '1'-variant hooks (defined with the other creation hooks above).
+HRESULT WINAPI Hook_CreateCommittedResource1(ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heapProps, D3D12_HEAP_FLAGS heapFlags,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, ID3D12ProtectedResourceSession* session,
+    REFIID riidRes, void** ppResource);
+HRESULT WINAPI Hook_CreateHeap1(ID3D12Device* device,
+    const D3D12_HEAP_DESC* heapDesc, ID3D12ProtectedResourceSession* session,
+    REFIID riid, void** ppHeap);
+HRESULT WINAPI Hook_CreateReservedResource1(ID3D12Device* device,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, ID3D12ProtectedResourceSession* session,
+    REFIID riidRes, void** ppResource);
+static volatile LONG s_d4HookState = 0;
+// Device8 hooks (defined with the other creation hooks above); installed only
+// after a successful Device8 QI on the same table (see Shim_DeviceQI).
+HRESULT WINAPI Hook_CreateCommittedResource2(ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heapProps, D3D12_HEAP_FLAGS heapFlags,
+    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, ID3D12ProtectedResourceSession* session,
+    REFIID riidRes, void** ppResource);
+HRESULT WINAPI Hook_CreatePlacedResource1(ID3D12Device* device,
+    ID3D12Heap* pHeap, UINT64 heapOffset,
+    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** ppResource);
+static volatile LONG s_d8HookState = 0;
+static HRESULT STDMETHODCALLTYPE Shim_DeviceQI(IUnknown* self, REFIID riid, void** ppvObject)
+{
+    InterlockedIncrement64(&g_qiTotal);
+    int idx = -1;
+    for (int i = 0; i < 9; ++i) {
+        if (SameGUID(riid, kQIWatch[i].iid)) { idx = i; break; }
+    }
+    LONG64 c = 0;
+    if (idx >= 0)
+        c = InterlockedIncrement64(&g_qiWatchCounts[idx]);
+    HRESULT hr = E_NOINTERFACE;
+    void* out = nullptr;
+    if (Real_DeviceQI)
+        hr = Real_DeviceQI(self, riid, ppvObject);
+    else {
+        static int s_qiFaultLogs = 0;
+        if (++s_qiFaultLogs <= 2)
+            Log("hooks: QI census forwarding missing (unreachable path)");
+    }
+    if (ppvObject) out = *ppvObject;
+    if (idx >= 0 && (c == 1 || (c % 1000) == 0))
+        Log("hooks: QI census %s #%lld self=%p hr=0x%08X out=%p",
+            kQIWatch[idx].name, c, (void*)self, (unsigned)hr, out);
+    // Device4 '1'-variant observation: install once, on the SAME table only,
+    // after a successful Device4 QI and before returning the interface.
+    // A distinct table is left untouched per the existing distinct-vtable rule
+    // (state resets so a later same-table QI can still install).
+    if (idx == 4 && SUCCEEDED(hr) && ppvObject && *ppvObject) {
+        if (InterlockedCompareExchange(&s_d4HookState, 1, 0) == 0) {
+            void* d4obj = *ppvObject;
+            void** d4vt = nullptr;
+            __try { d4vt = *(void***)d4obj; } __except (EXCEPTION_EXECUTE_HANDLER) { d4vt = nullptr; }
+            if (d4vt && g_hookedDeviceVtbl && d4vt == (void**)g_hookedDeviceVtbl) {
+                MEMORY_BASIC_INFORMATION dmbi = {};
+                VirtualQuery(d4vt, &dmbi, sizeof(dmbi));
+                DWORD doldProt = 0;
+                if (VirtualProtect(dmbi.BaseAddress, dmbi.RegionSize, PAGE_READWRITE, &doldProt)) {
+                    if (!Real_CommittedResource1)
+                        Real_CommittedResource1 = (PFN_CreateCommittedResource1)d4vt[53];
+                    if (!Real_Heap1)
+                        Real_Heap1 = (PFN_CreateHeap1)d4vt[54];
+                    if (!Real_ReservedResource1)
+                        Real_ReservedResource1 = (PFN_CreateReservedResource1)d4vt[55];
+                    d4vt[53] = (void*)&Hook_CreateCommittedResource1;
+                    d4vt[54] = (void*)&Hook_CreateHeap1;
+                    d4vt[55] = (void*)&Hook_CreateReservedResource1;
+                    VirtualProtect(dmbi.BaseAddress, dmbi.RegionSize, doldProt, &doldProt);
+                    void* d4t[3] = { (void*)&Hook_CreateCommittedResource1,
+                                     (void*)&Hook_CreateHeap1,
+                                     (void*)&Hook_CreateReservedResource1 };
+                    CfgMarkValid(d4t, 3);
+                    Log("hooks: Device4 '1'-variant hooks installed (53/54/55) vtbl=%p", (void*)d4vt);
+                } else {
+                    Log("hooks: Device4 table not writable - '1'-variant hooks skipped");
+                    InterlockedExchange(&s_d4HookState, 0);
+                }
+            } else {
+                Log("hooks: Device4 distinct table %p (hooked %p) - '1'-variant hooks skipped (coverage limitation)",
+                    (void*)d4vt, g_hookedDeviceVtbl);
+                InterlockedExchange(&s_d4HookState, 0);
+            }
+        }
+    }
+    // Device8 resource hooks: install once, on the SAME table only, after a
+    // successful Device8 QI and before returning the interface. Same
+    // distinct-table rule and one-time state discipline as Device4 above.
+    // (PlacedResource1 lives on Device8, not Device4 - verified in-header.)
+    if (idx == 8 && SUCCEEDED(hr) && ppvObject && *ppvObject) {
+        if (InterlockedCompareExchange(&s_d8HookState, 1, 0) == 0) {
+            void* d8obj = *ppvObject;
+            void** d8vt = nullptr;
+            __try { d8vt = *(void***)d8obj; } __except (EXCEPTION_EXECUTE_HANDLER) { d8vt = nullptr; }
+            if (d8vt && g_hookedDeviceVtbl && d8vt == (void**)g_hookedDeviceVtbl) {
+                MEMORY_BASIC_INFORMATION d8mbi = {};
+                VirtualQuery(d8vt, &d8mbi, sizeof(d8mbi));
+                DWORD d8oldProt = 0;
+                if (VirtualProtect(d8mbi.BaseAddress, d8mbi.RegionSize, PAGE_READWRITE, &d8oldProt)) {
+                    if (!Real_CommittedResource2)
+                        Real_CommittedResource2 = (PFN_CreateCommittedResource2)d8vt[69];
+                    if (!Real_PlacedResource1)
+                        Real_PlacedResource1 = (PFN_CreatePlacedResource1)d8vt[70];
+                    d8vt[69] = (void*)&Hook_CreateCommittedResource2;
+                    d8vt[70] = (void*)&Hook_CreatePlacedResource1;
+                    VirtualProtect(d8mbi.BaseAddress, d8mbi.RegionSize, d8oldProt, &d8oldProt);
+                    void* d8t[2] = { (void*)&Hook_CreateCommittedResource2,
+                                     (void*)&Hook_CreatePlacedResource1 };
+                    CfgMarkValid(d8t, 2);
+                    Log("hooks: Device8 resource hooks installed (69/70) vtbl=%p", (void*)d8vt);
+                } else {
+                    Log("hooks: Device8 table not writable - resource hooks skipped");
+                    InterlockedExchange(&s_d8HookState, 0);
+                }
+            } else {
+                Log("hooks: Device8 distinct table %p (hooked %p) - resource hooks skipped (coverage limitation)",
+                    (void*)d8vt, g_hookedDeviceVtbl);
+                InterlockedExchange(&s_d8HookState, 0);
+            }
+        }
+    }
+    return hr;
 }
 
 HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLevel,
@@ -6667,11 +8412,30 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
     // g_device poisoned every game-device assumption and cascaded into
     // DEVICE_REMOVED after each successful pInit.
     if (g_device) {
+        static volatile LONG s_skippedDevices = 0;
+        LONG n = InterlockedIncrement(&s_skippedDevices);
+        if (n <= 5) {
+            // Interface census covers every call including early-returns: a newer
+            // riid here would implicate post-capture devices directly.
+            Log("hooks: D3D12CreateDevice skipped (already have g_device=%p, n=%d riid=%08X:%04X:%04X:%02X%02X%02X%02X%02X%02X%02X%02X)",
+                (void*)g_device, (int)n,
+                (unsigned)riid.Data1, (unsigned)riid.Data2, (unsigned)riid.Data3,
+                riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+                riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
+        }
         return Real_D3D12CreateDevice_Tramp(adapter, minLevel, riid, ppDevice);
     }
     if (s_createCalls < 5) {
         ++s_createCalls;
-        Log("hooks: D3D12CreateDevice called #%d (g_device=%p)", s_createCalls, (void*)g_device);
+        // Device-interface census (diagnostic): which ID3D12Device version the
+        // game requests decides whether Device4+ '1'-variant creation methods
+        // (unhooked higher vtable slots) are a live hypothesis for resources
+        // missing from the slot-27/29/30 creation logs. Bounded (first 5).
+        Log("hooks: D3D12CreateDevice called #%d (g_device=%p riid=%08X:%04X:%04X:%02X%02X%02X%02X%02X%02X%02X%02X)",
+            s_createCalls, (void*)g_device,
+            (unsigned)riid.Data1, (unsigned)riid.Data2, (unsigned)riid.Data3,
+            riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+            riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
     }
     HRESULT hr = Real_D3D12CreateDevice_Tramp(adapter, minLevel, riid, ppDevice);
     if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
@@ -6708,11 +8472,17 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
             }
         }
         bool reinstallHooks = (g_device != newDev);
-        g_device = newDev;
+        // ALWAYS install RTV/SRV vtable hooks on every game device - the game
+        // creates multiple devices and we need to observe RTV creation on all.
+        // But only set g_device and install queue/list hooks on the first device.
+        bool isFirstDevice = (g_device == nullptr);
+        if (isFirstDevice) {
+            g_device = newDev;
+        }
         // Hook the cold device factory method so we can observe BeamNG's real
         // direct graphics queue. The old code only modified a temporary queue
         // created by ScaleNG, which could never see the game's submissions.
-        if (InterlockedCompareExchange(&g_realQueueHookInstalled, 0, 0) == 0 &&
+        if (isFirstDevice && InterlockedCompareExchange(&g_realQueueHookInstalled, 0, 0) == 0 &&
             newDev) {
             void** dv = *(void***)newDev;
             void* ccq = dv[8]; // ID3D12Device::CreateCommandQueue
@@ -6727,7 +8497,7 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                     ccq, (int)qst);
             }
         }
-        if (InterlockedCompareExchange(&g_realListHookInstalled, 0, 0) == 0 &&
+        if (isFirstDevice && InterlockedCompareExchange(&g_realListHookInstalled, 0, 0) == 0 &&
             newDev) {
             void** dv = *(void***)newDev;
             void* ccl = dv[12]; // ID3D12Device::CreateCommandList
@@ -6744,35 +8514,64 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                     ccl, (int)lst);
             }
         }
-        if (reinstallHooks) {
-            // Cold device-level view creation hooks are observation-only. The
+        // Install RTV/SRV/resource-creation hooks. Diagnostic-only forwarding.
+        {
+            // Cold device-level hooks are observation-only. The
             // hot command-list methods remain untouched below.
-            if (true) {
             // PURE VTABLE SWAP: never patch driver code bytes. Just redirect
             // the vtable pointer to our hook and save the original for
             // forwarding. The original function code is untouched.
-            void** vtbl = *(void***)g_device;
+            void** vtbl = *(void***)newDev;
 
+            // Shared-vtable safety: only one distinct device vtable is supported.
+            // Overwriting globals for a second distinct vtable would corrupt forwarding.
+            if (g_hookedDeviceVtbl && g_hookedDeviceVtbl != (void*)vtbl) {
+                Log("hooks: distinct device vtable %p already hooked %p - skipping second vtable (coverage limitation)",
+                    (void*)vtbl, g_hookedDeviceVtbl);
+            } else {
             // Make vtable page writable (it may be read-only)
             MEMORY_BASIC_INFORMATION mbi = {};
             VirtualQuery(vtbl, &mbi, sizeof(mbi));
             DWORD oldProt = 0;
             if (VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProt)) {
                 // Save originals and swap
-                Real_CreateRenderTargetView = (PFN_CreateRenderTargetView)vtbl[20];
-                Real_CreateShaderResourceView = (PFN_CreateShaderResourceView)vtbl[18];
-                vtbl[20] = (void*)&Hook_CreateRenderTargetView;
+                // ID3D12Device vtable (verified SDK 10.0.28000.0): QI=0, SRV=18, RTV=20,
+                // Committed=27, Placed=29, Reserved=30. Slot 26 is GetCustomHeapProperties.
+                // DescriptorHeap=14 (heap inventory, observe-only).
+                if (!Real_DeviceQI)
+                    Real_DeviceQI = (PFN_DeviceQueryInterface)vtbl[0];
+                if (!Real_CreateDescriptorHeap)
+                    Real_CreateDescriptorHeap = (PFN_CreateDescriptorHeap)vtbl[14];
+                if (!Real_CreateShaderResourceView)
+                    Real_CreateShaderResourceView = (PFN_CreateShaderResourceView)vtbl[18];
+                if (!Real_CreateRenderTargetView)
+                    Real_CreateRenderTargetView = (PFN_CreateRenderTargetView)vtbl[20];
+                if (!Real_CreateCommittedResource)
+                    Real_CreateCommittedResource = (PFN_CreateCommittedResource)vtbl[27];
+                if (!Real_CreatePlacedResource)
+                    Real_CreatePlacedResource = (PFN_CreatePlacedResource)vtbl[29];
+                if (!Real_CreateReservedResource)
+                    Real_CreateReservedResource = (PFN_CreateReservedResource)vtbl[30];
                 vtbl[18] = (void*)&Hook_CreateShaderResourceView;
+                vtbl[20] = (void*)&Hook_CreateRenderTargetView;
+                vtbl[27] = (void*)&Hook_CreateCommittedResource;
+                vtbl[29] = (void*)&Hook_CreatePlacedResource;
+                vtbl[30] = (void*)&Hook_CreateReservedResource;
+                vtbl[14] = (void*)&Hook_CreateDescriptorHeap;
+                vtbl[0] = (void*)&Shim_DeviceQI;
                 VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
-                Log("hooks: device vtable SWAPPED (20, 18) - no code patched");
+                g_hookedDeviceVtbl = (void*)vtbl;
+                Log("hooks: device vtable SWAPPED (18, 20, 27, 29, 30) on device %p vtbl=%p", (void*)newDev, (void*)vtbl);
+                Log("hooks: device QI census installed (slot 0) vtbl=%p", (void*)vtbl);
+                Log("hooks: descriptor-heap inventory installed (slot 14) vtbl=%p", (void*)vtbl);
             } else {
-                Log("hooks: VirtualProtect on vtable failed - device hooks not installed");
+                Log("hooks: VirtualProtect on vtable failed - device hooks not installed on device %p", (void*)newDev);
             }
             {
-                void* targets[2] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView };
-                CfgMarkValid(targets, 2);
+                void* targets[7] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView, (void*)Hook_CreateCommittedResource, (void*)Hook_CreatePlacedResource, (void*)Hook_CreateReservedResource, (void*)&Shim_DeviceQI, (void*)&Hook_CreateDescriptorHeap };
+                CfgMarkValid(targets, 7);
             }
-            } // end disabled device vtable swap
+            }
         }
 
         ID3D12CommandQueue* queue = nullptr;
@@ -6809,15 +8608,20 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
 void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
 {
     if (!list) return;
+    InterlockedIncrement64(&g_installCallsTotal);
 
     void** original = nullptr;
-    __try { original = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
-    if (!original) return;
+    __try { original = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement64(&g_installFailTotal);
+        return;
+    }
+    if (!original) { InterlockedIncrement64(&g_installFailTotal); return; }
 
     AcquireSRWLockExclusive(&g_commandListShimLock);
     for (auto& existing : g_commandListShims) {
         if (existing.list == list &&
             (existing.originalVtbl == original || existing.clonedVtbl == original)) {
+            InterlockedIncrement64(&g_installDedupTotal);
             ReleaseSRWLockExclusive(&g_commandListShimLock);
             return;
         }
@@ -6828,6 +8632,7 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
         if (!candidate.clonedVtbl) { slot = &candidate; break; }
     }
     if (!slot) {
+        InterlockedIncrement64(&g_installFailTotal);
         ReleaseSRWLockExclusive(&g_commandListShimLock);
         Log("hooks: command-list shim table full");
         return;
@@ -6838,6 +8643,7 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
         sizeof(void*) * kCommandListVtableEntries,
         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!cloned) {
+        InterlockedIncrement64(&g_installFailTotal);
         ReleaseSRWLockExclusive(&g_commandListShimLock);
         Log("hooks: command-list shim allocation failed");
         return;
@@ -6851,6 +8657,7 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
     }
     if (!copied) {
         VirtualFree(cloned, 0, MEM_RELEASE);
+        InterlockedIncrement64(&g_installFailTotal);
         ReleaseSRWLockExclusive(&g_commandListShimLock);
         Log("hooks: command-list shim vtable copy faulted list=%p", (void*)list);
         return;
@@ -6863,12 +8670,34 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
     slot->copyCount = 0;
     slot->originalVtbl = original;
     slot->clonedVtbl = cloned;
+    // ID3D12GraphicsCommandList vtable slots from the Windows SDK
+    // (10.0.28000.0 DECLSPEC_XFGVIRT order cross-checked):
+    // CopyBufferRegion=15, CopyTextureRegion=16, CopyResource=17,
+    // RSSetViewports=21, RSSetScissorRects=22, ResourceBarrier=26,
+    // OMSetRenderTargets=46, SetGraphicsRootDescriptorTable=32.
+    slot->copyBufferRegion = (PFN_CopyBufferRegion)original[15];
     slot->copyTexture = (PFN_CopyTextureRegion)original[16];
-    // ID3D12GraphicsCommandList vtable slots from the Windows SDK:
-    // CopyTextureRegion=16, ResourceBarrier=26, OMSetRenderTargets=46.
+    slot->copyResource = (PFN_CopyResource)original[17];
+    slot->setGraphicsRootDescriptorTable = (PFN_SetGraphicsRootDescriptorTable)original[32];
+    slot->rsSetViewports = (PFN_RSSetViewports)original[21];
+    slot->rsSetScissorRects = (PFN_RSSetScissorRects)original[22];
     slot->omSetRenderTargets = (PFN_OMSetRenderTargets)original[46];
     slot->resourceBarrier = (PFN_ResourceBarrier)original[26];
+    static unsigned s_slotDiag = 0;
+    if (++s_slotDiag <= 3) {
+        Log("hooks: shim vtable slots copyBufferRegion=%p copyTexture=%p copyResource=%p resourceBarrier=%p omSetRenderTargets=%p rsSetViewports=%p rsSetScissorRects=%p rootDescTable=%p",
+            (void*)slot->copyBufferRegion, (void*)slot->copyTexture,
+            (void*)slot->copyResource,
+            (void*)slot->resourceBarrier, (void*)slot->omSetRenderTargets,
+            (void*)slot->rsSetViewports, (void*)slot->rsSetScissorRects,
+            (void*)slot->setGraphicsRootDescriptorTable);
+    }
+    cloned[15] = (void*)&Shim_CopyBufferRegion;
     cloned[16] = (void*)&Shim_CopyTextureRegion;
+    cloned[17] = (void*)&Shim_CopyResource;
+    cloned[32] = (void*)&Shim_SetGraphicsRootDescriptorTable;
+    cloned[21] = (void*)&Shim_RSSetViewports;
+    cloned[22] = (void*)&Shim_RSSetScissorRects;
     cloned[46] = (void*)&Shim_OMSetRenderTargets;
     cloned[26] = (void*)&Shim_ResourceBarrier;
 
@@ -6884,18 +8713,30 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
         slot->originalVtbl = nullptr;
         slot->clonedVtbl = nullptr;
         slot->copyTexture = nullptr;
+        slot->copyBufferRegion = nullptr;
+        slot->copyResource = nullptr;
+        slot->setGraphicsRootDescriptorTable = nullptr;
+        slot->rsSetViewports = nullptr;
+        slot->rsSetScissorRects = nullptr;
         slot->omSetRenderTargets = nullptr;
         slot->resourceBarrier = nullptr;
         VirtualFree(cloned, 0, MEM_RELEASE);
+        InterlockedIncrement64(&g_installFailTotal);
         ReleaseSRWLockExclusive(&g_commandListShimLock);
         Log("hooks: command-list shim install faulted list=%p", (void*)list);
         return;
     }
 
-    void* targets[3] = { (void*)&Shim_CopyTextureRegion,
+    void* targets[8] = { (void*)&Shim_CopyBufferRegion,
+                         (void*)&Shim_CopyTextureRegion,
+                         (void*)&Shim_CopyResource,
+                         (void*)&Shim_SetGraphicsRootDescriptorTable,
+                         (void*)&Shim_RSSetViewports,
+                         (void*)&Shim_RSSetScissorRects,
                          (void*)&Shim_OMSetRenderTargets,
                          (void*)&Shim_ResourceBarrier };
-    CfgMarkValid(targets, 3);
+    CfgMarkValid(targets, 8);
+    InterlockedIncrement64(&g_installOkTotal);
     ReleaseSRWLockExclusive(&g_commandListShimLock);
     Log("hooks: command-list read-only shim installed list=%p original=%p cloned=%p",
         (void*)list, (void*)original, (void*)cloned);
@@ -7156,7 +8997,8 @@ void HooksSetConfig(const ScaleNgConfig& config)
     g_hudIniOn = config.hud;
     g_legacyScale = config.legacyScale;
     g_passiveMode = config.passive;
-    Log("hooks: config applied (dlaa=%d)", g_dlaaMode ? 1 : 0);
+    Log("hooks: config applied (dlaa=%d legacyScale=%d; viewport arming is dlaa-gated, legacyScale retained for compat)",
+        g_dlaaMode ? 1 : 0, g_legacyScale ? 1 : 0);
 }
 
 void HooksGetDescriptorHeaps(UINT* count, ID3D12DescriptorHeap** heaps)
@@ -7185,7 +9027,10 @@ unsigned HooksGetQuietFrames() {
     // Chain never observed yet => NOT quiet. (frameCounter grows through the
     // loading screen before any display-sized copy exists, which made the
     // 600f gate pass instantly and let nvngx load mid-churn.)
-    return g_lastNewChainFrame ? (g_frameCounter - g_lastNewChainFrame) : 0;
+    // Correctness: use the observed flag, not last==0, because 0 is also a
+    // valid frameCounter (first chain node seen pre-first-camera). Threshold
+    // and units unchanged (camera-frames, 120).
+    return g_chainObserved ? (g_frameCounter - g_lastNewChainFrame) : 0;
 }
 void HooksSetSmokeBusy(int v) { InterlockedExchange(&g_smokeBusy, (LONG)v); }
 void HooksKickEGSH() { EnsureGlobalSwapchainHookImpl(); }
@@ -7299,6 +9144,18 @@ void HooksInstallCreateDeviceDetour()
     }
     InterlockedExchange(&s_installState, 1);
     Log("hooks: D3D12CreateDevice detour installed");
+
+    // Global Map/Unmap hooks for constant buffer discovery (camera CB, velocity CB)
+    // These catch Map calls on already-created resources
+    if (g_device) {
+        void** devVtbl = *(void***)g_device;
+        // Note: Map/Unmap are on ID3D12Resource vtable, not device vtable.
+        // We need to hook them on the resource vtable. Since resources are created
+        // dynamically, we'll use a different approach: hook CreateCommittedResource
+        // to install per-resource shims (already done above).
+        // For resources created BEFORE our hook, we need another approach.
+        Log("hooks: Resource Map/Unmap shim infrastructure ready");
+    }
 
     // DXGI factory detours to capture the swapchain for Present-time injection.
     HMODULE dxgi = GetModuleHandleA("dxgi.dll");

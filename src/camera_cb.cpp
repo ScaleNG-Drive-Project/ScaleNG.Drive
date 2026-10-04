@@ -14,6 +14,9 @@ constexpr size_t kViewProj = 496;
 constexpr size_t kProjectionParams = 688;
 constexpr size_t kViewProjPrevFrame = 1184;
 constexpr size_t kWorldToScreenPos0PrevFrame = 1248;
+// BeamNG gameplay cameras can report a 12,500-unit far plane. Keep a broad,
+// finite sanity ceiling without rejecting that valid live camera transform.
+constexpr float kMaxCameraFarPlane = 100000.0f;
 
 bool IsFinite(const float* f, size_t count)
 {
@@ -76,7 +79,7 @@ bool ValidateCameraCb(const void* data, size_t size)
         std::fabs(worldToCamera[14]) < 0.1f) return false;
 
     if (projParams[0] < 0.01f || projParams[0] > 1.0f) return false;
-    if (projParams[1] < 1000.0f || projParams[1] > 10000.0f) return false;
+    if (projParams[1] < 1000.0f || projParams[1] > kMaxCameraFarPlane) return false;
     if (!std::isfinite(projParams[2]) || !std::isfinite(projParams[3])) return false;
 
     return true;
