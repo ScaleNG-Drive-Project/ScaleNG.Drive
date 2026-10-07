@@ -407,10 +407,29 @@ struct BookGuard {
     BookGuard() { InitOnceExecuteOnce(&g_bookInit, InitBookCS, nullptr, nullptr); EnterCriticalSection(&g_bookCS); }
     ~BookGuard() { LeaveCriticalSection(&g_bookCS); }
 };
+// Own-texture guard (forward): our textures must never be adopted as engine
+// inputs (proven: NGX-created SRV on our g_shDepth adopted it into the depth
+// slot — REAL depth was our own zeros). Defined after the owned globals.
+static bool IsOwnResource(ID3D12Resource* res);
 
-void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
+bool StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
+// Returns true when the slot names res afterwards (stored, or already did).
+// Returns false ONLY on self-adopt rejection. Callers MUST NOT update
+// discovery metadata (valid bits, stamps, formats, state map, logs) on
+// false: the slot still holds the previous engine resource and the old
+// metadata describes it.
 {
-    if (*slot == res) return;
+    if (*slot == res) return true;
+    // SELF-ADOPTION GUARD: never track our own textures as engine inputs.
+    // NGX (via the hooked device) creates views on the resources we hand it;
+    // those view-creation hooks would otherwise adopt our placeholders back
+    // into the discovery slots (observed: NGX SRV on our g_shDepth).
+    if (res && IsOwnResource(res)) {
+        static volatile LONG s_selfAdoptLogs = 0;
+        if (InterlockedIncrement(&s_selfAdoptLogs) <= 3)
+            Log("hooks: self-adopt rejected %p", (void*)res);
+        return false;
+    }
     bool mvSlot = (slot == (ID3D12Resource**)&g_mvResource) || (slot == (ID3D12Resource**)&g_mvResourceAlt);
     bool depSlot = (slot == (ID3D12Resource**)&g_depthResource);
     bool sceneSlot = (slot == (ID3D12Resource**)&g_sceneColor) || (slot == (ID3D12Resource**)&g_sceneColorAlt);
@@ -419,12 +438,12 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
         // count as a change - otherwise the settle gate can never elapse.
         ID3D12Resource** other = (slot == (ID3D12Resource**)&g_sceneColor)
                                      ? &g_sceneColorAlt : &g_sceneColor;
-        if (*other == res) { *slot = res; return; } // pure reassignment
+        if (*other == res) { *slot = res; return true; } // pure reassignment
         // Only PERSISTENT composite sources are real scene changes - transient
         // post targets on recycled descriptors swap constantly during play.
         int persistNow = 0;
         { AcquireSRWLockShared(&g_copyMapLock); auto ci = g_copySrcCount.find((void*)res); if (ci != g_copySrcCount.end()) persistNow = ci->second; ReleaseSRWLockShared(&g_copyMapLock); }
-        if (persistNow < 40) { *slot = res; return; }
+        if (persistNow < 40) { *slot = res; return true; }
         g_lastSceneChangeFrame = g_frameCounter;
         g_lastDiscoveryChangeFrame = g_frameCounter;
         static unsigned s_changeFrames[8] = {};
@@ -444,7 +463,7 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     } else if (mvSlot) {
         ID3D12Resource** oMv = (slot == (ID3D12Resource**)&g_mvResource)
                                     ? &g_mvResourceAlt : &g_mvResource;
-        if (*oMv == res) { *slot = res; return; }
+        if (*oMv == res) { *slot = res; return true; }
         g_lastDiscoveryChangeFrame = g_frameCounter;
     } else if (depSlot) {
         g_lastDiscoveryChangeFrame = g_frameCounter;
@@ -454,6 +473,7 @@ void StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     // creation) desyncs its teardown bookkeeping and corrupts its object
     // graph. Staleness stamps + bridge SEH handle freed pointers safely.
     *slot = res;
+    return true;
 }
 // Last-seen MV RTV descriptor key. After an invalidation the engine does NOT
 // recreate its MV texture (same map/spawn - fixed content), so creation-based
@@ -3316,7 +3336,11 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             rd.Width == g_displayW && rd.Height == g_displayH &&
             (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
              desc->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || desc->Format == DXGI_FORMAT_D32_FLOAT)) {
-            StoreTracked(&g_depthResource, res);
+            // Metadata only on a real store: a rejected self-adopt must not
+            // corrupt the slot's engine metadata (valid/stamp/fmt/srvSourced).
+            // Forwarding below always runs regardless.
+            if (!StoreTracked(&g_depthResource, res)) { /* rejected: keep prior engine metadata */ }
+            else {
             g_depthValid = true;
             g_depthSrvSourced = true;
             g_depthStamp = g_frameCounter;
@@ -3324,6 +3348,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             g_depthMsaa = rd.SampleDesc.Count != 1;
             g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             Log("hooks: depth candidate SRV %p", (void*)res);
+            }
         }
     }
     if (Real_CreateShaderResourceView)
@@ -6207,12 +6232,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                             Log("hooks: MV re-adopt skipped - key now resolves to fmt=%u (not MV)",
                                 (unsigned)mrd.Format);
                     } else {
-                        StoreTracked(&g_mvResource, ri->second);
+                        // Metadata only on a real store (self-adopt guard).
+                        if (!StoreTracked(&g_mvResource, ri->second)) { /* keep prior MV metadata */ }
+                        else {
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
                         if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
                         g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
+                        }
                     }
                 }
             }
@@ -6756,6 +6784,24 @@ static unsigned g_abWindowPresents = 0;
 // ON = engine MV/depth after fail-closed validation, restored post-eval.
 static bool g_shadowRealInputs = false;
 
+// Own-texture registry check: every texture ScaleNG creates itself. The
+// discovery hooks (RTV/SRV creation, OM bind, copy DEST, registry re-adopt)
+// all funnel through StoreTracked, so one comparison list here protects
+// every slot (scene/MV/depth) against self-adoption feedback loops.
+static bool IsOwnResource(ID3D12Resource* res)
+{
+    if (!res) return false;
+    return res == g_shMv || res == g_shDepth || res == g_shOut ||
+           res == g_shMvUp || res == g_shDepthUp ||
+           res == g_hudAtlas || res == g_hudVb ||
+           res == g_ngxColor || res == g_ngxDepth || res == g_ngxMv || res == g_ngxOut ||
+           res == g_dlssOut ||
+           res == g_brColor || res == g_brDepth || res == g_brMv || res == g_brOut ||
+           res == g_gameColor || res == g_gameDepth || res == g_gameMv || res == g_gameOut ||
+           res == g_b2ColorG || res == g_b2ColorO || res == g_b2OutG || res == g_b2OutO ||
+           res == g_b2Depth || res == g_b2Mv;
+}
+
 static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSerial)
 {
     if (g_dlaaMode || !g_upscaler || !g_upscaler->IsReady()) return;
@@ -7122,6 +7168,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         if (!g_mvValid || !mv) realWhy = "no-mv";
         else if (!mvAlive) realWhy = "mv-retired";
         else if (mvd.Format != DXGI_FORMAT_R16G16_FLOAT) realWhy = "mv-format";
+        else if (IsOwnResource(mv) || IsOwnResource(dep)) realWhy = "self-input";
         else if (mvd.Width != g_displayW || mvd.Height != g_displayH) realWhy = "mv-size";
         else if (!g_depthValid || !dep) realWhy = "no-depth";
         else if (!depAlive) realWhy = "depth-retired";
@@ -8491,21 +8538,25 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                             g_sceneColorAlt = nullptr;
                     }
                     if (!srcIsTracked && !g_sceneColorAlt) {
-                        StoreTracked(&g_sceneColorAlt, src->pResource);
+                        // Metadata only on a real store (self-adopt guard).
+                        if (StoreTracked(&g_sceneColorAlt, src->pResource)) {
                         g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair node adopted as ALT %p (f10)", (void*)src->pResource);
+                        }
                     } else if (!dstIsTracked && !g_sceneColorAlt) {
-                        StoreTracked(&g_sceneColorAlt, dst->pResource);
+                        if (StoreTracked(&g_sceneColorAlt, dst->pResource)) {
                         g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair node adopted as ALT %p (f10 dst)", (void*)dst->pResource);
+                        }
                     } else if (!altIsPairHalf && g_sceneColorAlt &&
                                g_sceneColorAlt != src->pResource && g_sceneColorAlt != dst->pResource) {
                         ID3D12Resource* oldAlt = g_sceneColorAlt;
                         (void)oldAlt;
                         ID3D12Resource* cand = srcIsTracked ? dst->pResource : src->pResource;
-                        StoreTracked(&g_sceneColorAlt, cand);
+                        if (StoreTracked(&g_sceneColorAlt, cand)) {
                         g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
                         Log("hooks: terminal pair REPLACED non-pair ALT -> %p (f10)", (void*)cand);
+                        }
                     }
                 }
             }
@@ -8520,15 +8571,22 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
             // engine still copies the scene color at full-res every frame.
             // A display-sized scene-format src here is the scene color - adopt it.
             if (!g_sceneColorValid && !isMvDst) {
-                D3D12_RESOURCE_DESC sd = src->pResource->GetDesc();
-                if (sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                // Guarded desc read: src is a weak engine pointer (same class
+                // as the old copy-depth unguarded GetDesc). No early return:
+                // the engine copy below must always be forwarded.
+                D3D12_RESOURCE_DESC sd = {};
+                if (src->pResource && SafeGetDesc(src->pResource, &sd) &&
+                    sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     sd.MipLevels == 1 &&
                     IsSceneColorFormat((unsigned)sd.Format)) {
-                    StoreTracked(&g_sceneColor, src->pResource);
+                    // Metadata only on a real store (self-adopt guard).
+                    if (!StoreTracked(&g_sceneColor, src->pResource)) { /* keep prior */ }
+                    else {
                     g_sceneColorValid = true;
                     g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE;
                     AdoptDisplaySize((unsigned int)sd.Width, (unsigned int)sd.Height);
                     Log("hooks: scene color adopted from copy source %p", (void*)g_sceneColor);
+                    }
                 }
             }
             isSceneSrc = (src->pResource == g_sceneColor ||
@@ -8590,7 +8648,9 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         Log("hooks: depth copy skipped - SRV depth kept %p", (void*)g_depthResource);
                 } else {
                 if (!g_depthValid) g_depthFirstValidFrame = g_frameCounter;
-                StoreTracked(&g_depthResource, dst->pResource);
+                // Metadata only on a real store (self-adopt guard).
+                if (!StoreTracked(&g_depthResource, dst->pResource)) { /* keep prior depth metadata */ }
+                else {
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
                 {
@@ -8608,6 +8668,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 }
                 }
             }
+        }
         }
         // FALLBACK trigger: full-res copy into the MV resource (pool re-fill events).
         // Almost never usable (patchApplied is false in that context); kept as a safety.
@@ -8901,11 +8962,15 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                         (unsigned)mrd.Width == g_displayW && mrd.Height == g_displayH &&
                         mrd.Format == DXGI_FORMAT_R16G16_FLOAT) {
                         bool first = !g_mvValid;
-                        StoreTracked(&g_mvResource, g_boundRtvResource);
+                        // Metadata only on a real store (self-adopt guard).
+                        // No log on this path by design (per-frame bind frequency).
+                        if (!StoreTracked(&g_mvResource, g_boundRtvResource)) { /* keep prior MV metadata */ }
+                        else {
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
                         if (first) g_mvFirstValidFrame = g_frameCounter;
                         g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                        }
                     }
                 }
             }

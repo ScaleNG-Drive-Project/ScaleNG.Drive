@@ -2300,3 +2300,56 @@ blindly copy this workaround to another installation without checking its files.
  recent runs); 20-min run stays off the table (user directive).
  Clean 100s reference run 204943Z (p12764, zeros default): PASS_DLSS_EVAL,
  ok #7800 (present 8641, handoff 1), 0 FAILED/FAULTED, breaker silent.
+
+## User F9 session forensics + self-adoption fix (2026-10-07/08, runs 204943Z/211024Z/220445Z)
+
+**User session (204943Z p12764): 7× F9-ON, 7/7 engaged REAL
+ (`why=real`), 0 FAILED/FAULTED, F8 visibly gated handoff (log handoff
+ bit follows).** MV D35A4DF810 genuine engine (RTV-created,
+ rtv-provenance, barrier traffic). **Depth D35A68EFF0 was OUR OWN
+ g_shDepth** (committed, SRV-only, born present 842 = infra timing —
+ same fingerprint as our placeholders, no RTV role, no engine touches):
+ NGX's first-eval SRV creation on our placeholder (via hooked device)
+ adopted it into the depth slot (pre-guard build). So the user's null
+ visual = genuine-MV + zero-depth REAL at DLAA-native-frozen-jitter
+ over ~2–5s windows: E4 (expected subtlety) + depth-void + short
+ windows. F9 worked; the signal was half-void. Next human test
+ (A–G protocol) now runs with genuine depth available.
+**Subagent reconciliation (3× read-only, non-overlapping):** log
+ investigator confirmed 7/7 engagement + fault-free continuity (with
+ sampling caveats stated); source auditor verified F9/F8 wiring sound
+ and predicted E4 invisibility; test designer proposed the A–G human
+ protocol + decision table (adopted). CORRECTION from cross-check:
+ adoption-tracer proved the slots were NEVER overwritten — my "slots
+ hold our textures" reading confused the periodic `mv=/depth=` lines
+ (which print the fallback *inputs* inMv/inDepth, i.e. our placeholders
+ by design) with slot contents. The real corruption was METADATA-ONLY:
+ SRV-depth/MV-re-adopt/depth-copy sites set valid/stamp/fmt/srvSourced
+ unconditionally AFTER a rejected store (slot kept engine texture, flags
+ described ours + `srvSourced` pinned against refresh). MV slot was never
+ at risk (no MV SRV branch exists). Run A (194541Z) and Run B (200358Z)
+ claims STAND as genuine-engine by creation-path fingerprint
+ (placed-heap, 8–17s pre-infra, RTV roles at birth, engine traffic;
+ ours are committed/SRV-only/born ~842): A = real MV + real
+ engine-velocity-as-depth (reframed, not invalidated), B = real MV +
+ real D24 depth; counters #7200/#9000 authoritative over sampled lines.
+**Fix (source change, this turn):** `StoreTracked` returns bool (false
+ only on self-reject; same-pointer/null pass through); metadata
+ early-outs at SRV-depth, MV re-adopt, depth-copy, scene ALT trio
+ (8541/45/53), scene-copy fallback (+SafeGetDesc replacing an unguarded
+ GetDesc on a weak pointer), MV track-by-bind (silent path, highest
+ latent risk); `IsOwnResource` += staging buffers + HUD textures
+ (all other owned textures were already covered; backbuffer/weak refs
+ deliberately excluded). Validation adds `self-input` fail-closed
+ reason (defense-in-depth). No hook forward touched (forwarding audit:
+ all Real_* paths intact, exactly-once preserved). A brace hunt needed
+ one added `}` (copy-site else stole its close; subagent-localized,
+ compiler-verified). Files: `src/d3d12_hooks.cpp` only (+ STATUS).
+ Reversal: revert the bool signature + 7 early-out sites + list
+ additions + `self-input` line; rebuild; rerun. Zero-path behavior
+ unchanged (fallbacks byte-identical).
+**Test 220445Z (90s, realInputs=1 deployed, p10832): PASS_DLSS_EVAL,**
+ 21 sampled oks (last #6600), 0 FAILED/FAULTED, breaker silent,
+ `self-adopt rejected` ×1 (loop recurs, blocked), depth-size fallbacks
+ ×22 (transient 359x379 junk correctly rejected). Deployed INI restored
+ to `realInputs=0`. Artifacts preserved under `logs/test_runs/`.
