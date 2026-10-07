@@ -217,6 +217,8 @@ bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
     // BEFORE loading it - it names the exact parameter on EvaluateFeature
     // rejections, which ScaleNG.log cannot see.
     SetEnvironmentVariableA("__NGX_LOG_LEVEL", "3");
+    // SIMCLASS experiment (forum 384236) REVERTED 2026-10-07: identical
+    // 0xBAD00002 on this box (run 20261007T163545Z). No behavior remnant.
     // NOTE (2026-10-04): __NGX_DISABLE_UPDATER intentionally NOT set — the
     // 310.x NGX Update Module resolves feature DLLs, and disabling it is a
     // suspect in Init PlatformError. Reversible one-liner.
@@ -224,19 +226,37 @@ bool NvDlssUpscaler::LoadNGX(const wchar_t* dllPath)
     // PART 2: locate and load the driver's NGX core (nvngx.dll in the driver
     // store). It exports the classic API: Init / AllocateParameters /
     // CreateFeature / EvaluateFeature / Shutdown.
-    wchar_t corePath[MAX_PATH] = {};
-    WIN32_FIND_DATAW fd = {};
-    HANDLE hFind = FindFirstFileW(L"C:\\Windows\\System32\\DriverStore\\FileRepository\\nvlti.inf_*", &fd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        FindClose(hFind);
-        CopyW(corePath, MAX_PATH, L"C:\\Windows\\System32\\DriverStore\\FileRepository\\");
-        AppendW(corePath, MAX_PATH, fd.cFileName);
-        AppendW(corePath, MAX_PATH, L"\\nvngx.dll");
-        m_ngxDll = LoadLibraryW(corePath);
-        if (m_ngxDll) {
-            CopyW(m_dlssPath, MAX_PATH, corePath);
-            Log("DLSS: loaded driver core nvngx.dll (%ls)", corePath);
+    // 2026-10-07 fix (reviewer hypothesis B CONFIRMED): the old code hardcoded
+    // only nvlti.inf_*, but this machine's core lives under nvltsi.inf_* (other
+    // drivers use nv_dispi.inf_* etc.). Enumerate every nv*.inf_* dir and load
+    // the first nvngx.dll found there. Verified live: FileRepository census
+    // found nvltsi.inf_amd64_...\nvngx.dll (489KB core vs 74MB snippet).
+    {
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(L"C:\\Windows\\System32\\DriverStore\\FileRepository\\nv*.inf_*", &fd);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            Log("DLSS: driver-store INF census failed err=%lu", GetLastError());
         }
+        while (hFind != INVALID_HANDLE_VALUE) {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                fd.cFileName[0] != L'.') {
+                wchar_t cand[MAX_PATH] = {};
+                CopyW(cand, MAX_PATH, L"C:\\Windows\\System32\\DriverStore\\FileRepository\\");
+                AppendW(cand, MAX_PATH, fd.cFileName);
+                AppendW(cand, MAX_PATH, L"\\nvngx.dll");
+                DWORD attr = GetFileAttributesW(cand);
+                if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    m_ngxDll = LoadLibraryW(cand);
+                    if (m_ngxDll) {
+                        CopyW(m_dlssPath, MAX_PATH, cand);
+                        Log("DLSS: loaded driver core nvngx.dll (%ls)", cand);
+                        break;
+                    }
+                }
+            }
+            if (!FindNextFileW(hFind, &fd)) break;
+        }
+        if (hFind != INVALID_HANDLE_VALUE) FindClose(hFind);
     }
     if (!m_ngxDll) {
         // Fallback: System32 (older driver layouts).
@@ -352,10 +372,19 @@ bool NvDlssUpscaler::Init(const UpscalerInitParams& params)
     for (size_t i = 0; i < len; ++i)
         if (moduleDir[i] == L'\\') cut = i + 1;
     moduleDir[cut] = L'\0';
-    // Use the SAME data path as the harness (test_mini) which provably works.
-    // The module directory was causing NGX to search for snippets/models in
-    // the wrong location, leading to incomplete initialization.
-    CopyW(m_ngxDataPath, MAX_PATH, L"C:\\ProgramData\\NVIDIA\\NGX\\models");
+    // Data path: dedicated fresh subdir (stale-state interference variant,
+    // 2026-10-07). Previously the shared models dir itself; that dir is
+    // writable (verified) and results were identical, so this tests whether
+    // NGX wants a dir it owns. One variable; reversible by reverting these
+    // lines. Falls back to the shared dir if creation fails.
+    CopyW(m_ngxDataPath, MAX_PATH, L"C:\\ProgramData\\NVIDIA\\NGX\\models\\ScaleNG_ngx");
+    if (!CreateDirectoryW(m_ngxDataPath, nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        Log("DLSS: data subdir not creatable - falling back to shared models dir");
+        CopyW(m_ngxDataPath, MAX_PATH, L"C:\\ProgramData\\NVIDIA\\NGX\\models");
+    } else {
+        Log("DLSS: data path %ls", m_ngxDataPath);
+    }
 
     m_initialized = true;
     return true;

@@ -4,7 +4,9 @@
 // shipped nvngx_dlss.dll, and calls Init_Ext exactly as dlss_ngx.cpp does.
 // Prints exact result codes; touches nothing belonging to the game.
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d12.h>
+#include <d3d11.h>
 #include <dxgi.h>
 #include <cstdio>
 
@@ -27,6 +29,30 @@ struct NVSDK_NGX_FeatureCommonInfo_L {
 typedef NVSDK_NGX_Result_Local (__cdecl* PFN_Init_Ext_L)(
     unsigned long long, const wchar_t*, ID3D12Device*, NVSDK_NGX_Version_Local,
     const NVSDK_NGX_FeatureCommonInfo_L*);
+
+static void SnapNvMods(const char* tag)
+{
+    HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (h == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me = {};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(h, &me)) do {
+        wchar_t* n = me.szModule;
+        size_t L = 0;
+        while (n[L]) ++L;
+        if (L > 4) {
+            wchar_t low[64] = {};
+            for (size_t i = 0; i < L && i < 63; ++i) {
+                wchar_t c = n[i];
+                low[i] = (wchar_t)((c >= L'A' && c <= L'Z') ? (c + 32) : c);
+            }
+            bool hit = wcsstr(low, L"nv") != nullptr || wcsstr(low, L"ngx") != nullptr ||
+                       wcsstr(low, L"dxg") != nullptr || wcsstr(low, L"d3d12") != nullptr;
+            if (hit) wprintf(L"probe: mod-%hs: %ls\n", tag, n);
+        }
+    } while (Module32NextW(h, &me));
+    CloseHandle(h);
+}
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -121,8 +147,53 @@ int wmain(int argc, wchar_t** argv)
     fc.LoggingInfo.MinimumLoggingLevel = 1;
     fc.LoggingInfo.DisableOtherLoggingSinks = false;
 
+    SnapNvMods("pre-init");
     int rc = pExt(appId, sub, dev, 0x15, &fc);
     printf("probe: Init_Ext(appId=%llu) result=%d (0x%08X)\n", appId, rc, (unsigned)rc);
     dev->Release();
+
+    // Module-load audit: does snippet Init pull any sibling (core/update)
+    // DLLs? Snapshot process modules before/after via toolhelp.
+    SnapNvMods("post-init");
+
+    // NvAPI visibility check: NGX platform needs NvAPI GPU handles. Forum box
+    // verified 2 GPUs via NvAPI; verify here (IDs are NVIDIA's public ABI).
+    {
+        HMODULE nvapi = LoadLibraryW(L"nvapi64.dll");
+        typedef void* (__cdecl* PFN_QI)(unsigned int);
+        PFN_QI qi = nvapi ? (PFN_QI)GetProcAddress(nvapi, "nvapi_QueryInterface") : nullptr;
+        typedef int (__cdecl* PFN_EnumGPUs)(void* handles[64], int* count);
+        PFN_EnumGPUs pEnum = qi ? (PFN_EnumGPUs)qi(0xE5AC921F) : nullptr;
+        printf("probe: nvapi=%p enumGPUs=%p\n", (void*)nvapi, (void*)pEnum);
+        if (pEnum) {
+            void* handles[64] = {};
+            int count = 0;
+            int st = pEnum(handles, &count);
+            printf("probe: NvAPI_EnumPhysicalGPUs status=%d count=%d\n", st, count);
+        }
+    }
+
+    // Forum 384236 discriminator: D3D11 Init SUCCEEDS where D3D12 fails on the
+    // reporter's box. Same question here, zero game involvement.
+    {
+        typedef int (__cdecl* PFN_D3D11_Init_L)(unsigned long long, const wchar_t*,
+            ID3D11Device*, const void*, int);
+        PFN_D3D11_Init_L pD3D11 = (PFN_D3D11_Init_L)GetProcAddress(
+            dll, "NVSDK_NGX_D3D11_Init");
+        printf("probe: D3D11_Init=%p\n", (void*)pD3D11);
+        if (pD3D11) {
+            ID3D11Device* d11 = nullptr;
+            HRESULT hr11 = D3D11CreateDevice(picked, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                                            nullptr, 0, D3D11_SDK_VERSION, &d11,
+                                            nullptr, nullptr);
+            printf("probe: D3D11CreateDevice hr=0x%08X dev=%p\n", (unsigned)hr11, (void*)d11);
+            if (SUCCEEDED(hr11) && d11) {
+                int rc11 = pD3D11(appId, sub, d11, &fc, 0x15);
+                printf("probe: D3D11_Init(appId=%llu) result=%d (0x%08X)\n",
+                       appId, rc11, (unsigned)rc11);
+                d11->Release();
+            }
+        }
+    }
     return 0;
 }

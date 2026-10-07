@@ -2480,10 +2480,14 @@ void EnsureUpscalerInit(bool bypassQuietGate)
     // Atomic: only one thread may attempt NGX init
     if (InterlockedCompareExchange(&g_upscalerInitAttempted, 1, 0) != 0) return;
     // SINGLE-DEVICE ARCHITECTURE: abandon bridge. Use game's device directly.
-    // The old assumption was that NGX needs IDXGIDevice (which the wrapper
-    // blocks). But we never actually TESTED NGX on the wrapped device - we
-    // assumed failure. Test it now.
-    if (!g_device) return;
+    // Tested live (runs 182725Z+): NGX Init on the game device returns
+    // 0xBAD00001/0xBAD00002, identically on pristine clean devices — see the
+    // Init investigation in docs/STATUS.md. QI(IDXGIDevice) failure below is
+    // normal D3D12 behavior (proven on clean devices), not wrapper blocking.
+    if (!g_device) {
+        InterlockedExchange(&g_upscalerInitAttempted, 0);
+        return;
+    }
     Log("hooks: SINGLE-DEVICE - attempting NGX init on game device %p", (void*)g_device);
     // Log adapter info if QI succeeds (diagnostic only, not a gate)
     {
@@ -2501,12 +2505,15 @@ void EnsureUpscalerInit(bool bypassQuietGate)
             }
             dxgidev->Release();
         } else {
-            Log("hooks: SINGLE-DEVICE wrapper blocks IDXGIDevice - proceeding anyway");
+            Log("hooks: SINGLE-DEVICE QI(IDXGIDevice) failed as on clean D3D12 devices - proceeding anyway");
         }
     }
     if (!g_upscaler) g_upscaler = CreateUpscaler(UPSCALER_DLSS);
     if (!g_upscaler) {
         Log("hooks: upscaler creation failed");
+        // Auditor fix: deferral must not consume the single attempt (see NOTE
+        // above). Any early return below re-arms so later callers retry.
+        InterlockedExchange(&g_upscalerInitAttempted, 0);
         return;
     }
     UpscalerInitParams ip = {};
@@ -2524,6 +2531,11 @@ void EnsureUpscalerInit(bool bypassQuietGate)
     if (!g_upscaler->Init(ip)) {
         Log("hooks: DLSS init failed - upscaling disabled");
         g_upscaler->SetEnabled(false);
+        // Auditor fix: a failed Init is not an attempt that may proceed — the
+        // atomic flag stays clear so later callers retry (throttled by the
+        // 1/60-present retry cadence and the CreateFeature 1/sec throttle, so
+        // no spin). SetEnabled(false) keeps Evaluate gated until then.
+        InterlockedExchange(&g_upscalerInitAttempted, 0);
     } else {
         Log("hooks: upscaler ready (render %ux%u display %ux%u)",
             g_renderW, g_renderH, g_displayW, g_displayH);
@@ -6692,22 +6704,72 @@ static UINT64 g_shFenceNext = 1;
 static UINT64 g_shFenceDone[2] = {};
 static UINT64 g_shUpFenceVal = 0;
 static unsigned g_shFlip = 0;
+// Visible-handoff master switch (F8 toggles live; logged). Default ON: this
+// VM exists to verify DLSS visuals, and any corruption is diagnosable
+// evidence with a one-key revert.
+static bool g_shadowHandoff = true;
 
 static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSerial)
 {
     if (g_dlaaMode || !g_upscaler || !g_upscaler->IsReady()) return;
+    // F8 edge-triggered handoff toggle for live A/B comparison.
+    {
+        static bool s_f8Prev = false;
+        bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (f8 && !s_f8Prev) {
+            g_shadowHandoff = !g_shadowHandoff;
+            Log("hooks: shadow-eval handoff %s (F8)", g_shadowHandoff ? "ON" : "OFF");
+        }
+        s_f8Prev = f8;
+    }
     if (!g_device || g_displayW == 0 || g_displayH == 0) return;
     ID3D12CommandQueue* queue = g_gameSubmitQueue ? g_gameSubmitQueue : g_graphicsQueue;
     if (!queue) return;
     ID3D12Resource* bb = nullptr;
-    __try {
-        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    // Use the CURRENT backbuffer index, never hardcoded 0: with 2+ buffers,
+    // index 0 may be the frame the engine is already acquiring next, and
+    // transitioning/copying it corrupts engine state (prime suspect in the
+    // 165729Z GPU crash: 2 handoffs then device loss). QI IDXGISwapChain3;
+    // logged fallback to 0 only if the interface is unavailable.
+    {
+        UINT bbIndex = 0;
+        IDXGISwapChain3* sc3 = nullptr;
+        __try {
+            if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3)) && sc3) {
+                bbIndex = sc3->GetCurrentBackBufferIndex();
+                sc3->Release();
+            } else {
+                static volatile LONG s_bbIdxLogs = 0;
+                if (InterlockedIncrement(&s_bbIdxLogs) <= 2)
+                    Log("hooks: shadow-eval no IDXGISwapChain3 - using buffer 0");
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        __try {
+            if (FAILED(sc->GetBuffer(bbIndex, IID_PPV_ARGS(&bb))) || !bb) return;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        static UINT s_bbLastIndex = 0xFFFFFFFFu;
+        if (bbIndex != s_bbLastIndex) {
+            s_bbLastIndex = bbIndex;
+            Log("hooks: shadow-eval backbuffer index=%u", bbIndex);
+        }
+    }
     D3D12_RESOURCE_DESC bbd = {};
     __try { bbd = bb->GetDesc(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { bb->Release(); return; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        static volatile LONG s_shDescFaults = 0;
+        if (InterlockedIncrement(&s_shDescFaults) <= 3)
+            Log("hooks: shadow-eval backbuffer desc fault");
+        bb->Release(); return;
+    }
     if (bbd.Width != g_displayW || bbd.Height != g_displayH ||
-        bbd.Format != DXGI_FORMAT_R8G8B8A8_UNORM) { bb->Release(); return; }
+        bbd.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        static volatile LONG s_shSizeMiss = 0;
+        if (InterlockedIncrement(&s_shSizeMiss) <= 3)
+            Log("hooks: shadow-eval size mismatch bb=%ux%u fmt=%u vs display=%ux%u",
+                (unsigned)bbd.Width, (unsigned)bbd.Height, (unsigned)bbd.Format,
+                g_displayW, g_displayH);
+        bb->Release(); return;
+    }
 
     // Lazy one-time infra (own fence/allocators/lists/inputs/output).
     static LONG s_shInit = 0;
@@ -6889,6 +6951,9 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         return;
     }
     if (FAILED(g_shAlloc[slot]->Reset()) || FAILED(g_shList[slot]->Reset(g_shAlloc[slot], nullptr))) {
+        static volatile LONG s_shResetFails = 0;
+        if (InterlockedIncrement(&s_shResetFails) <= 3)
+            Log("hooks: shadow-eval allocator/list reset failed");
         bb->Release();
         return;
     }
@@ -6923,14 +6988,52 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     ep.sharpness = g_cfg.sharpness;
     bool ok = g_upscaler->Evaluate(ep);
 
-    b.Transition.pResource = bb;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    list->ResourceBarrier(1, &b);
-    b.Transition.pResource = g_shOut;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-    list->ResourceBarrier(1, &b);
+    // HANDOFF (visible DLSS): on success, write the evaluated output back
+    // into the backbuffer before Real_Present runs. All states self-owned:
+    // bb is PSR (set above), shOut is UAV (set above). F8 toggles live for
+    // A/B comparison (logged). On eval failure the original frame presents
+    // untouched (prior behavior).
+    static bool s_handoffLogged = false;
+    if (ok && g_shadowHandoff) {
+        b.Transition.pResource = bb;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &b);
+        b.Transition.pResource = g_shOut;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &b);
+        D3D12_TEXTURE_COPY_LOCATION hdst = {};
+        hdst.pResource = bb;
+        hdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        hdst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION hsrc = {};
+        hsrc.pResource = g_shOut;
+        hsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        hsrc.SubresourceIndex = 0;
+        list->CopyTextureRegion(&hdst, 0, 0, 0, &hsrc, nullptr);
+        b.Transition.pResource = g_shOut;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        list->ResourceBarrier(1, &b);
+        b.Transition.pResource = bb;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        list->ResourceBarrier(1, &b);
+        if (!s_handoffLogged) {
+            s_handoffLogged = true;
+            Log("hooks: shadow-eval HANDOFF armed (F8 toggles)");
+        }
+    } else {
+        b.Transition.pResource = bb;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        list->ResourceBarrier(1, &b);
+        b.Transition.pResource = g_shOut;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        list->ResourceBarrier(1, &b);
+    }
     list->Close();
     ID3D12CommandList* lists[1] = { list };
     queue->ExecuteCommandLists(1, lists);
@@ -6942,7 +7045,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     static volatile LONG s_shOk = 0, s_shFail = 0;
     if (ok) {
         LONG n = InterlockedIncrement(&s_shOk);
-        if (n <= 3 || (n % 600) == 0)
+        if (n <= 10 || (n % 600) == 0)
             Log("hooks: shadow-eval ok #%ld (present %llu)", n, presentSerial);
     } else {
         LONG n = InterlockedIncrement(&s_shFail);
@@ -7072,6 +7175,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT syncInterval, 
                         Log("ngx-pipe: present1-path guarded fault #%d", s_pres1Fault);
                 }
             }
+            // Shadow eval, Present1 variant (this is the path the engine
+            // drives during gameplay; Hook_Present goes quiet after loading).
+            // Same guarded region; original presents on all outcomes.
+            if (!g_dlaaMode && !g_passiveMode)
+                ShadowEvalAtPresent((IDXGISwapChain*)sc, presentSerial);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("hooks: present1 handling guarded (code %08X)", (unsigned)GetExceptionCode());
@@ -9394,6 +9502,7 @@ void HooksSetConfig(const ScaleNgConfig& config)
     g_hudIniOn = config.hud;
     g_legacyScale = config.legacyScale;
     g_passiveMode = config.passive;
+    g_shadowHandoff = config.shadowHandoff;
     Log("hooks: config applied (dlaa=%d legacyScale=%d; viewport arming is dlaa-gated, legacyScale retained for compat)",
         g_dlaaMode ? 1 : 0, g_legacyScale ? 1 : 0);
 }

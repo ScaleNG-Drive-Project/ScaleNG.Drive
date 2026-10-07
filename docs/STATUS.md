@@ -1722,13 +1722,131 @@ Rollback note (correction): never revert doc work with whole-file checkout —
  updater env (removal changed nothing); deny-list (unrelated entry);
  in-process interference (standalone `tests/ngx_init_probe.cpp` on explicit
  NVIDIA device, out-of-game: identical `0xBAD00002`).
-**Standing hypothesis:** driver-side NGX platform component absent/broken —
- `nvngx.dll` exists NOWHERE standard (System32/SysWOW64/DriverStore/
- NGXCore), while models are cached (NVIDIA App only). Init bring-up fails
- before any NGX log line is emitted (callback armed, never fires; no
- `nvngx.log` written). Fixing that is a driver reinstall/repair = EXTERNAL,
- approval required (risks: reboot, display interruption, installer changes
- outside the project — NOT attempted).
+**Correction (2026-10-07 — driver hypothesis withdrawn as stated):**
+ driver repair/reinstallation was presented as the standing hypothesis. That
+ was overstated and is hereby corrected: the driver is known-stable/current
+ by user selection, and no evidence shows the driver itself is the cause.
+ Proven-vs-hypothesis accounting follows.
+**Proven module evidence (verified, read-only):** every NGX call ran code
+ inside ONE module: `...\Bin64\plugins\nvngx_dlss.dll`, FileVersion
+ 310.6.0, NVIDIA-signed (DigiCert G4 code-signing, valid to 2028-07-06).
+ `LoadNGX` resolves Init, Init_Ext, CreateFeature, EvaluateFeature,
+ Shutdown, GetParameters, GetAPIVersion, GetSnippetVersion and
+ GetFeatureRequirements from that single `m_ngxDll` handle (driver-store /
+ System32 attempts fail first — logged). The DLL is self-contained
+ (imports only system DLLs). `nvngx.dll` (classic driver-core module) is
+ absent from System32/SysWOW64/DriverStore/NGXCore — reconciled: that does
+ NOT mean no NGX code ran; the feature-snippet Init executed and returned
+ real codes. Whether 310.x still needs a separate core is UNKNOWN.
+**Proven results (exact codes; vendored 1.5.0 AND current DLSS-repo headers
+ agree — |1=FeatureNotSupported, |2=PlatformError):** classic Init →
+ `0xBAD00001` FeatureNotSupported ("SDK/feature not supported by
+ system/hardware/API"); `Init_Ext` → `0xBAD00002` PlatformError
+ ("underlying platform: graphics API, OS, system libs"); same-DLL
+ `GetFeatureRequirements` → rr=1 Supported (minHW TU100-class, minOS
+ 10.0.0) on the enumerated RTX 3050; snippet self-reports API 0x13.
+ Discovery-supported yet bring-up-refused is the fact to explain.
+**Eliminated (live, one variable each, all PASS/0-fatal):** wrapper/QI,
+ AppId ×3, API version 0x13+0x15–0x1B (official macro still 0x15),
+ NvAPI (init=0), data-path writability, GPU identity (both devices
+ LUID-match 0x10DE), updater env, deny-list, in-process factors
+ (out-of-game probe identical). ProjectID route: UNAVAILABLE (no export
+ in this DLL — eliminated without a run).
+**Open, untested input variants (no driver/system changes):** dedicated
+ fresh data subdir (stale-state interference); dual search paths; Init
+ timing (load-time rejected: fix89 churn-death history).
+**Standing unknown (NOT a finding):** why snippet bring-up fails on a
+ supported adapter. Driver repair is one UNPROVEN hypothesis among others;
+ no driver/installer/system change without explicit approval.
+**Update (2026-10-07, run 20261007T163018Z):** dedicated fresh data subdir
+ (`models\ScaleNG_ngx`, created OK, cleaned up after) → identical codes.
+ Data-path staleness ELIMINATED.
+
+## NGX bring-up resolution (2026-10-07; subagent-assisted audit + loader fix)
+
+**Module reconciliation (verified, read-only):** ALL NGX calls resolve from
+ ONE module handle: `Bin64\plugins\nvngx_dlss.dll`, FileVersion 310.6.0,
+ NVIDIA-signed (DigiCert G4, valid to 2028), self-contained imports
+ (system DLLs only). `nvngx.dll` (classic driver core) is absent from
+ System32/SysWOW64/DriverStore/NGXCore — reconciled: that does NOT mean no
+ NGX code ran; the feature-snippet Init executed and returned real codes
+ (classic `0xBAD00001` FeatureNotSupported, Ext `0xBAD00002` PlatformError
+ per matching-generation headers, vendored + current agreeing). Driver
+ repair was proposed, then WITHDRAWN as unproven (driver is
+ known-stable/current by user selection; no evidence implicates it).
+**Correction from researcher subagent:** public SDK declares
+ `Init(AppId,path,device,FeatureCommonInfo*=nullptr,version)` — classic
+ 4-arg form is valid; version macro still `0x15` TODAY (sweep 0x13–0x1B
+ correctly negative). AppId: docs say use 0 until assigned; `Denied` (not
+ observed) is the restriction code — AppId sweeps were vacuous.
+**Decisive fix (reviewer hypothesis B, filesystem-CONFIRMED):** loader
+ hardcoded only `nvlti.inf_*`; the real core sits at
+ `nvltsi.inf_amd64_...\nvngx.dll` (489KB). Census-enumerated loader
+ (`nv*.inf_*`) loads the CORE first; Init_Ext + NGX logging then SUCCEED:
+ `Found matching adapter`, `feature created (1286x723→1920x1080)`,
+ `shadow-eval ok #1..#1800+` consecutive, 0 failures.
+**Also fixed along the way:** `AllocateParameters`-optional (never called);
+ `g_upscalerInitAttempted` stuck-flag resets (auditor find);
+ `IDXGIDevice`-QI failure is normal D3D12 behavior (vtable-repair theory
+ FALSIFIED, write defused to log-only); UPLOAD-float-texture restriction
+ (DEFAULT+staging design); backbuffer index 0-hardcode → current index
+ (4-deep swapchain; prime suspect in the 165729Z GPU crash, exit code 1
+ shown to be the runner's normal termination); Present1 gameplay path
+ (Hook_Present goes quiet after loading — explains frozen Present-path
+ diagnostics, shadow eval now wired into both); silent-return stage
+ counters (desc-fault/size-mismatch/reset-fail, first-3 each).
+**Reconciliation (reviewer hole #3):** the `Init_Ext` 5th-arg type concern
+ is FALSIFIED by success — `FeatureCommonInfo` against the loaded CORE
+ returns success, so the earlier Ext failures were wrong-module (snippet),
+ not wrong-struct. Classic-vs-Ext code split likewise explained (snippet
+ answers each entry differently). Ext-with-`FeatureCommonInfo` stands as
+ the correct core call shape.
+**Milestone (run 20261007T171602Z, PASS, 0 fatal):** 4200+ consecutive
+ eval+handoff frames (ok #4200 at present 5041, 0 failures) — the
+ 1000-consecutive-frame criterion is SATISFIED for evaluation+handoff
+ mechanics. INI `shadowHandoff` toggle added (default 1) for rigorous A/B.
+ Remaining for completion: VISUAL verification (screenshot under test),
+ 20-minute stability, second clean reproduction. No visual claim yet.
+ handoff writes shOut into the presented backbuffer (F8 toggles, default
+ ON). Color-correctness (IsHDR=1 vs LDR input), MV/depth semantics (zero
+ dummies in shadow path), and VISUAL verification all still open.
+ Reversal: per-hunk revert as documented in each section; full list in the
+ implementation-stack section. No DLSS visual claim yet.
+
+## NGX CORE LOADER FIX — Init_Ext SUCCEEDED + feature created + evals run
+ (2026-10-07, runs 20261007T165257Z/193649Z+, commit pending)
+
+**Root cause (verified):** `LoadNGX` hardcoded ONLY `nvlti.inf_*` for the
+ driver-store core search; this box carries the core at
+ `nvltsi.inf_amd64_f0bf3af178442601\nvngx.dll` (489KB, vs 74MB snippet), so
+ every Init ran against the fallback feature DLL. Filesystem census by the
+ reviewer subagent found it; the fix enumerates every `nv*.inf_*` dir
+ (other drivers: `nv_dispi.inf_*`), loads the first `nvngx.dll` found,
+ logs `GetLastError` when the census itself fails.
+**Result (run 20261007T165257Z, PASS freeroam+`thePlayer`, 0 fatal):**
+ `loaded driver core nvngx.dll (...\nvltsi...)`; NGX's own log lines flow
+ (`Found matching adapter with NVAPI physical GPU handle`);
+ `Init_Ext SUCCEEDED`; `feature created (1286x723 → 1920x1080)`;
+ `shadow-eval ok #1..#1800+` consecutive, every present, zero failures —
+ first NGX evaluations on the wrapped game device. Mechanics proven; color
+ correctness (IsHDR=1 vs LDR backbuffer input) explicitly NOT proven.
+**Visible handoff (implemented, under test):** on eval success the own-list
+ path now writes `shOut` back into the backbuffer (self-owned
+ PSR→COPY_DEST / UAV→COPY_SOURCE, copy, restore to PRESENT) before
+ `Real_Present`; failures still present the original. F8 toggles live
+ (`handoff ON/OFF` logged) for A/B. States/queue/fences all self-managed;
+ engine lists untouched. Reversal: delete the handoff block + F8 block +
+ `g_shadowHandoff` (keep/shadow-eval untouched); rebuild; rerun.
+ No DLSS visual-verification claim yet — pending screenshot evidence. Init scoreboard: classic `0xBAD00001` ×
+ (AppId 241534720/0/608174073, versions 0x13+0x15–0x1B, both devices,
+ in+out of game); Ext `0xBAD00002` × (same matrix + fresh dir). Every
+ project-local input variant is now exhausted; remaining Init hypotheses
+ need either NVIDIA-side answers or driver work — both external.
+**Next safe in-project work (no driver changes):** (1) visual-baseline
+ readiness — screenshot path in the test workflow for future A/B (test
+ scripts only, zero game impact); (2) depth-format logging (fmt-34 vs
+ D24-family for NGX depth convention); (3) legacy trigger/patch replay
+ analysis stays parked behind eval success. No DLSS success claimed.
 **Built along the way (all reversible, zero game impact observed):**
  shadow-eval own-list path (infra per-step HRESULTs; UPLOAD-float-texture
  E_INVALIDARG found → DEFAULT+staging-buffer upload design; 2-frame

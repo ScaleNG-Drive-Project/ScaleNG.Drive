@@ -114,6 +114,7 @@ static void LoadConfig()
     g_config.autoExposure = getBool(L"autoExposure", true);
     g_config.appId = (unsigned int)getInt(L"appId", 0xE658700);
     g_config.ngxApiVersion = (unsigned int)getInt(L"ngxApiVersion", 0x15);
+    g_config.shadowHandoff = getBool(L"shadowHandoff", true);
     g_config.enabled = getBool(L"enabled", true);
 
     wchar_t upscaler[32] = {};
