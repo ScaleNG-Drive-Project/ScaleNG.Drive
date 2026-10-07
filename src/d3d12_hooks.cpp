@@ -64,6 +64,9 @@ unsigned int g_mvH = 0;
 
 ID3D12Resource* g_depthResource = nullptr;
 bool g_depthValid = false;
+// True when the depth slot holds an SRV-sourced (depth-view) adoption rather
+// than copy-heuristic guesswork. Copies must not overwrite real depth.
+static bool g_depthSrvSourced = false;
 
 // Frame stamps: when depth/MV were last (re)discovered. Feeding NGX a freed
 // resource = InvalidParameter storms + driver instability, so injection
@@ -664,6 +667,21 @@ static bool IsSceneColorFormat(unsigned fmt)
 {
     return fmt == (unsigned)DXGI_FORMAT_R16G16B16A16_UNORM ||
            fmt == (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
+// Depth-family RESOURCE formats (SDK-verified numerics, not memory): NGX
+// depth is single-channel; velocity (34) and LDR color (28) copy DESTs must
+// never occupy the depth slot (observed: fmt-34 velocity adopted as depth,
+// fmt-28 359x379 junk). Typeless D24 (44) and D24S8 view (45) resources are
+// true depth; conversion to an NGX-usable representation is separate work.
+static bool IsDepthFamilyFormat(unsigned fmt)
+{
+    return fmt == (unsigned)DXGI_FORMAT_R32_TYPELESS ||        // 39
+           fmt == (unsigned)DXGI_FORMAT_D32_FLOAT ||          // 40
+           fmt == (unsigned)DXGI_FORMAT_R32_FLOAT ||          // 41
+           fmt == (unsigned)DXGI_FORMAT_R24G8_TYPELESS ||     // 44
+           fmt == (unsigned)DXGI_FORMAT_D24_UNORM_S8_UINT ||  // 45
+           fmt == (unsigned)DXGI_FORMAT_R24_UNORM_X8_TYPELESS;// 46
 }
 
 // Insert-capable observe: creation / OM-adoption paths pass already-fetched
@@ -3300,6 +3318,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
              desc->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || desc->Format == DXGI_FORMAT_D32_FLOAT)) {
             StoreTracked(&g_depthResource, res);
             g_depthValid = true;
+            g_depthSrvSourced = true;
             g_depthStamp = g_frameCounter;
             g_depthRealFmt = rd.Format;
             g_depthMsaa = rd.SampleDesc.Count != 1;
@@ -6086,7 +6105,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                     mvStale ? fc2 - g_mvStamp : 0);
             doDlss = false;
             // Null the stale pointers so the null guard catches them next frame
-            if (depthStale) { g_depthResource = nullptr; g_depthValid = false; }
+            if (depthStale) { g_depthResource = nullptr; g_depthValid = false; g_depthSrvSourced = false; }
             if (mvStale) { g_mvResource = nullptr; g_mvValid = false; }
         }
     }
@@ -6367,7 +6386,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             __except (EXCEPTION_EXECUTE_HANDLER) {
                 bridgeOk = false;
                 Log("hooks: bridge FAULTED at %s - invalidating all inputs", g_injStep);
-                StoreTracked(&g_depthResource, nullptr); g_depthValid = false; g_depthStamp = 0;
+                StoreTracked(&g_depthResource, nullptr); g_depthValid = false; g_depthSrvSourced = false; g_depthStamp = 0;
                 StoreTracked(&g_mvResource, nullptr); g_mvValid = false; g_mvStamp = 0;
                 // One-strike rule (P5 crash handling): an in-engine AV means the
                 // engine cmd list may be left inconsistent by the faulting call.
@@ -7082,9 +7101,13 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         D3D12_RESOURCE_DESC mvd = {}, depd = {};
         bool mvAlive = mv && SafeGetDesc(mv, &mvd);
         // MV rotation: the engine renders into a fresh R16G16F target most
-        // frames (primary + ALT pattern in every run). A retired primary
-        // must not pin us to zeros while a live ALT exists.
-        if (!mvAlive && g_mvResourceAlt && SafeGetDesc(g_mvResourceAlt, &mvd)) {
+        // frames (primary + ALT pattern in every run). A retired OR
+        // wrong-sized primary must not pin us to zeros while a live,
+        // display-sized ALT exists (observed: stable 1902x1033 primary vs
+        // live 1920x1080 ALTs all run).
+        if ((!mvAlive || mvd.Format != DXGI_FORMAT_R16G16_FLOAT ||
+             mvd.Width != g_displayW || mvd.Height != g_displayH) &&
+            g_mvResourceAlt && SafeGetDesc(g_mvResourceAlt, &mvd)) {
             mv = g_mvResourceAlt;
             mvAlive = true;
         }
@@ -8524,16 +8547,33 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 }
             }
             // Depth candidate heuristic (copies NOT involving the scene color or MV).
+            // Gated two ways: (1) SRV-sourced true depth is never overwritten
+            // by copy guesswork; (2) only depth-family RESOURCE formats adopt
+            // (velocity fmt-34 and LDR junk proved the unfiltered heuristic
+            // pollutes the slot). Guarded desc read: the DST pointer is weak.
             bool quietNow = ((int)(g_frameCounter - g_quietUntilFrame) < 0);
             if (!quietNow && !isSceneSrc && !isMvDst && dst->pResource != g_dlssOut) {
+                D3D12_RESOURCE_DESC ddg = {};
+                bool ddOk = dst->pResource && SafeGetDesc(dst->pResource, &ddg);
+                if (!ddOk || !IsDepthFamilyFormat((unsigned)ddg.Format)) {
+                    static int s_depthRejects = 0;
+                    if (++s_depthRejects <= 4)
+                        Log("hooks: depth copy rejected (fmt=%u %ux%u srvDepth=%d)",
+                            ddOk ? (unsigned)ddg.Format : 0,
+                            ddOk ? (unsigned)ddg.Width : 0, ddOk ? (unsigned)ddg.Height : 0,
+                            g_depthSrvSourced ? 1 : 0);
+                } else if (g_depthSrvSourced && g_depthResource && g_depthResource != dst->pResource) {
+                    static int s_depthKeeps = 0;
+                    if (++s_depthKeeps <= 2)
+                        Log("hooks: depth copy skipped - SRV depth kept %p", (void*)g_depthResource);
+                } else {
                 if (!g_depthValid) g_depthFirstValidFrame = g_frameCounter;
                 StoreTracked(&g_depthResource, dst->pResource);
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
                 {
-                    D3D12_RESOURCE_DESC dd = dst->pResource->GetDesc();
-                    g_depthRealFmt = dd.Format;
-                    g_depthMsaa = dd.SampleDesc.Count != 1;
+                    g_depthRealFmt = ddg.Format;
+                    g_depthMsaa = ddg.SampleDesc.Count != 1;
                 }
                 BookGuard _bgCopy;
         auto it = g_resourceStates.find(dst->pResource);
@@ -8543,6 +8583,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 if (s_depthCandidates < 8) {
                     ++s_depthCandidates;
                     Log("hooks: depth candidate %p (full-res copy)", (void*)dst->pResource);
+                }
                 }
             }
         }

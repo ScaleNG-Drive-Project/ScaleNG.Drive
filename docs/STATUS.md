@@ -2107,7 +2107,8 @@ blindly copy this workaround to another installation without checking its files.
  (1902x1033/1902x983/1920x983 loading → 1920x1080 gameplay; some runs
  never reach display size). Depth: `g_depthResource` adopted at SRV
  creation + full-res-copy DEST heuristic; **live-measured format fmt-45
- = R24G8_TYPELESS** (run 192627Z p3844: `candDepth=...(45 1920x1080)`) —
+ = D24_UNORM_S8_UINT** (fmt-45, SDK-verified; run 192627Z p3844:
+ `candDepth=...(45 1920x1080)`) —
  NOT directly NGX-compatible (NGX depth is single-channel; typeless
  depth+stencil needs an R32F copy or an R24X8/R32F view). States:
  barrier traffic IS tracked live on the shim path
@@ -2185,7 +2186,7 @@ blindly copy this workaround to another installation without checking its files.
  finding above blocks direct depth use.
 **Limitations / NOT claimed:** REAL never engaged — no image-quality
  comparison exists yet; MV direction/scale/jitter-inclusion, depth
- convention/conversion (R24G8→R32F copy or view), jittered rendering,
+ convention/conversion (D24→R32F copy or view), jittered rendering,
  and scene-vs-presented alignment are all still open. Next: R32F depth
  conversion + MV TOCTOU hardening (validation-to-bind race), then
  re-attempt REAL on a stable baseline. No image-quality improvement
@@ -2212,7 +2213,7 @@ blindly copy this workaround to another installation without checking its files.
 **CRITICAL role correction:** the depth-slot resource is a SECOND
  VELOCITY BUFFER (`motion vector RTV 8045DA8860 ... (ALT)`), adopted via
  the copy-DEST heuristic — NOT true depth. So REAL = real MV +
- velocity-as-depth. True R24G8_TYPELESS depth conversion is still open
+ velocity-as-depth. True D24 depth conversion is still open
  (step 4); depth-convention questions are untouched.
 **Zero-era anomaly in the same run:** presents 842→~2745 faulted
  ~1904x (`EvaluateFeature FAULTED SEH 0xC0000005`) with ZERO fallbacks
@@ -2228,3 +2229,38 @@ blindly copy this workaround to another installation without checking its files.
  only after the zero-fault cause is understood; not changed now.
 **Reversal:** unchanged (INI flag; hunk revert as above). No source
  changed this turn.
+
+## TRUE DEPTH + 9000 REAL evals (2026-10-07, run 20261007T200358Z, p7012)
+
+**Depth identification hardening (source change, this turn):**
+ `IsDepthFamilyFormat()` (SDK-verified numerics 39/40/41/44/45/46);
+ copy-heuristic now adopts ONLY depth-family DSTs via guarded desc read
+ (also fixes a pre-existing unguarded `GetDesc` on a weak pointer) and
+ never overwrites SRV-sourced true depth (`g_depthSrvSourced`, cleared
+ on both invalidation paths). MV ALT fallback widened to wrong-sized
+ primaries (stable 1902x1033 primary vs live 1920x1080 ALTs observed).
+ Run 200000Z proved the gate: fmt-34 velocity copy REJECTED,
+ `srvDepth=1` kept. Files: `src/d3d12_hooks.cpp` only (+ STATUS
+ fmt-45 correction: D24_UNORM_S8_UINT, not R24G8). Reversal: revert the
+ three hunk groups; rebuild; rerun.
+**Run 200358Z (120s, realInputs=1): PASS_DLSS_EVAL, 0 FAILED,
+ 0 FAULTED.** REAL from the first eval: **ok #1 (present 842) → ok
+ #9000 (present 9841), handoff 1 throughout**, normal exit. MV
+ `FF7AACB9D0` fmt-34 1920x1080 ALT (placed + RTV-created, provenance
+ logged); depth `FF6D983C90` **fmt-45 D24_UNORM_S8_UINT 1920x1080,
+ SRV-adopted true depth** (engine barrier 192→2048=COPY_SOURCE + engine
+ copy FROM it at present 186 — alive and in engine use). NGX consumed
+ the D24S8 resource directly 9000x with zero faults: **no depth
+ conversion shader is needed.** mvScale 1920x1080 (UV hypothesis),
+ jitter 0/0, HDR flags. Deployed INI restored to `realInputs=0`.
+**Status vs success criteria:** (1) init+feature ✓; (2) real MV +
+ TRUE depth ✓ (role-correct; same-frame association strong-supported:
+ stable pointers + engine use + age gates, frame clock frozen so strict
+ proof limited); (3) handoff into presented frames ✓ (9000);
+ (4) moving-scene IQ benefit ⏳ NEEDS EYES — bot pixel comparison is
+ drift-invalid (proven); (5) drop-in packaging ⏳ later. Zero-fault
+ cluster (194541Z) did NOT recur (195249Z zeros clean); baseline
+ crash-free NOT claimed (192627Z unexplained).
+**Next single action:** human-observed REAL vs ZERO comparison while
+ driving (F9 toggles inputs live, F8 toggles handoff): motion trails on
+ lettering, FPS-counter smear, ghosting, still-frame detail.
