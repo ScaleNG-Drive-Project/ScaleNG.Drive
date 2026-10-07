@@ -599,11 +599,13 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     m_paramStore->SetUI(NVSDK_NGX_Parameter_OutHeight, m_displayHeight);
     m_paramStore->SetI(NVSDK_NGX_Parameter_PerfQualityValue, m_perfQuality);
 
-    // The legacy scene input is linear HDR HALF-float (verified live:
-    // 1920x1080 fmt-10 RTV-bound + barriered + viewported in gameplay). Per
-    // NVIDIA, linear input under LDR/default flags produces banding/shift
-    // artifacts, so HDR processing is required for this input.
-    int flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    // Color-mode flag: HDR unless overridden for testing. The shadow path
+    // feeds an LDR backbuffer while the HDR scene input is unwired, so the
+    // correct mode for TODAY's input is selectable live (F7, via IUpscaler::
+    // SetHDR + ResetFeature): IsHDR=1 assumes linear-HDR input; IsHDR=0
+    // assumes LDR. Per NVIDIA, linear-in-LDR bands/shifts and LDR-in-HDR
+    // misresponds (softness/brightness shift).
+    int flags = m_forceHDR ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
     if (m_mvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (m_autoExposure) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
@@ -627,8 +629,9 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     }
 
     m_featureCreated = true;
-    Log("DLSS: feature created (render %ux%u -> display %ux%u)",
-        m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight);
+    Log("DLSS: feature created (render %ux%u -> display %ux%u %s)",
+        m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
+        m_forceHDR ? "HDR" : "LDR");
     return true;
 }
 

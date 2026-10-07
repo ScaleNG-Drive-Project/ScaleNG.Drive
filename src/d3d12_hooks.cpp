@@ -6708,6 +6708,11 @@ static unsigned g_shFlip = 0;
 // VM exists to verify DLSS visuals, and any corruption is diagnosable
 // evidence with a one-key revert.
 static bool g_shadowHandoff = true;
+// HDR/LDR A/B switch for the shadow path's LDR backbuffer input (F7 toggles
+// live + recreates the feature; logged). File-local toggle state; the NGX
+// side goes through IUpscaler::SetHDR (anonymous-namespace globals have no
+// external linkage by design).
+static bool g_dlssForceLDR = false;
 // A/B auto-alternation window in presents (0 = steady manual-only control).
 // Nonzero alternates handoff ON/OFF per window for bot captures.
 static unsigned g_abWindowPresents = 0;
@@ -6716,14 +6721,24 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
 {
     if (g_dlaaMode || !g_upscaler || !g_upscaler->IsReady()) return;
     // F8 edge-triggered handoff toggle for live A/B comparison.
+    // F7 edge-triggered HDR/LDR mode toggle (recreates feature).
     {
-        static bool s_f8Prev = false;
+        static bool s_f8Prev = false, s_f7Prev = false;
         bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         if (f8 && !s_f8Prev) {
             g_shadowHandoff = !g_shadowHandoff;
             Log("hooks: shadow-eval handoff %s (F8)", g_shadowHandoff ? "ON" : "OFF");
         }
         s_f8Prev = f8;
+        bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        if (f7 && !s_f7Prev && g_upscaler) {
+            g_dlssForceLDR = !g_dlssForceLDR;
+            g_upscaler->SetHDR(!g_dlssForceLDR);
+            g_upscaler->ResetFeature();
+            Log("hooks: shadow-eval color mode %s (F7, feature recreates next eval)",
+                g_dlssForceLDR ? "LDR" : "HDR");
+        }
+        s_f7Prev = f7;
     }
     if (!g_device || g_displayW == 0 || g_displayH == 0) return;
     ID3D12CommandQueue* queue = g_gameSubmitQueue ? g_gameSubmitQueue : g_graphicsQueue;

@@ -47,6 +47,12 @@ public:
     // its render target resolution). Default: no-op.
     virtual void UpdateSizes(unsigned int rw, unsigned int rh,
                              unsigned int dw, unsigned int dh) {}
+    // Drop the live NGX feature so the next Evaluate re-creates it (picks up
+    // changed create flags). Default: no-op.
+    virtual void ResetFeature() {}
+    // Select HDR (linear input) vs LDR color processing for the next feature
+    // creation. Default: no-op (implementation default applies).
+    virtual void SetHDR(bool hdr) { (void)hdr; }
 
     // One-shot diagnostic: run NGX Init on a self-created clean device to
     // discriminate wrapper/device-interop failure from AppId/driver failure.

@@ -1,329 +1,382 @@
 #!/usr/bin/env python3
-"""
-ScaleNG.Drive — Autonomous Test Runner (ASI/UAL Architecture - WORKING)
-Builds plugin, deploys, launches BeamNG directly into level, monitors logs for 320s.
+"""Build, launch, and verify ScaleNG in a fresh BeamNG.drive process.
 
-Uses ASI plugin + UAL (winmm.dll). Monitors plugins/ScaleNG.log for NGX initialization and evaluation.
-
-Requirements:
-  - Windows with VS2022 Build Tools (for build.bat)
-  - BeamNG.drive at C:\games\BeamNG.drive
-  - Python 3.8+
-
-Optional (for advanced automation):
-  pip install beamngpy
+Requires Windows, Visual Studio C++ build tools, BeamNG.drive, and the pinned
+test environment from scripts/setup_test_env.bat. Results/logs are saved under
+logs/test_runs/. See scripts/README.md; don't install an arbitrary BeamNGpy.
 """
 
-import subprocess
-import time
-import sys
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
+import json
 import os
-import threading
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-REPO_ROOT = Path(__file__).parent.parent
-SRC_DIR = REPO_ROOT / "src"
-DIST_DIR = REPO_ROOT / "dist"
+ROOT = Path(__file__).resolve().parent.parent
+GAME = Path(r"C:\Games\BeamNG.drive")
+BIN64 = GAME / "Bin64"
+PLUGINS = BIN64 / "plugins"
+GAME_EXE = BIN64 / "BeamNG.drive.x64.exe"
+GAME_LOG = PLUGINS / "ScaleNG.log"
+REQUIRED = ("ScaleNG.asi", "ScaleNG_NGX_helper.exe")
+FATAL_MARKERS = (
+    "FATAL: SEH exception", "access violation", "DEVICE_REMOVED",
+    "GetDeviceRemovedReason", "EvaluateFeature FAULTED",
+)
+USER32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
-BEAMNG_HOME = Path(r"C:\games\BeamNG.drive")
-BEAMNG_EXE = BEAMNG_HOME / "Bin64" / "BeamNG.drive.x64.exe"
-BIN64_DIR = BEAMNG_HOME / "Bin64"
-PLUGINS_DIR = BEAMNG_HOME / "Bin64" / "plugins"
-SCALENG_LOG = PLUGINS_DIR / "ScaleNG.log"
 
-TEST_CONFIG = {
-    "level": "GridMap",               # Must match actual folder name (capital G)
-    "vehicle": "pickup",              # Vehicle to spawn
-    "duration_sec": 320,              # Test duration (320s = ~5.3 min)
-    "extra_args": ["-console", "-gfx", "d3d12"],
-    "map_load_timeout_sec": 120,      # Max time to wait for map load confirmation
-}
-
-# Success/failure markers in ScaleNG.log (ASI architecture)
-# Note: C0000005 is EXCLUDED because it appears in memory addresses in logs
-SCALENG_MARKERS = {
-    "success": [
-        "NGX] Initialized successfully",
-        "NGX] Feature created",
-        "NGX] Evaluated frame",
-        "helper: NGX evaluation succeeded",
-        "ScaleNG.asi initialization complete",
-        "hooks: D3D12CreateDevice detour installed",
-        "hooks: CreateDXGIFactory",
-    ],
-    "warning": [
-        "injection skipped",
-        "camera CB copy not validated",
-        "viewport patch 0",
-    ],
-    "failure": [
-        "EvaluateFeature failed",
-        "CreateFeature failed",
-        "device removed",
-        "D3D12CreateDevice hook failed",
-        "GetDeviceRemovedReason",
-        "DEVICE_REMOVED",
-    ],
-    "critical": [
-        "FATAL: SEH exception",
-        "access violation",
-    ],
-}
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-def log(msg, level="INFO"):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    prefix = {"INFO": "[INFO]", "WARN": "[WARN]", "ERROR": "[ERROR]", "SUCCESS": "[SUCCESS]", "CRITICAL": "[CRITICAL]"}.get(level, "[INFO]")
-    print(f"{timestamp} {prefix} {msg}")
-
-def run_cmd(cmd, cwd=None, capture=True, shell=False):
-    """Run command, return (success, stdout, stderr)."""
-    log(f"Running: {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
-    try:
-        result = subprocess.run(
-            cmd, cwd=cwd, capture_output=capture, text=True, shell=shell, timeout=300
-        )
-        if result.stdout and capture:
-            log(f"  stdout: {result.stdout[:500]}")
-        if result.stderr and capture:
-            log(f"  stderr: {result.stderr[:500]}")
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        log("Command timed out", "ERROR")
-        return False, "", "Timeout"
-    except Exception as e:
-        log(f"Command failed: {e}", "ERROR")
-        return False, "", str(e)
-
-def build_plugin():
-    """Run src/build.bat."""
-    log("Building plugin via src/build.bat...")
-    ok, out, err = run_cmd("build.bat", cwd=SRC_DIR, shell=True)
-    if not ok:
-        log("Build failed", "ERROR")
+def dismiss_known_library_warning(process_id: int) -> bool:
+    """Choose Cancel only on BeamNG's known third-party-library dialog."""
+    if USER32 is None:
         return False
-    log("Build successful", "SUCCESS")
-    return True
-
-def deploy():
-    """Copy dist/* to plugins/ (ASI architecture)."""
-    log(f"Deploying to {PLUGINS_DIR}...")
-    files = ["ScaleNG.asi", "ScaleNG.ini", "ScaleNG_NGX_helper.exe", "nvngx_dlss.dll"]
-    for f in files:
-        src = DIST_DIR / f
-        dst = PLUGINS_DIR / f
-        if src.exists():
-            import shutil
-            shutil.copy2(src, dst)
-            log(f"  Deployed: {f}")
-        else:
-            log(f"  Missing (will fail): {src}", "WARN")
-    log("Deploy complete", "SUCCESS")
-
-def verify_deploy():
-    """Verify all required files exist in plugins/."""
-    required = ["ScaleNG.asi", "ScaleNG.ini", "ScaleNG_NGX_helper.exe", "nvngx_dlss.dll"]
-    for f in required:
-        if not (PLUGINS_DIR / f).exists():
-            log(f"Missing required file: {f}", "ERROR")
+    hwnd = ctypes.c_void_p()
+    while True:
+        hwnd = USER32.FindWindowW(None, "Third-party library warning")
+        if not hwnd:
             return False
-    log("All deploy files verified", "SUCCESS")
-    return True
-
-def launch_beamng():
-    """Launch BeamNG with test level, capturing stdout/stderr."""
-    args = [
-        str(BEAMNG_EXE),
-        f"-level {TEST_CONFIG['level']}",
-    ]
-    if TEST_CONFIG['vehicle']:
-        args.append(f"-vehicle {TEST_CONFIG['vehicle']}")
-    args.extend(TEST_CONFIG["extra_args"])
-    
-    log(f"Launching BeamNG: {' '.join(args)}")
-    proc = subprocess.Popen(
-        args, 
-        cwd=BIN64_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,  # Line buffered
-        encoding='utf-8',
-        errors='replace'
-    )
-    return proc
-
-def wait_for_game_ready(timeout_sec=90):
-    """Wait for game to be ready by checking ScaleNG.log for NGX evaluation."""
-    log(f"Waiting for game to be ready (timeout: {timeout_sec}s)...")
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout_sec:
-        if SCALENG_LOG.exists():
-            try:
-                with open(SCALENG_LOG, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                    # Check for NGX evaluation (proves level is rendering)
-                    if "NGX] Evaluated frame" in content or "helper: NGX evaluation succeeded" in content:
-                        log("Game ready - NGX evaluation active (level rendering)", "SUCCESS")
-                        return True
-                    # Also check for ScaleNG initialization
-                    if "ScaleNG.asi initialization complete" in content:
-                        log("Game ready - ScaleNG initialized", "SUCCESS")
-                        return True
-            except Exception:
-                pass
-        time.sleep(2)
-    
-    log(f"Game ready check timeout after {timeout_sec}s", "WARN")
-    return False
-
-def wait_for_scaleng_log(timeout_sec=120):
-    """Wait for ScaleNG.log to appear."""
-    log(f"Waiting for ScaleNG.log (timeout: {timeout_sec}s)...")
-    for i in range(timeout_sec):
-        if SCALENG_LOG.exists():
-            log(f"ScaleNG.log found at {SCALENG_LOG}", "SUCCESS")
-            return True
+        pid = ctypes.c_ulong()
+        USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value != process_id:
+            return False
+        # BM_CLICK is sent only to the Cancel button nested under this exact
+        # BeamNG-owned dialog. Cancel permanently suppresses repeat warnings.
+        cancel = USER32.FindWindowExW(hwnd, None, "Button", "Cancel")
+        if not cancel:
+            return False
+        USER32.SendMessageW(cancel, 0x00F5, 0, 0)
         time.sleep(1)
-    log("ScaleNG.log never appeared", "ERROR")
-    return False
-
-def analyze_scaleng_line(line, stats):
-    """Check ScaleNG.log line for markers, update stats."""
-    for category, markers in SCALENG_MARKERS.items():
-        for marker in markers:
-            if marker.lower() in line.lower():
-                stats[category] = stats.get(category, 0) + 1
-                if category == "success":
-                    log(f"  >>> SUCCESS MARKER: {marker}", "SUCCESS")
-                elif category == "warning":
-                    log(f"  >>> WARNING: {marker}", "WARN")
-                elif category == "failure":
-                    log(f"  >>> FAILURE: {marker}", "ERROR")
-                elif category == "critical":
-                    log(f"  >>> CRITICAL: {marker}", "CRITICAL")
-                break
-
-def tail_scaleng_log(duration_sec):
-    """Tail ScaleNG.log for duration_sec seconds, analyze markers."""
-    log(f"Tailing ScaleNG.log for {duration_sec} seconds...")
-    
-    stats = {"success": 0, "warning": 0, "failure": 0, "critical": 0}
-    start_time = time.time()
-    last_pos = 0
-    
-    # Initial read to catch up
-    try:
-        with open(SCALENG_LOG, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-            last_pos = f.tell()
-            for line in content.splitlines():
-                analyze_scaleng_line(line, stats)
-    except Exception as e:
-        log(f"Initial ScaleNG.log read failed: {e}", "WARN")
-    
-    log(f"[MONITOR] Starting live tail at {datetime.now().strftime('%H:%M:%S')}")
-    
-    while time.time() - start_time < duration_sec:
-        try:
-            with open(SCALENG_LOG, "r", encoding="utf-8", errors="ignore") as f:
-                f.seek(last_pos)
-                new_content = f.read()
-                last_pos = f.tell()
-                if new_content:
-                    for line in new_content.splitlines():
-                        elapsed = time.time() - start_time
-                        print(f"[{datetime.now().strftime('%H:%M:%S')} +{elapsed:.1f}s] {line}")
-                        analyze_scaleng_line(line, stats)
-        except Exception as e:
-            log(f"ScaleNG.log read error: {e}", "WARN")
-        
-        time.sleep(0.5)
-    
-    log(f"[MONITOR] Tail completed. Stats: {stats}")
-    return stats
-
-def print_summary(stats):
-    """Print final test summary."""
-    print("\n" + "=" * 60)
-    print("AUTONOMOUS TEST SUMMARY")
-    print("=" * 60)
-    print(f"Duration:     {TEST_CONFIG['duration_sec']}s")
-    print(f"Level:        {TEST_CONFIG['level']}")
-    print(f"Vehicle:      {TEST_CONFIG['vehicle'] or '(default)'}")
-    print(f"Log:          {SCALENG_LOG}")
-    print("-" * 60)
-    print(f"Success markers: {stats.get('success', 0)}")
-    print(f"Warnings:       {stats.get('warning', 0)}")
-    print(f"Failures:       {stats.get('failure', 0)}")
-    print(f"Critical:       {stats.get('critical', 0)}")
-    print("-" * 60)
-    
-    # Determine overall result
-    if stats.get("critical", 0) > 0:
-        print("RESULT: CRITICAL FAILURE - Crash/SEH detected", "CRITICAL")
-        return False
-    elif stats.get("failure", 0) > 0:
-        print("RESULT: FAILURE - NGX evaluate/create failed", "ERROR")
-        return False
-    elif stats.get("success", 0) == 0:
-        print("RESULT: INCONCLUSIVE - No success markers (plugin may not have initialized)")
-        return False
-    else:
-        print("RESULT: SUCCESS - NGX initialized, feature created, and evaluation active!", "SUCCESS")
         return True
 
-def main():
-    print("=" * 60)
-    print("ScaleNG.Drive Autonomous Test (320s) - ASI/UAL Architecture")
-    print("=" * 60)
-    
-    # Step 1: Build
-    if not build_plugin():
-        return 1
-    
-    # Step 2: Deploy
-    deploy()
-    if not verify_deploy():
-        return 1
-    
-    # Step 3: Launch BeamNG
-    proc = launch_beamng()
-    
-    try:
-        # Step 4: Wait for ScaleNG.log to appear
-        if not wait_for_scaleng_log(120):
-            return 1
-        
-        # Step 5: Wait for game ready (NGX evaluation = level rendering)
-        if not wait_for_game_ready(90):
-            log("Game not ready in time, but continuing test...", "WARN")
-        
-        # Step 6: Tail ScaleNG.log for test duration
-        stats = tail_scaleng_log(TEST_CONFIG["duration_sec"])
-        
-    finally:
-        # Cleanup
-        log("Terminating BeamNG...")
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def port_is_free(port: int) -> bool:
+    with socket.socket() as sock:
         try:
-            proc.terminate()
-            proc.wait(timeout=10)
-        except Exception:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--duration", type=int, default=75, help="gameplay observation time in seconds (default: 75)")
+    parser.add_argument("--level", default="smallgrid")
+    parser.add_argument("--require-dlss", action="store_true", help="require a DLSS eval marker (legacy injection or shadow-eval ok; default only verifies D3D12 frames)")
+    parser.add_argument("--port", type=int, default=25252, help="BeamNGpy TCom port")
+    parser.add_argument("--startup-timeout", type=int, default=180)
+    parser.add_argument("--skip-build", action="store_true", help="use existing dist artifacts")
+    parser.add_argument("--no-deploy", action="store_true", help="test currently deployed plugin without copying files")
+    args = parser.parse_args()
+
+    if args.duration < 1:
+        parser.error("--duration must be positive")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = ROOT / "logs" / "test_runs" / stamp
+    run_dir.mkdir(parents=True, exist_ok=False)
+    result = {"started_utc": stamp, "level": args.level, "duration_sec": args.duration,
+              "checks": {}, "errors": [], "run_dir": str(run_dir)}
+    game = None
+    process = None
+    baseline_signature = None
+    baseline_size = 0
+    live_lines: list[str] = []
+    game_output_file = None
+
+    def check(name: str, passed: bool, detail: str = "") -> None:
+        result["checks"][name] = {"passed": bool(passed), "detail": detail}
+        print(f"{'PASS' if passed else 'FAIL'} {name}{': ' + detail if detail else ''}", flush=True)
+
+    try:
+        try:
+            import beamngpy
+            from beamngpy.connection.connection import Connection
+            from beamngpy import BeamNGpy
+        except ImportError as exc:
+            raise RuntimeError("beamngpy is required; install with: py -m pip install beamngpy") from exc
+        result["beamngpy_version"] = getattr(beamngpy, "__version__", "unknown")
+        check("beamngpy_available", True, result["beamngpy_version"])
+        if Connection.PROTOCOL_VERSION != "v1.26":
+            raise RuntimeError(
+                f"BeamNG {GAME} requires BeamNGpy protocol v1.26; installed package uses "
+                f"{Connection.PROTOCOL_VERSION}. Run scripts\\setup_test_env.bat "
+                "to install the package version matched to this game's TCom protocol."
+            )
+
+        if not GAME_EXE.is_file():
+            raise RuntimeError(f"BeamNG executable not found: {GAME_EXE}")
+        check("game_install_found", True, str(GAME_EXE))
+        tasklist = subprocess.run(["tasklist.exe", "/FI", "IMAGENAME eq BeamNG.drive.x64.exe", "/NH"],
+                                  capture_output=True, text=True, timeout=10)
+        if "BeamNG.drive.x64.exe" in tasklist.stdout:
+            raise RuntimeError("BeamNG is already running; close it so this run only controls its own process")
+        if not port_is_free(args.port):
+            raise RuntimeError(f"TCom port {args.port} is occupied; choose another with --port")
+
+        dist = ROOT / "dist"
+        if not args.skip_build:
+            build = subprocess.run(["cmd.exe", "/d", "/c", str(ROOT / "src" / "build_asi.bat")],
+                                   cwd=ROOT / "src", capture_output=True, text=True, timeout=300)
+            (run_dir / "build.stdout.txt").write_text(build.stdout or "", encoding="utf-8")
+            (run_dir / "build.stderr.txt").write_text(build.stderr or "", encoding="utf-8")
+            check("build", build.returncode == 0, f"exit={build.returncode}; see build.stdout.txt")
+            if build.returncode:
+                raise RuntimeError("ASI build failed")
+        else:
+            check("build", True, "skipped; using existing artifacts")
+
+        for filename in REQUIRED:
+            if not (dist / filename).is_file():
+                raise RuntimeError(f"Required build artifact missing: {dist / filename}")
+        check("build_artifacts", True, ", ".join(REQUIRED))
+
+        if not args.no_deploy:
+            backup_dir = run_dir / "deployment_backup"
+            backup_dir.mkdir()
+            for filename in REQUIRED:
+                old = PLUGINS / filename
+                if old.exists():
+                    shutil.copy2(old, backup_dir / filename)
+            for filename in REQUIRED:
+                shutil.copy2(dist / filename, PLUGINS / filename)
+        else:
+            backup_dir = None
+        deployed = all((PLUGINS / n).is_file() and sha256(PLUGINS / n) == sha256(dist / n) for n in REQUIRED)
+        check("deployment", deployed, "artifacts match dist" if deployed else "missing or hash mismatch")
+        if not deployed:
+            raise RuntimeError("Deployment verification failed")
+        if backup_dir:
+            result["deployment_backup"] = str(backup_dir)
+
+        if not args.no_deploy:
+            config = PLUGINS / "ScaleNG.ini"
+            if not config.is_file():
+                shutil.copy2(dist / "ScaleNG.ini", config)
+                result["deployment_backup_config"] = "not present before this run"
+        baseline_size = GAME_LOG.stat().st_size if GAME_LOG.exists() else 0
+        baseline_log = GAME_LOG.read_bytes() if GAME_LOG.exists() else b""
+        baseline_signature = hashlib.sha256(baseline_log).hexdigest()
+        (run_dir / "plugin_log_before.txt").write_bytes(baseline_log)
+
+        game = BeamNGpy("127.0.0.1", args.port, home=str(GAME),
+                        binary="Bin64/BeamNG.drive.x64.exe", quit_on_close=False,
+                        )
+        level_arg = args.level.rsplit("/", 1)[0].split("/")[-1] if "/" in args.level else args.level
+        launch_args = ["-tcom-listen-ip", "127.0.0.1", "-level", level_arg,
+                       "-vehicle", "pickup"]
+        game_output_file = (run_dir / "game.stdout.log").open("wb")
+        command = game._prepare_call(str(GAME_EXE), None, *launch_args)
+        print(f"Launching BeamNG once: {' '.join(command)}", flush=True)
+        process = subprocess.Popen(command, cwd=BIN64, stdin=subprocess.PIPE,
+                                   stdout=game_output_file, stderr=subprocess.STDOUT)
+        game.process = process
+        pid = getattr(process, "pid", None)
+        result["game_pid"] = pid
+
+        started = time.monotonic()
+        connected = False
+        while time.monotonic() - started < args.startup_timeout:
+            if process.poll() is not None:
+                raise RuntimeError(f"BeamNG exited during startup (code {process.returncode})")
+            dismiss_known_library_warning(pid)
             try:
-                proc.kill()
+                game.connection = Connection(game.host, game.port)
+                game.connection._process = process
+                if game.connection.connect_to_beamng(tries=1, log_tries=False):
+                    connected = True
+                    break
             except Exception:
                 pass
-    
-    # Step 7: Summary
-    success = print_summary(stats)
-    return 0 if success else 1
+            time.sleep(1)
+        check("tcom_connected", connected, f"single BeamNG PID {pid} on port {args.port}")
+        if not connected:
+            raise RuntimeError("BeamNG did not expose TCom; see game.stdout.log")
+        game._load_system_info()
+
+        gameplay_ready = False
+        while time.monotonic() - started < args.startup_timeout:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(f"BeamNG exited during startup (code {process.returncode})")
+            if process is not None:
+                dismiss_known_library_warning(process.pid)
+            try:
+                state = game.control.get_gamestate()
+                if state.get("state") == "freeroam":
+                    vehicles = game.vehicles.get_current()
+                    if vehicles:
+                        gameplay_ready = True
+                        result["game_state"] = state
+                        result["vehicles"] = list(vehicles.keys())
+                        break
+            except Exception:
+                pass
+            time.sleep(2)
+        check("gameplay_ready", gameplay_ready, f"state={result.get('game_state')}; vehicles={result.get('vehicles')}")
+        if not gameplay_ready:
+            raise RuntimeError("Game did not reach freeroam with a vehicle before timeout")
+
+        observed_start = time.monotonic()
+        log_offset = baseline_size
+        while time.monotonic() - observed_start < args.duration:
+            if process is not None and process.poll() is not None:
+                result["errors"].append(f"BeamNG exited during test (code {process.returncode})")
+                break
+            try:
+                if GAME_LOG.exists():
+                    size = GAME_LOG.stat().st_size
+                    if size < log_offset:
+                        log_offset = 0
+                    with GAME_LOG.open("rb") as stream:
+                        stream.seek(log_offset)
+                        new = stream.read()
+                        log_offset = stream.tell()
+                    live_lines.extend(new.decode("utf-8", errors="replace").splitlines())
+            except OSError as exc:
+                result["errors"].append(f"Could not read plugin log: {exc}")
+            time.sleep(1)
+
+        fresh_log = GAME_LOG.read_bytes() if GAME_LOG.exists() else b""
+        if hashlib.sha256(fresh_log).hexdigest() != baseline_signature:
+            new_bytes = fresh_log[baseline_size:] if len(fresh_log) >= baseline_size else fresh_log
+        else:
+            new_bytes = b""
+        if not new_bytes and pid:
+            current_lines = fresh_log.decode("utf-8", errors="replace").splitlines()
+            process_lines = [line for line in current_lines if f"[p{pid}]" in line]
+            new_bytes = ("\n".join(process_lines) + "\n").encode("utf-8")
+        (run_dir / "plugin_log_new.txt").write_bytes(new_bytes)
+        live_lines = (run_dir / "plugin_log_new.txt").read_text(encoding="utf-8", errors="replace").splitlines()
+        loaded = any("ScaleNG.asi loaded" in line and (not pid or f"[p{pid}]" in line or f"pid={pid}" in line)
+                     for line in live_lines)
+        initialized = any("ScaleNG.asi initialization complete" in line for line in live_lines)
+        frames = [line for line in live_lines if "hooks: frame " in line and " started " in line]
+        render_evidence = [line for line in live_lines if any(marker in line for marker in (
+            "hooks: D3D12CreateDevice called #", "hooks: GAME direct queue captured=",
+            "hooks: real queue ECL hook INSTALLED", "hooks: PRESENT fn-level hook INSTALLED",
+            "hooks: swapchain ", "hooks: GAME CreateCommandList #",
+        ))]
+        present_progress = [line for line in live_lines if "topo-state: snapshot present=" in line]
+        present_values = []
+        for line in present_progress:
+            match = re.search(r"topo-state: snapshot present=(\d+)", line)
+            if match:
+                present_values.append(int(match.group(1)))
+        render_evidence.extend(present_progress)
+        current_pid_lines = [line for line in live_lines if f"[p{pid}]" in line] if pid else live_lines
+        target_lines = current_pid_lines or live_lines
+        frames = [line for line in target_lines if "hooks: frame " in line and " started " in line]
+        injections = [line for line in target_lines if "hooks: DLSS injection recorded" in line]
+        # Shadow-eval path (current): "hooks: shadow-eval ok #<n> (present <p> handoff <0|1>)".
+        # ok  = NGX feature evaluated successfully on a presented frame.
+        # handoff=1 = that evaluation's output was copied into the backbuffer
+        # being presented (the visible-handoff proof). The bit is optional so
+        # older logs still parse as evidence of evaluation.
+        shadow_ok = []
+        shadow_handoff = []
+        shadow_failures = [line for line in target_lines if any(marker in line for marker in (
+            "shadow-eval FAILED", "shadow-eval reset failed", "shadow-eval allocator/list reset failed"))]
+        for line in target_lines:
+            match = re.search(r"hooks: shadow-eval ok #(\d+) \(present (\d+) handoff (\d)\)", line)
+            if match:
+                shadow_ok.append(line)
+                if match.group(3) == "1":
+                    shadow_handoff.append(line)
+            elif "hooks: shadow-eval ok #" in line:
+                shadow_ok.append(line)
+        eval_failures = [line for line in target_lines if "DLSS evaluate failed" in line or "EvaluateFeature failed" in line]
+        fatal = [line for line in target_lines if any(marker.lower() in line.lower() for marker in FATAL_MARKERS)]
+        check("plugin_loaded_this_run", loaded, f"BeamNG PID {pid}; based on fresh log bytes")
+        check("plugin_initialized", initialized, "fresh initialization-complete marker")
+        render_pass = bool(frames or render_evidence) and len(present_values) >= 2 and present_values[-1] > present_values[0]
+        check("d3d12_render_frames", render_pass,
+              f"{len(frames)} frame markers; {len(render_evidence)} current-process D3D12/Present hook signals; "
+              f"Present counter {present_values[0] if present_values else 0}->{present_values[-1] if present_values else 0} "
+              f"across {len(present_values)} snapshots")
+        if injections:
+            check("dlss_frames_evaluated", True,
+                  f"{len(injections)} legacy injection markers (retired path)")
+        elif shadow_ok:
+            desc = f"{len(shadow_ok)} shadow-eval ok markers"
+            if shadow_handoff:
+                desc += f", {len(shadow_handoff)} with visible handoff"
+            check("dlss_frames_evaluated", True, desc + " (not proof of visual quality)")
+        else:
+            check("dlss_frames_evaluated", False, "no DLSS eval evidence (not proof of visual quality)")
+        check("no_fatal_markers", not fatal, f"{len(fatal)} fatal markers")
+        result["counts"] = {"frame_markers": len(frames), "render_evidence": len(render_evidence),
+                             "present_snapshots": len(present_progress), "injection_markers": len(injections),
+                             "shadow_eval_ok": len(shadow_ok), "shadow_eval_handoff": len(shadow_handoff),
+                             "shadow_eval_failures": len(shadow_failures),
+                             "evaluate_failures": len(eval_failures), "fatal_markers": len(fatal)}
+        result["evaluate_failure_samples"] = eval_failures[:20]
+        result["fatal_samples"] = fatal[:20]
+        result["outcome"] = "PASS" if loaded and initialized and render_pass and not fatal else "FAIL"
+        dlss_evidenced = bool(injections or shadow_ok)
+        if result["outcome"] == "PASS" and args.require_dlss and not dlss_evidenced:
+            result["outcome"] = "INCONCLUSIVE_DLSS"
+        elif dlss_evidenced:
+            result["outcome"] = "PASS_DLSS_EVAL"
+        check("overall", result["outcome"] == "PASS", result["outcome"])
+    except Exception as exc:
+        result["outcome"] = "FAIL"
+        result["errors"].append(str(exc))
+        print(f"ERROR {exc}", file=sys.stderr, flush=True)
+    finally:
+        process_exit_code = process.poll() if process is not None else None
+        if game is not None:
+            try:
+                game.close()
+            except Exception as exc:
+                result["errors"].append(f"Game cleanup: {exc}")
+        if process is not None and process_exit_code is None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        if process is not None:
+            code = process_exit_code if process_exit_code is not None else process.poll()
+            result["game_exit_code"] = code
+            if code == 0xC0000005:
+                try:
+                    fresh_log = GAME_LOG.read_bytes() if GAME_LOG.exists() else b""
+                    changed = hashlib.sha256(fresh_log).hexdigest() != baseline_signature
+                    new_bytes = (fresh_log[baseline_size:] if len(fresh_log) >= baseline_size else fresh_log) if changed else b""
+                    (run_dir / "plugin_log_new.txt").write_bytes(new_bytes)
+                    lines = new_bytes.decode("utf-8", errors="replace").splitlines()
+                    loaded = any("ScaleNG.asi loaded" in line and f"[p{process.pid}]" in line for line in lines)
+                    initialized = any("ScaleNG.asi initialization complete" in line for line in lines)
+                    result["checks"]["plugin_loaded_this_run"] = {"passed": loaded, "detail": f"BeamNG PID {process.pid}"}
+                    result["checks"]["plugin_initialized"] = {"passed": initialized, "detail": "fresh plugin log"}
+                    if loaded and initialized:
+                        result["outcome"] = "GAME_CRASHED_AFTER_PLUGIN_INIT"
+                except Exception:
+                    pass
+        if game_output_file is not None:
+            game_output_file.close()
+        result["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(f"Result: {result.get('outcome', 'FAIL')} — {run_dir / 'result.json'}", flush=True)
+    return 0 if result.get("outcome") in ("PASS", "PASS_DLSS_EVAL", "PASS_DLSS_INJECTION", "INCONCLUSIVE_DLSS") else 1
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

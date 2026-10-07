@@ -1828,6 +1828,33 @@ Rollback note (correction): never revert doc work with whole-file checkout —
  auto-orbits when idle and the user changed cars/drove (damage, viewpoints
  vary) — cross-run pixel A/B invalid; in-run alternation or F8 is the
  valid comparison. Display/graphics settings untouched by user.
+**User observations as test inputs (2026-10-07, NOT diagnoses):** no
+ heat-wave/warp (consistent with zero — not wrong-signed — MVs); still
+ scene stable but soft (consistent with frozen jitter + zero MVs + no
+ sharpening); motion blur on lettering clearing after stop + FPS-counter
+ trails (consistent with zero-MV temporal smear + UI pixels inside the
+ DLSS input, since our color is the post-HUD backbuffer). Verified in
+ code/logs: every eval gets identical zero MV/depth/jitter (shadow params
+ constant; camera-frame counter frozen so jitter never varies);
+ `sharpness=0` with deprecated SDK sharpening; `MVJittered` flag set while
+ inputs are unjittered zeros (moot: NGX subtracts jitter 0).
+**Falsifiable test (built + exercised live):** live HDR/LDR A/B — F7 flips
+ `IsHDR` and recreates the feature (`feature created ... HDR/LDR`).
+ Run 20261007T183644Z (200s, PASS, 0 fatal, PID 2468): F7 pressed 7×
+ (HDR→LDR→HDR→LDR→HDR→LDR→HDR), feature recreated each time without
+ failure; steady `shadow-eval ok #15000 (present 17399 handoff 1)` with
+ 0 shadow-eval failures — ~16.5k consecutive presented frames evaluated
+ with the output written into the presented backbuffer. This is the
+ strongest streak so far (supersedes 6600) and proves the toggle is
+ robust under repeated use, but it does NOT measure image quality:
+ the HDR-vs-LDR visual difference is a human observation still pending.
+**Test-runner honesty fix:** `dlss_injection_recorded` FAILed forever because
+ it only matched the retired legacy `hooks: DLSS injection recorded` marker.
+ Replaced with `dlss_frames_evaluated`, which accepts either legacy markers
+ or `shadow-eval ok` markers (counting `handoff 1` separately) and names the
+ evidence path; outcome token is now `PASS_DLSS_EVAL` (`PASS_DLSS_INJECTION`
+ still accepted for older logs). `--require-dlss` accepts either path.
+ Reversal: revert the `autonomous_test.py` hunk; no runtime code touched.
 
 ## Visual A/B (2026-10-07; handoff ON vs OFF screenshots, no 20-min run per user)
 

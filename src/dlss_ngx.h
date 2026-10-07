@@ -179,7 +179,8 @@ public:
     int LastEvaluateResult() const { return m_lastEvaluateResult; }
     int LastCreateResult() const { return m_lastCreateResult; }
     int ProbeCleanDeviceInit() override;
-    void UpdateSizes(unsigned int rw, unsigned int rh,
+    void ResetFeature() override { DestroyFeature(); m_firstEvaluate = true; }
+    void SetHDR(bool hdr) override { m_forceHDR = hdr; }    void UpdateSizes(unsigned int rw, unsigned int rh,
                      unsigned int dw, unsigned int dh) override;
 
 private:
@@ -218,6 +219,7 @@ private:
     uint32_t m_displayHeight = 0;
     uint32_t m_appId = 0;
     uint32_t m_ngxVersion = (uint32_t)NVSDK_NGX_Version_API;
+    bool m_forceHDR = true;
     int m_perfQuality = 1;
     bool m_mvJittered = true;
     bool m_autoExposure = true;
