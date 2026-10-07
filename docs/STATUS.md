@@ -2190,3 +2190,41 @@ blindly copy this workaround to another installation without checking its files.
  conversion + MV TOCTOU hardening (validation-to-bind race), then
  re-attempt REAL on a stable baseline. No image-quality improvement
  claimed; no 20-min run (user directive).
+
+## REAL ENGAGED (2026-10-07, run 20261007T194541Z, p2256, 120s)
+
+**What happened:** with `realInputs=1` deployed (dist stayed 0), the
+ fail-closed path SELECTED real inputs at 22:46:29 and NGX evaluated
+ them successfully **7200+ consecutive times with handoff=1**
+ (`ok #7200 (present 9945 handoff 1)`), 0 device-removal, normal game
+ exit. This is the first non-placeholder evaluation. Deployed INI
+ restored to `realInputs=0` immediately after.
+**Proof points (PID-filtered):** MV `80DA99BFD0` fmt-34 R16G16_FLOAT
+ 1920x1080, placed texture + RTV-created (`rtv-provenance`) + adopted as
+ MV ALT; depth-slot `8045DA8860` fmt-34 1920x1080, likewise RTV-created.
+ NO conversion/copy (direct resources). States via tracked `Barrier()`
+ to PSR + restore in the same list. Params: mvScale 1920.0x1080.0
+ (UV hypothesis), jitter 0/0, HDR create flags, sharpness 0.
+ Same-present engine-render proof for the depth-slot resource at present
+ 2745 (barrier 192→1024→RT + RTV bind survey, then our eval). MV
+ same-frame proof is weaker (stable pointer + mvAge 1, but the frame
+ clock is frozen and no per-frame MV touch logs exist in the REAL era).
+**CRITICAL role correction:** the depth-slot resource is a SECOND
+ VELOCITY BUFFER (`motion vector RTV 8045DA8860 ... (ALT)`), adopted via
+ the copy-DEST heuristic — NOT true depth. So REAL = real MV +
+ velocity-as-depth. True R24G8_TYPELESS depth conversion is still open
+ (step 4); depth-convention questions are untouched.
+**Zero-era anomaly in the same run:** presents 842→~2745 faulted
+ ~1904x (`EvaluateFeature FAULTED SEH 0xC0000005`) with ZERO fallbacks
+ (`why=depth-size`: transient 359x379 fmt-28 depth candidate), then
+ instant success from the first REAL eval. Correlation zero-fault →
+ REAL-success is logged but CAUSALITY IS UNCLAIMED: confounds include
+ upload-completion timing, driver warmup, first-feature settling. The
+ 192627Z CreateFeature fault + this zero-fault cluster mean the baseline
+ is NOT proven crash-free. Next: rerun zeros to test recurrence.
+**Runner note:** 1904 unbounded `FAULTED` lines tripped `no_fatal`
+ (correctly — that many driver-internal AVs, all SEH-caught, deserve a
+ FAIL token even with later success). Consider bounding the FAULTED log
+ only after the zero-fault cause is understood; not changed now.
+**Reversal:** unchanged (INI flag; hunk revert as above). No source
+ changed this turn.
