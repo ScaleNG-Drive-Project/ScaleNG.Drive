@@ -2264,3 +2264,37 @@ blindly copy this workaround to another installation without checking its files.
 **Next single action:** human-observed REAL vs ZERO comparison while
  driving (F9 toggles inputs live, F8 toggles handoff): motion trails on
  lettering, FPS-counter smear, ghosting, still-frame detail.
+
+## Fault storm + circuit breaker (2026-10-07, runs 200904Z/201932Z)
+
+**F9 verified working end-to-end** (`scripts/f9_toggle.ps1` via
+ keybd_event + AppActivate): run 200904Z p13344 logged `inputs REAL
+ MV/depth (F9)` at 23:10:50 and `inputs zero placeholders (F9)` at
+ 23:11:26. Both directions register; the toggle the user will drive
+ with is proven.
+**Fault storm (run 200904Z):** 6000 healthy zero-evals (present
+ 842→6841), then EVERY eval faulted from present 7054 to run end
+ (7390 `EvaluateFeature FAULTED SEH 0xC0000005`, no recovery, no
+ DEVICE_REMOVED, game survived, normal exit). Storm onset coincided
+ with F9#1/focus-change to the exact second — but the flag is PROVEN
+ uninvolved: validation never passed (no REAL line, zero engine
+ contact), F9#2 did not stop the storm, no size/display/feature/reset
+ events exist. Coincidence vs focus side-effect is UNRESOLVED (testable:
+ focus-without-F9 vs F9-without-focus, n=1 each — weak, deferred).
+ Combined with 194541Z (1904 zero-faults then REAL success) and 192627Z
+ (CreateFeature AV): NGX CPU-side AVs cluster and persist with
+ identical inputs after thousands of successes. Mechanism UNKNOWN;
+ poisoned-history is one hypothesis (Reset is only ever set on the
+ first eval — a poisoned history persists by design).
+**Circuit breaker + log bound (source change, this turn):**
+ `dlss_ngx.cpp` FAULTED/failed logs bounded (first 10 + every 600 —
+ the 7390-line flood risk is gone); shadow path counts consecutive
+ faults: 30 → `ResetFeature` (fresh NGX history; recovery logged and
+ proves transient state), 120 → HALT evals for the session (game
+ presents unmodified, logged once). Zero behavior change on healthy
+ paths (verified run 201932Z: 60s PASS, 17 oks, 0 faults, breaker
+ silent). Files: `src/dlss_ngx.cpp`, `src/d3d12_hooks.cpp`.
+ Reversal: delete the two bounded-log hunks + the consec/halt block and
+ top declarations; rebuild; rerun.
+**Standing warnings:** baseline NOT crash-free (3 fault events across
+ recent runs); 20-min run stays off the table (user directive).

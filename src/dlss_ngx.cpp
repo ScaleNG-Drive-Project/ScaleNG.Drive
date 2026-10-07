@@ -723,13 +723,19 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     }
     if (evr == -2) {
         m_lastEvaluateResult = -2000 - (int)evSeh;
-        Log("DLSS: EvaluateFeature FAULTED (SEH 0x%08X)", evSeh);
+        static volatile LONG s_evFaultLogs = 0;
+        LONG efn = InterlockedIncrement(&s_evFaultLogs);
+        if (efn <= 10 || (efn % 600) == 0)
+            Log("DLSS: EvaluateFeature FAULTED (SEH 0x%08X #%ld)", evSeh, efn);
         return false;
     }
     NVSDK_NGX_Result r = (NVSDK_NGX_Result)evr;
     m_lastEvaluateResult = evr;
     if (!NVSDK_NGX_SUCCEEDED(r)) {
-        Log("DLSS: EvaluateFeature failed, result=%d", r);
+        static volatile LONG s_evFailLogs = 0;
+        LONG ern = InterlockedIncrement(&s_evFailLogs);
+        if (ern <= 10 || (ern % 600) == 0)
+            Log("DLSS: EvaluateFeature failed, result=%d (#%ld)", r, ern);
         return false;
     }
 

@@ -6759,6 +6759,12 @@ static bool g_shadowRealInputs = false;
 static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSerial)
 {
     if (g_dlaaMode || !g_upscaler || !g_upscaler->IsReady()) return;
+    // Eval outcome counters (declared up-front: the halt check below needs
+    // them; POD statics are __try-safe anywhere in this frame).
+    static volatile LONG s_shOk = 0, s_shFail = 0;
+    static volatile LONG s_shConsecFail = 0;
+    static volatile LONG s_shHalted = 0;
+    if (InterlockedCompareExchange(&s_shHalted, 0, 0)) return;
     // F8 edge-triggered handoff toggle for live A/B comparison.
     // F7 edge-triggered HDR/LDR mode toggle (recreates feature).
     // F9 edge-triggered real/zero MV+depth input toggle (logged).
@@ -7237,8 +7243,8 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     g_shFenceDone[slot] = fv;
     bb->Release();
 
-    static volatile LONG s_shOk = 0, s_shFail = 0;
     if (ok) {
+        LONG was = InterlockedExchange(&s_shConsecFail, 0);
         LONG n = InterlockedIncrement(&s_shOk);
         if (n <= 10 || (n % 600) == 0) {
             Log("hooks: shadow-eval ok #%ld (present %llu handoff %d)", n, presentSerial, handoffNow ? 1 : 0);
@@ -7248,10 +7254,26 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
                 g_mvValid ? (g_frameCounter - g_mvStamp) : 9999,
                 g_depthValid ? (g_frameCounter - g_depthStamp) : 9999);
         }
+        if (was >= 30)
+            Log("hooks: shadow-eval recovered after %ld-fault streak (ok #%ld)", was, n);
     } else {
         LONG n = InterlockedIncrement(&s_shFail);
+        LONG cf = InterlockedIncrement(&s_shConsecFail);
         if (n <= 10)
             Log("hooks: shadow-eval FAILED #%ld (present %llu)", n, presentSerial);
+        // Circuit breaker: faulting every present helps nothing and risks
+        // driver state. At 30 consecutive faults, drop the NGX feature so the
+        // next eval recreates it with fresh history (poisoned-history
+        // hypothesis, falsifiable: recovery proves transient NGX state). At
+        // 120, halt shadow evals for the session — the game then presents
+        // unmodified frames (safe fallback, logged once).
+        if (cf == 30 && g_upscaler) {
+            g_upscaler->ResetFeature();
+            Log("hooks: shadow-eval 30 consecutive faults - feature reset (present %llu)", presentSerial);
+        } else if (cf == 120) {
+            InterlockedExchange(&s_shHalted, 1);
+            Log("hooks: shadow-eval HALTED after 120 consecutive faults (present %llu) - presenting unmodified", presentSerial);
+        }
     }
 }
 
