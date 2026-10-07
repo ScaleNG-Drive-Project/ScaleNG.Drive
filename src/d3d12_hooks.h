@@ -16,6 +16,7 @@ struct ScaleNgConfig {
     unsigned int appId = 0xE658700;
     unsigned int ngxApiVersion = 0x15; // NGX SDK version passed to Init (0x15 headers vs 310.6.0 DLL under test)
     bool shadowHandoff = true; // write shadow-eval output into the presented backbuffer (F8 toggles live)
+    unsigned int abWindow = 0; // auto-alternation window in presents (0 = steady, no alternation)
     wchar_t dlssDllPath[MAX_PATH] = {};
 };
 

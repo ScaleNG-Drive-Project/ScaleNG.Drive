@@ -1807,6 +1807,50 @@ Rollback note (correction): never revert doc work with whole-file checkout —
  mechanics. INI `shadowHandoff` toggle added (default 1) for rigorous A/B.
  Remaining for completion: VISUAL verification (screenshot under test),
  20-minute stability, second clean reproduction. No visual claim yet.
+**Correction (2026-10-07 — dimension honesty):** the "1286x723 → 1920x1080
+ feature" log described NGX parameters, NOT reality: the engine renders
+ full-res (viewport patch is replay-blocked) while eval received a
+ 1920x1080 backbuffer against 1286x723-declared params — a mismatch the
+ API tolerated silently. The prior "upscaling" framing is WITHDRAWN. The
+ path is honest native-resolution DLAA: shadow eval now re-targets
+ render==display per display size (`UpdateSizes`, once per size, feature
+ lazily recreates). Render-scale upscaling needs an engine-rendered
+ sub-native input that does not exist while the viewport patch is
+ replay-blocked — tracked separately, not conflated.
+**Same-viewpoint A/B (implemented, under test):** 600-present windows
+ alternate handoff ON/OFF in-run (INI+F8 still gate; transitions logged;
+ per-eval handoff bit in ok log for exact ON-frame counting). Human
+ override: `abWindow=0` (default) disables alternation for steady manual
+ testing (F8/INI only); bot captures set `abWindow=60+.
+**Human-test findings (2026-10-07, user driving):** captures 55/62/69 show
+ healthy frames with HUD intact (handoff non-destructive in both states);
+ shot 76 caught the user's own Start-menu keypress (discarded). Camera
+ auto-orbits when idle and the user changed cars/drove (damage, viewpoints
+ vary) — cross-run pixel A/B invalid; in-run alternation or F8 is the
+ valid comparison. Display/graphics settings untouched by user.
+
+## Visual A/B (2026-10-07; handoff ON vs OFF screenshots, no 20-min run per user)
+
+**Evidence:** `%TEMP%\dlss_handoff_on.png` (run 171851Z, 6600+ oks) shows a
+ healthy freeroam frame (chase view, coherent sky/grid/truck, no black,
+ no garbage); `%TEMP%\dlss_handoff_off.png` (run 172210Z, INI toggle,
+ 4200+ oks p14764-only, 0 fails) shows a healthy orbit view with HUD.
+ Pixel stats (80×60 grid): mean ON 134,135,140 vs OFF 120,120,121;
+ 6.6% strongly-differing samples — consistent with different viewpoints,
+ NOT a corruption signal (viewpoints uncontrolled: runner has no camera
+ control; chase vs orbit + differing vehicle state).
+**Verdict (narrow, honest):** handoff is NON-DESTRUCTIVE — the presented
+ image stays a coherent game frame with eval+handoff active every frame.
+ A DLSS-effect delta is NOT measurable here: uncontrolled viewpoints plus
+ DLAA-at-native with zero MV inputs is inherently subtle. No visual
+ success claimed beyond non-destruction.
+**Hygiene note:** OFF run log contains a stale overlapping process
+ (p4172, ASI config-load only, 0 evals) from the prior run's shutdown
+ window; TCom PID was single (14764); all eval evidence above is
+ PID-filtered to 14764. Pre-launch tasklist check stays mandatory.
+**Reversal:** INI `shadowHandoff` (dist + deployed, both at 1) or F8 live;
+ code: handoff block + toggle as documented. Artifacts: both PNGs in
+ `%TEMP%`, run dirs preserved.
  handoff writes shOut into the presented backbuffer (F8 toggles, default
  ON). Color-correctness (IsHDR=1 vs LDR input), MV/depth semantics (zero
  dummies in shadow path), and VISUAL verification all still open.

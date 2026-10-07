@@ -6708,6 +6708,9 @@ static unsigned g_shFlip = 0;
 // VM exists to verify DLSS visuals, and any corruption is diagnosable
 // evidence with a one-key revert.
 static bool g_shadowHandoff = true;
+// A/B auto-alternation window in presents (0 = steady manual-only control).
+// Nonzero alternates handoff ON/OFF per window for bot captures.
+static unsigned g_abWindowPresents = 0;
 
 static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSerial)
 {
@@ -6942,6 +6945,40 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         if (!ok) { bb->Release(); return; }
     }
 
+    // Dimension honesty (2026-10-07): the engine renders full-res (viewport
+    // patch is replay-blocked), so the only coherent eval is DLAA at native
+    // size. Re-target the feature render==display once per display size;
+    // UpdateSizes destroys + lazily recreates the feature at next Evaluate.
+    // Legacy render-scale params stay untouched for a future engine input.
+    {
+        static unsigned s_shAppliedW = 0, s_shAppliedH = 0;
+        if (g_displayW != 0 && (s_shAppliedW != g_displayW || s_shAppliedH != g_displayH)) {
+            s_shAppliedW = g_displayW; s_shAppliedH = g_displayH;
+            g_upscaler->UpdateSizes(g_displayW, g_displayH, g_displayW, g_displayH);
+            Log("hooks: shadow-eval DLAA sizing render==display %ux%u (was %ux%u)",
+                g_displayW, g_displayH, g_renderW, g_renderH);
+        }
+    }
+
+    // A/B auto-alternation (default STEADY for human testing): when
+    // g_abWindowPresents is nonzero, handoff alternates ON/OFF per window
+    // for bot captures. At 0 (default) there is no alternation — manual
+    // F8/INI control only, so driving/orbiting never flickers. Transitions
+    // logged; per-eval handoff bit in ok log for exact ON-frame counting.
+    bool handoffNow = false;
+    {
+        static int s_lastWindow = -1;
+        int window = 0;
+        if (g_abWindowPresents > 0)
+            window = (int)((presentSerial / g_abWindowPresents) % 2);
+        handoffNow = g_shadowHandoff && (window == 0);
+        if (window != s_lastWindow) {
+            s_lastWindow = window;
+            Log("hooks: shadow-eval window handoff %s (present %llu)",
+                handoffNow ? "ON" : "OFF", presentSerial);
+        }
+    }
+
     unsigned slot = (g_shFlip++) & 1;
     if (SafeGetFenceCompleted(g_shFence) < g_shFenceDone[slot]) {
         static volatile LONG s_shSkips = 0;
@@ -6994,7 +7031,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     // A/B comparison (logged). On eval failure the original frame presents
     // untouched (prior behavior).
     static bool s_handoffLogged = false;
-    if (ok && g_shadowHandoff) {
+    if (ok && handoffNow) {
         b.Transition.pResource = bb;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -7046,7 +7083,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     if (ok) {
         LONG n = InterlockedIncrement(&s_shOk);
         if (n <= 10 || (n % 600) == 0)
-            Log("hooks: shadow-eval ok #%ld (present %llu)", n, presentSerial);
+            Log("hooks: shadow-eval ok #%ld (present %llu handoff %d)", n, presentSerial, handoffNow ? 1 : 0);
     } else {
         LONG n = InterlockedIncrement(&s_shFail);
         if (n <= 10)
@@ -9503,6 +9540,7 @@ void HooksSetConfig(const ScaleNgConfig& config)
     g_legacyScale = config.legacyScale;
     g_passiveMode = config.passive;
     g_shadowHandoff = config.shadowHandoff;
+    g_abWindowPresents = config.abWindow;
     Log("hooks: config applied (dlaa=%d legacyScale=%d; viewport arming is dlaa-gated, legacyScale retained for compat)",
         g_dlaaMode ? 1 : 0, g_legacyScale ? 1 : 0);
 }
