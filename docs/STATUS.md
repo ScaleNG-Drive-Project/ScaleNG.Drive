@@ -2353,3 +2353,58 @@ blindly copy this workaround to another installation without checking its files.
  `self-adopt rejected` ×1 (loop recurs, blocked), depth-size fallbacks
  ×22 (transient 359x379 junk correctly rejected). Deployed INI restored
  to `realInputs=0`. Artifacts preserved under `logs/test_runs/`.
+
+## Verification round + DestroyFeature hardening (2026-10-08, run 224756Z)
+
+**Three read-only verifications (non-overlapping subagents), reconciled:**
+ (a) Guard holes: pre-store `g_resourceStates` writes CONFIRMED as
+ ordering defect but unreachable (needs RTV creation on owned textures;
+ none exists — NGX is SRV-only). Bind-refresh unchecked returns
+ CONFIRMED as code defect, blocked 3-deep (rtvMap hit + scene-format +
+ persist/handle gates). (b) g_grave gap BENIGN (parked pointers never
+ observed by any hook; createdRefs/owned tables dead). F9 double-bind
+ REFUTED as same-press double-fire (HUD vs shadow paths mutually
+ exclusive per Present; zero `hud: overlay` lines in artifact) —
+ log-label confusion only. (c) Breaker gaps: dual-Present race
+ CONFIRMED structural but weak reachability (single-threaded steady
+ state; same race already affects the slot picker); ResetFeature
+ fault-unsafety CONFIRMED (no SEH, dangling handle on escape, storm
+ amplifier); alternating-fault gap CONFIRMED low urgency (fails safe).
+**Fix (source change, this turn): DestroyFeature is now fault-safe**
+ (null-before-call, SEH around ReleaseFeature, distinct log, recreate on
+ next eval). Rationale: the breaker fires exactly when driver state is
+ suspect, so its own reset path must not fault-escape or dangle.
+ Concurrency serialization and windowed-counter changes DEFERRED
+ (weak reachability / low urgency — cleanup proposal). Files:
+ `src/dlss_ngx.cpp` only. Reversal: revert the hunk; rebuild; rerun.
+**Test 224756Z (60s, zeros default, p16084): PASS_DLSS_EVAL, 17 oks,**
+ 0 FAILED/FAULTED (reset path not exercised — strictly-safer code on an
+ already-failing path; live reset test awaits the next fault storm or
+ F7/size-change run).
+
+## Prioritized cleanup proposal (from 4-auditor health review; NOT implemented)
+
+P1 — small correctness hygiene (each independently verifiable, no
+ behavior change on healthy paths): F9 single owner (HUD F9 arm vs
+ shadow F9; today mutually exclusive per Present but log-confusing);
+ scene bind-refresh early-outs (8925/8989/9001 class) + move pre-store
+ `g_resourceStates` writes post-store; g_grave (loop) into
+ IsOwnResource; narrow FATAL_MARKERS substrings; fix outcome-token docs
+ (`PASS_DLSS_EVAL` emitted vs `PASS_DLSS_INJECTION` documented).
+P2 — dead-code removal (each: build + grep-empty + named-log absence):
+ StoreTracked_Weak, TryDeferredInject, TryVectorA body, smoke test +
+ new_smoke.txt, HUD subtree (keep atlas/vb globals + IsOwnResource
+ entries), commented EnsureBridge blocks, duplicate bb Release/return,
+ bridge-flow HUD counters; decide bridge restoration vs deletion
+ (g_dlaaMode+dlaa=1 currently silent no-op).
+P3 — config/docs/tests: sync deployed INI in deploy script (+backup);
+ document live (F7/F8/F9) vs restart-required settings; resolve
+ scale/render_scale alias + dxgi_hooks render_scale drift; remove or
+ wire [bridge] dead keys + legacyScale/passive/jitterPattern; fix
+ result.json sampled-counter undercount; .gitignore binaries/logs;
+ refresh README/STATUS dates + dxgi-proxy coexistence note.
+P4 — deferred larger work (needs design/user): Present-concurrency
+ serialization; windowed fault-ratio counter; jittered rendering
+ (ApplyCameraCbJitter gate) and sub-native render scale for a REAL
+ signal ZERO lacks; MV sign/scale/axis measurement; human A–G visual
+ protocol (design ready, needs eyes); 20-min run (user dropped).

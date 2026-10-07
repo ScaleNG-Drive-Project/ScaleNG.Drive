@@ -752,16 +752,36 @@ void NvDlssUpscaler::DestroyFeature()
     // which tears down the ENTIRE NGX core including the snippet's JIT-compiled
     // pass code - the next EvaluateFeature then jumped into freed JIT memory
     // (constant fault address, RIP=RAX) and crashed the game after size churn.
+    // Fault-safe: the breaker calls this after 30 consecutive eval faults, i.e.
+    // exactly when driver state is suspect. A fault inside ReleaseFeature must
+    // neither escape (it would bypass the halt accounting) nor leave a live
+    // m_feature dangling into the next Evaluate (fault-storm amplifier: the
+    // next eval would reuse the half-released handle). Null first, then call
+    // under SEH; no C++ objects in this frame so __try is legal.
     if (m_featureCreated && m_ngxDll) {
         typedef int(__cdecl* PFN_Release)(void*);
         PFN_Release pRelease = (PFN_Release)GetProcAddress(m_ngxDll, "NVSDK_NGX_D3D12_ReleaseFeature");
-        if (pRelease && m_feature) {
-            NVSDK_NGX_Result rr = pRelease(m_feature);
-            Log("DLSS: feature released (rr=%d)", rr);
-        }
+        void* doomed = m_feature;
+        m_feature = nullptr;
         m_featureCreated = false;
+        if (pRelease && doomed) {
+            unsigned relSeh = 0;
+            int relr = -3;
+            __try {
+                NVSDK_NGX_Result rr = pRelease(doomed);
+                relr = (int)rr;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                relSeh = (unsigned)GetExceptionCode();
+            }
+            if (relSeh)
+                Log("DLSS: feature release FAULTED (SEH 0x%08X) - handle dropped, feature recreates next eval", relSeh);
+            else
+                Log("DLSS: feature released (rr=%d)", relr);
+        }
+    } else {
+        m_featureCreated = false;
+        m_feature = nullptr;
     }
-    m_feature = nullptr;
 }
 
 void NvDlssUpscaler::UpdateSizes(unsigned int rw, unsigned int rh,
