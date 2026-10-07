@@ -328,13 +328,19 @@ def main() -> int:
                              "evaluate_failures": len(eval_failures), "fatal_markers": len(fatal)}
         result["evaluate_failure_samples"] = eval_failures[:20]
         result["fatal_samples"] = fatal[:20]
-        result["outcome"] = "PASS" if loaded and initialized and render_pass and not fatal else "FAIL"
+        base_pass = loaded and initialized and render_pass and not fatal
         dlss_evidenced = bool(injections or shadow_ok)
-        if result["outcome"] == "PASS" and args.require_dlss and not dlss_evidenced:
+        if not base_pass:
+            result["outcome"] = "FAIL"
+        elif args.require_dlss and not dlss_evidenced:
             result["outcome"] = "INCONCLUSIVE_DLSS"
         elif dlss_evidenced:
             result["outcome"] = "PASS_DLSS_EVAL"
-        check("overall", result["outcome"] == "PASS", result["outcome"])
+        else:
+            result["outcome"] = "PASS"
+        # PASS_DLSS_EVAL means the run passed AND DLSS evaluation was observed;
+        # it is strictly stronger than bare PASS, so it must not read as FAIL.
+        check("overall", result["outcome"] != "FAIL", result["outcome"])
     except Exception as exc:
         result["outcome"] = "FAIL"
         result["errors"].append(str(exc))

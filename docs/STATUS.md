@@ -1848,6 +1848,32 @@ Rollback note (correction): never revert doc work with whole-file checkout —
  strongest streak so far (supersedes 6600) and proves the toggle is
  robust under repeated use, but it does NOT measure image quality:
  the HDR-vs-LDR visual difference is a human observation still pending.
+**HDR/LDR A/B verdict (user, run 20261007T183644Z):** both modes
+ "essentially the exact same with extremely minor differences" — color-mode
+ mismatch is NOT a contributor to the softness. Corroborated in source:
+ this SDK declares sharpening unsupported
+ (`vendor/nvngx/nvsdk_ngx_defs.h:296` "Sharpness is not supported") and
+ exposes no MaxDetail knob, so `sharpness=0` is not the cause either.
+ Remaining candidates are temporal: jitter frozen at 0, and MV + depth both
+ all-zero buffers (`memset` in the shadow-eval infra) → DLSS has no subpixel
+ samples and no motion information.
+**Objective sharpness probe (built + validated):**
+ `scripts/sharpness_ab.ps1` (Laplacian variance + mean |gradient| on a
+ central crop, F8 via keybd_event, scene guard on mean luma, discards
+ scene-mismatch/blank pairs) and `scripts/diff_pair.ps1` (exact
+ differing-pixel count). Metric validated against synthetic sharp/blurred
+ images by `scripts/ab_selftest.ps1` — PASS (sharp lapvar 48910 vs soft
+ 21483, correct ordering).
+**A/B sharpness measurement is BLOCKED — proven quantitatively:** run
+ p2908, 5 ON/OFF pairs → 100.3% lapvar ratio ("no measurable delta"), but
+ the NULL CONTROL (two captures 600ms apart with NO toggle,
+ `scripts/sharpness_control.ps1`) differs on 87–96% of pixels
+ (meanDelta 11–24 of 255). Camera drift alone swamps any plausible DLSS
+ effect, so the earlier "45.5% softening" reading was a drift artifact and
+ is WITHDRAWN. ON/OFF pairs showed 9–57% differing pixels — entirely
+ inside the control band. Screenshot differencing cannot measure this while
+ the scene moves; needs a frozen camera (viewport patch replay-blocked) or
+ an in-engine freeze.
 **Test-runner honesty fix:** `dlss_injection_recorded` FAILed forever because
  it only matched the retired legacy `hooks: DLSS injection recorded` marker.
  Replaced with `dlss_frames_evaluated`, which accepts either legacy markers
