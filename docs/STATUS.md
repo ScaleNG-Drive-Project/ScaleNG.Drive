@@ -2298,3 +2298,5 @@ blindly copy this workaround to another installation without checking its files.
  top declarations; rebuild; rerun.
 **Standing warnings:** baseline NOT crash-free (3 fault events across
  recent runs); 20-min run stays off the table (user directive).
+ Clean 100s reference run 204943Z (p12764, zeros default): PASS_DLSS_EVAL,
+ ok #7800 (present 8641, handoff 1), 0 FAILED/FAULTED, breaker silent.
