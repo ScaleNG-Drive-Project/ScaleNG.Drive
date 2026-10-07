@@ -2364,6 +2364,22 @@ void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURC
         Log("hooks: barrier %p %u -> %u (#%ld)", (void*)res, (unsigned int)before, (unsigned int)after, n);
 }
 
+// Locked lookup of tracked entry states for a resource pair. Lives outside
+// any __try function (BookGuard requires unwinding; C2712 forbids __try in
+// such frames), so Present-time code can query states legally.
+static bool LookupTrackedStates(ID3D12Resource* a, D3D12_RESOURCE_STATES* aOut,
+                                ID3D12Resource* b, D3D12_RESOURCE_STATES* bOut)
+{
+    if (!a || !b || !aOut || !bOut) return false;
+    bool aTr = false, bTr = false;
+    { BookGuard _bg;
+      auto it = g_resourceStates.find(a);
+      if (it != g_resourceStates.end()) { *aOut = it->second; aTr = true; }
+      auto jt = g_resourceStates.find(b);
+      if (jt != g_resourceStates.end()) { *bOut = jt->second; bTr = true; } }
+    return aTr && bTr;
+}
+
 void CreateDlssOut()
 {
     if (!g_device || g_displayW == 0 || g_displayH == 0) return;
@@ -6716,20 +6732,31 @@ static bool g_dlssForceLDR = false;
 // A/B auto-alternation window in presents (0 = steady manual-only control).
 // Nonzero alternates handoff ON/OFF per window for bot captures.
 static unsigned g_abWindowPresents = 0;
+// Real-input switch for the shadow path (F9 toggles live + logged; INI
+// `realInputs`, default OFF). OFF = owned zero MV/depth (known-good).
+// ON = engine MV/depth after fail-closed validation, restored post-eval.
+static bool g_shadowRealInputs = false;
 
 static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSerial)
 {
     if (g_dlaaMode || !g_upscaler || !g_upscaler->IsReady()) return;
     // F8 edge-triggered handoff toggle for live A/B comparison.
     // F7 edge-triggered HDR/LDR mode toggle (recreates feature).
+    // F9 edge-triggered real/zero MV+depth input toggle (logged).
     {
-        static bool s_f8Prev = false, s_f7Prev = false;
+        static bool s_f8Prev = false, s_f7Prev = false, s_f9Prev = false;
         bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         if (f8 && !s_f8Prev) {
             g_shadowHandoff = !g_shadowHandoff;
             Log("hooks: shadow-eval handoff %s (F8)", g_shadowHandoff ? "ON" : "OFF");
         }
         s_f8Prev = f8;
+        bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        if (f9 && !s_f9Prev) {
+            g_shadowRealInputs = !g_shadowRealInputs;
+            Log("hooks: shadow-eval inputs %s (F9)", g_shadowRealInputs ? "REAL MV/depth" : "zero placeholders");
+        }
+        s_f9Prev = f9;
         bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
         if (f7 && !s_f7Prev && g_upscaler) {
             g_dlssForceLDR = !g_dlssForceLDR;
@@ -7029,16 +7056,109 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &b);
 
+    // REAL-INPUT PATH (default OFF, F9 toggles live): feed the engine's own
+    // MV/depth to NGX instead of the zero placeholders. Fail-closed: ANY
+    // doubt falls back to the owned zeros (behavior below is then exactly
+    // the proven path). Engine resources are transitioned via the
+    // tracked-state Barrier() helper and restored to entry states in the
+    // same list, so FIFO queue order keeps engine use safe.
+    // Known unknowns (logged per eval batch, NOT solved here): MV value
+    // range/direction/jitter inclusion (assumed UV [0,1] prev-minus-cur,
+    // same as the legacy path's mvScale=W/H); depth convention
+    // (DepthInverted NOT set); jitter stays 0 (render is unjittered).
+    ID3D12Resource* inMv = g_shMv;
+    ID3D12Resource* inDepth = g_shDepth;
+    float mvScaleX = 1.0f, mvScaleY = 1.0f;
+    bool useReal = false;
+    const char* realWhy = "off";
+    D3D12_RESOURCE_STATES mvBefore = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES depthBefore = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* mvCand = nullptr;   // selected engine MV candidate (scope for diagnostics)
+    ID3D12Resource* depCand = nullptr;  // selected engine depth candidate (scope for diagnostics)
+    if (g_shadowRealInputs) {
+        realWhy = "unchecked";
+        ID3D12Resource* mv = g_mvResource;
+        ID3D12Resource* dep = g_depthResource;
+        D3D12_RESOURCE_DESC mvd = {}, depd = {};
+        bool mvAlive = mv && SafeGetDesc(mv, &mvd);
+        // MV rotation: the engine renders into a fresh R16G16F target most
+        // frames (primary + ALT pattern in every run). A retired primary
+        // must not pin us to zeros while a live ALT exists.
+        if (!mvAlive && g_mvResourceAlt && SafeGetDesc(g_mvResourceAlt, &mvd)) {
+            mv = g_mvResourceAlt;
+            mvAlive = true;
+        }
+        mvCand = mv; depCand = dep;
+        bool depAlive = dep && SafeGetDesc(dep, &depd);
+        if (!g_mvValid || !mv) realWhy = "no-mv";
+        else if (!mvAlive) realWhy = "mv-retired";
+        else if (mvd.Format != DXGI_FORMAT_R16G16_FLOAT) realWhy = "mv-format";
+        else if (mvd.Width != g_displayW || mvd.Height != g_displayH) realWhy = "mv-size";
+        else if (!g_depthValid || !dep) realWhy = "no-depth";
+        else if (!depAlive) realWhy = "depth-retired";
+        else if (g_depthRealFmt == DXGI_FORMAT_UNKNOWN || g_depthMsaa) realWhy = "depth-fmt";
+        else if (depd.Width != g_displayW || depd.Height != g_displayH) realWhy = "depth-size";
+        else if (g_frameCounter < g_mvStamp || g_frameCounter - g_mvStamp > 10) realWhy = "mv-stale";
+        else if (g_frameCounter < g_depthStamp || g_frameCounter - g_depthStamp > 20000) realWhy = "depth-stale";
+        else {
+            // Tracked entry states must exist: without a known StateBefore
+            // there is no legal transition (fail closed to zeros). The lookup
+            // helper owns the lock; this __try frame must not (C2712).
+            mvCand = mv; depCand = dep;
+            if (!LookupTrackedStates(mv, &mvBefore, dep, &depthBefore)) realWhy = "untracked-state";
+            else {
+                useReal = true; realWhy = "real";
+                inMv = mv; inDepth = dep;
+                mvScaleX = (float)mvd.Width; mvScaleY = (float)mvd.Height;
+                Barrier(list, inMv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(list, inDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+        }
+    }
+    {
+        // Bounded source diagnostics: transitions always; periodic identity
+        // below with the ok counter. Never per-frame. Prints the CANDIDATE
+        // engine resources (mv/dep), not the selected inputs: on fallback the
+        // inputs are the owned placeholders and would mislead.
+        static int s_lastSrc = -1;
+        int src = useReal ? 1 : 0;
+        if (src != s_lastSrc) {
+            s_lastSrc = src;
+            // Print the SELECTED candidates (mvCand/depCand), not slot
+            // re-reads: engine frees MV textures mid-frame, so a re-read can
+            // disagree with the validation microseconds earlier (observed).
+            // When the toggle is off the candidates are null and the owned
+            // placeholders (inMv/inDepth) are printed instead.
+            D3D12_RESOURCE_DESC mvd2 = {}, depd2 = {};
+            ID3D12Resource* mvP = mvCand ? mvCand : inMv;
+            ID3D12Resource* depP = depCand ? depCand : inDepth;
+            bool mOk = mvP && SafeGetDesc(mvP, &mvd2);
+            bool dOk = depP && SafeGetDesc(depP, &depd2);
+            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f",
+                useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
+                mOk ? (unsigned)mvd2.Format : 0, mOk ? (unsigned)mvd2.Width : 0, mOk ? (unsigned)mvd2.Height : 0,
+                (mvP == g_mvResourceAlt) ? " ALT" : "",
+                (void*)depP,
+                dOk ? (unsigned)depd2.Format : 0, dOk ? (unsigned)depd2.Width : 0, dOk ? (unsigned)depd2.Height : 0,
+                mvScaleX, mvScaleY);
+        }
+    }
+
     UpscalerEvaluateParams ep = {};
     ep.commandList = list;
     ep.color = bb;
-    ep.depth = g_shDepth;
-    ep.motionVectors = g_shMv;
+    ep.depth = inDepth;
+    ep.motionVectors = inMv;
     ep.output = g_shOut;
     ep.jitterX = 0.0f; ep.jitterY = 0.0f;
-    ep.mvScaleX = 1.0f; ep.mvScaleY = 1.0f;
+    ep.mvScaleX = mvScaleX; ep.mvScaleY = mvScaleY;
     ep.sharpness = g_cfg.sharpness;
     bool ok = g_upscaler->Evaluate(ep);
+    if (useReal) {
+        // Restore engine resources to entry states in the same list.
+        Barrier(list, inMv, mvBefore);
+        Barrier(list, inDepth, depthBefore);
+    }
 
     // HANDOFF (visible DLSS): on success, write the evaluated output back
     // into the backbuffer before Real_Present runs. All states self-owned:
@@ -7097,8 +7217,14 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     static volatile LONG s_shOk = 0, s_shFail = 0;
     if (ok) {
         LONG n = InterlockedIncrement(&s_shOk);
-        if (n <= 10 || (n % 600) == 0)
+        if (n <= 10 || (n % 600) == 0) {
             Log("hooks: shadow-eval ok #%ld (present %llu handoff %d)", n, presentSerial, handoffNow ? 1 : 0);
+            Log("hooks: shadow-eval inputs %s why=%s mv=%p depth=%p mvScale=%.0fx%.0f frame=%u mvAge=%u depthAge=%u",
+                useReal ? "REAL" : "ZERO", realWhy, (void*)inMv, (void*)inDepth,
+                mvScaleX, mvScaleY, g_frameCounter,
+                g_mvValid ? (g_frameCounter - g_mvStamp) : 9999,
+                g_depthValid ? (g_frameCounter - g_depthStamp) : 9999);
+        }
     } else {
         LONG n = InterlockedIncrement(&s_shFail);
         if (n <= 10)
@@ -9556,6 +9682,7 @@ void HooksSetConfig(const ScaleNgConfig& config)
     g_passiveMode = config.passive;
     g_shadowHandoff = config.shadowHandoff;
     g_abWindowPresents = config.abWindow;
+    g_shadowRealInputs = config.realInputs;
     Log("hooks: config applied (dlaa=%d legacyScale=%d; viewport arming is dlaa-gated, legacyScale retained for compat)",
         g_dlaaMode ? 1 : 0, g_legacyScale ? 1 : 0);
 }

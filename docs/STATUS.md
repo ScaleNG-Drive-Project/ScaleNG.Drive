@@ -2082,3 +2082,111 @@ For the verified ASI path, `C:\Games\BeamNG.drive\Bin64\dxgi.dll` had been
 reversibly renamed to `dxgi.dll.scaleng-disabled-20261002`. Keep the proxy
 disabled for this ASI test unless testing coexistence specifically. Do not
 blindly copy this workaround to another installation without checking its files.
+
+## Real MV/depth inputs: fail-closed path + live findings (2026-10-07, runs 190954Z–193154Z)
+
+**Verified: what each successful eval receives TODAY.** The only eval path
+ that succeeds is shadow-eval (`ShadowEvalAtPresent`); the legacy
+ `DoInjection` path records 0 injections in every recent run (its
+ viewport-patch + veteran gates never all pass). Shadow eval feeds NGX:
+ color = current presented backbuffer (fmt-28 LDR, post-HUD), depth +
+ MV = OWNED zero-filled placeholders (`g_shMv` fmt-34 R16G16_FLOAT,
+ `g_shDepth` fmt-41 R32_FLOAT, `memset 0` once, parked in PSR forever),
+ output = owned fmt-28 UAV, jitter 0/0, mvScale 1.0x1.0 (zeros make scale
+ moot). Proven by source (`d3d12_hooks.cpp` infra + ep block) and
+ PID-filtered logs (e.g. run 190954Z p3668: owned placeholders
+ 1920x1080 fmt-34/41). Zero buffers are NOT valid DLSS inputs (NVIDIA
+ treats depth+MVs as mandatory); they are why motion smears and stills
+ stay soft. HDR/LDR + sharpness already eliminated (STATUS visual-A/B
+ sections); remaining cause is temporal (frozen jitter + zero MV/depth).
+
+**Verified: engine resources that COULD supply real inputs.** MV:
+ `g_mvResource`/`g_mvResourceAlt` adopted at `CreateRenderTargetView`
+ (fmt-34 R16G16_FLOAT) + silent re-adopt at `OMSetRenderTargets` bind
+ (track-by-bind, no log) + registry re-adopt; sizes vary by phase
+ (1902x1033/1902x983/1920x983 loading → 1920x1080 gameplay; some runs
+ never reach display size). Depth: `g_depthResource` adopted at SRV
+ creation + full-res-copy DEST heuristic; **live-measured format fmt-45
+ = R24G8_TYPELESS** (run 192627Z p3844: `candDepth=...(45 1920x1080)`) —
+ NOT directly NGX-compatible (NGX depth is single-channel; typeless
+ depth+stencil needs an R32F copy or an R24X8/R32F view). States:
+ barrier traffic IS tracked live on the shim path
+ (`TrackResourceBarriers` refreshes `g_resourceStates` + MV/depth stamps;
+ the old "frozen-unknown" blocker note is outdated) but shim coverage of
+ engine lists is unproven, so untracked = fail closed. Freshness gates:
+ MV age <=10 presents, depth age <=20000 frames (legacy thresholds).
+ Jitter: `g_currJitter` (Halton 2/3) computed per camera frame but the
+ render is UNJITTERED (`ApplyCameraCbJitter` gated on `g_dlaaMode`,
+ shipped `dlaa=0`), so shadow eval correctly passes 0/0; `mvJittered=1`
+ create flag with jitter 0 is moot. MV value range/direction/jitter
+ inclusion: UNKNOWN (no readback by policy); assumed UV [0,1]
+ prev-minus-cur per code comment + legacy `mvScale=W/H` (hypothesis,
+ untested). Depth convention (inverted?): UNKNOWN, `DepthInverted` NOT
+ set. Scene-color correspondence: shadow color is the PRESENTED frame
+ (post-composite + HUD) while MV/depth describe the pre-composite scene
+ render — approximately pixel-aligned at 1920x1080 but UI pixels carry
+ scene MVs (FPS-trail mechanism already observed).
+
+**Implemented (fail-closed, default OFF, known-good preserved):**
+ `g_shadowRealInputs` (INI `realInputs=0`, F9 toggles live, logged).
+ When ON, each eval validates: liveness (`SafeGetDesc`), MV fmt-34 +
+ display size (primary, else ALT — engine rotates MV textures every run),
+ depth known non-MSAA fmt + display size, freshness gates, tracked entry
+ states via `LookupTrackedStates` (lock lives outside the `__try` frame —
+ C2712 forbids unwinding objects with `__try`; first build caught this).
+ Pass → engine MV/depth via tracked `Barrier()` to PSR + `mvScale=W/H`,
+ restored to entry states in the same list (FIFO order = engine safety).
+ ANY failure → owned zeros (byte-identical proven path). Diagnostics
+ (bounded, never per-frame): source transitions (`REAL`/`ZERO` +
+ reason + candidate identity + mvScale) and a periodic line piggybacked
+ on the 600-ok cadence (pointers, mvScale, frame, mv/depth ages). The ok
+ line format is UNCHANGED (runner parser intact). `IUpscaler` untouched.
+ Files: `src/d3d12_hooks.cpp` (F9, selection, barriers, logs),
+ `src/d3d12_hooks.h` (`realInputs`), `src/main.cpp` (INI parse),
+ `dist/ScaleNG.ini` (`realInputs=0`).
+**Reversal:** set INI `realInputs=0` (or F9); full revert = delete the
+ F9 block + real-input selection/diagnostic hunks + `LookupTrackedStates`
+ + config plumbing; rebuild; rerun. Zero-path behavior is untouched.
+
+**Live results (same scene/vehicle/settings: smallgrid + pickup).**
+ - 190954Z (90s, flag off): PASS_DLSS_EVAL, 22-proxy oks (19 counted),
+   0 fatal — regression baseline for the new binary hunk (inactive).
+ - 191239Z (90s, flag on but INI NOT deployed — deployed INI stale):
+   `why=off` all run — process finding: deployment copies ASI/helper but
+   NOT ScaleNG.ini; dist↔deployed INI must be synced by hand (copied;
+   `.pre-realinputs-bak` kept in game dir).
+ - 191619Z (120s, flag on): 0 evals — run invalid for the experiment:
+   transient allocator-reset failures at startup + a 2048x2048 fmt-10
+   scene ALT adopted → `AdoptDisplaySize(2048,2048)` while bb stays
+   1920x1080 → every present exits at size check. Pre-existing adoption
+   hazard (any >=1000x500 scene-format RTV redefines display), untouched
+   by this work; run A saw 37 2048-lines without adoption taking hold.
+   Fail-closed guards behaved (`why=mv-retired`, 0 REAL, 0 crashes here).
+ - 192231Z (120s, flag on): PASS_DLSS_EVAL, 26 oks, 0 fatal, 0 REAL —
+   guards correctly rejected all run (`why=mv-format` x27: candidate
+   alive but not fmt-34). Stable: real-path validation adds no
+   instability when it rejects.
+ - 192627Z (120s, flag on): GAME_CRASHED_AFTER_PLUGIN_INIT, exit
+   0xC0000005. Crash on FIRST eval with ZEROS (`why=mv-format` →
+   fallback, no engine barrier executed by my code — provable from the
+   log sequence), fault inside NGX `CreateFeature` (SEH 0xC0000005).
+   Baseline rerun below shows this is not reproducible via my path.
+ - 193154Z (90s, flag off, current binary): PASS_DLSS_EVAL, 22 oks,
+   0 fatal — baseline STABLE; the 192627Z crash is not caused by the
+   real-input hunk (inactive here; delta vs proven build is F9 check +
+   two bounded logs). Crash cause UNDETERMINED: pre-existing
+   CreateFeature flakiness (first observed) vs run-specific driver
+   state; no engine-state corruption by my code is possible on the
+   logged path (zero fallback touches nothing engine-owned).
+**Bonus verified facts from the new diagnostics:** (1) MV UAF race is
+ live and microsecond-scale: a candidate passing validation read dead
+ (fmt 34→0) one log line later; (2) owned-placeholder identity prints
+ misled once — fixed to print selected candidates; (3) depth fmt-45
+ finding above blocks direct depth use.
+**Limitations / NOT claimed:** REAL never engaged — no image-quality
+ comparison exists yet; MV direction/scale/jitter-inclusion, depth
+ convention/conversion (R24G8→R32F copy or view), jittered rendering,
+ and scene-vs-presented alignment are all still open. Next: R32F depth
+ conversion + MV TOCTOU hardening (validation-to-bind race), then
+ re-attempt REAL on a stable baseline. No image-quality improvement
+ claimed; no 20-min run (user directive).
