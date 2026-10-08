@@ -36,6 +36,21 @@ FATAL_MARKERS = (
 USER32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
 
+def send_hotkey(vk_key: int) -> None:
+    """Simulate a single key press+release via the global keyboard state.
+
+    The plugin uses GetAsyncKeyState, which reads the system-wide async state,
+    so no window focus manipulation is needed. F9/edge detection requires a
+    full down-then-up transition.
+    """
+    if USER32 is None:
+        return
+    # keybd_event(vk, scan, flags, extraInfo); 0 = key down, 2 = key up.
+    USER32.keybd_event(vk_key, 0, 0, 0)
+    time.sleep(0.05)
+    USER32.keybd_event(vk_key, 0, 2, 0)
+
+
 def dismiss_known_library_warning(process_id: int) -> bool:
     """Choose Cancel only on BeamNG's known third-party-library dialog."""
     if USER32 is None:
@@ -85,6 +100,11 @@ def main() -> int:
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--skip-build", action="store_true", help="use existing dist artifacts")
     parser.add_argument("--no-deploy", action="store_true", help="test currently deployed plugin without copying files")
+    parser.add_argument("--real-test", action="store_true",
+                        help="after gameplay ready, toggle F9 to REAL engine MV/depth inputs "
+                             "(F8 remains ON from INI shadowHandoff=1). Verifies mvTouchAge/depthTouchAge<=3.")
+    parser.add_argument("--extra-settle", type=int, default=10,
+                        help="seconds to settle after F9 toggle before recording (default: 10)")
     args = parser.parse_args()
 
     if args.duration < 1:
@@ -93,7 +113,8 @@ def main() -> int:
     run_dir = ROOT / "logs" / "test_runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=False)
     result = {"started_utc": stamp, "level": args.level, "duration_sec": args.duration,
-              "checks": {}, "errors": [], "run_dir": str(run_dir)}
+              "checks": {}, "errors": [], "run_dir": str(run_dir),
+              "real_test": args.real_test}
     game = None
     process = None
     baseline_signature = None
@@ -233,6 +254,15 @@ def main() -> int:
         if not gameplay_ready:
             raise RuntimeError("Game did not reach freeroam with a vehicle before timeout")
 
+        if args.real_test:
+            # Toggle F9 to switch from zero placeholders to engine REAL MV/depth.
+            # F8 (shadowHandoff) stays ON per INI shadowHandoff=1 / realInputs=0 default.
+            send_hotkey(0x78)  # VK_F9
+            result["real_test_toggle_sent"] = True
+            if args.extra_settle:
+                print(f"REAL test: F9 toggled; settling {args.extra_settle}s for engine to feed REAL inputs...", flush=True)
+                time.sleep(args.extra_settle)
+
         observed_start = time.monotonic()
         log_offset = baseline_size
         while time.monotonic() - observed_start < args.duration:
@@ -322,6 +352,12 @@ def main() -> int:
         shadow_input_zero_lines = 0
         shadow_input_real_why: list[str] = []
         shadow_input_zero_why: list[str] = []
+        # Touch-age tracking for REAL freshness proof (present-serial same-frame).
+        # mvTouchAge/depthTouchAge <= 3 on sustained REAL inputs lines is the
+        # falsifiable expectation (see STATUS.md). 9999 = never observed.
+        max_mv_touch_age_real = 0
+        max_depth_touch_age_real = 0
+        real_touch_age_violations = 0
         last_input_mode = "unknown"
         for line in target_lines:
             mode_match = re.search(r"inputs (REAL|ZERO)", line)
@@ -329,11 +365,21 @@ def main() -> int:
                 continue
             why_match = re.search(r"why=([A-Za-z-]+)", line)
             why = why_match.group(1) if why_match else None
+            mv_age_match = re.search(r"mvTouchAge=(\d+)", line)
+            depth_age_match = re.search(r"depthTouchAge=(\d+)", line)
+            mv_touch = int(mv_age_match.group(1)) if mv_age_match else 9999
+            depth_touch = int(depth_age_match.group(1)) if depth_age_match else 9999
             if mode_match.group(1) == "REAL":
                 shadow_input_real_lines += 1
                 if why and why not in shadow_input_real_why and len(shadow_input_real_why) < 8:
                     shadow_input_real_why.append(why)
                 last_input_mode = "REAL"
+                if mv_touch > max_mv_touch_age_real:
+                    max_mv_touch_age_real = mv_touch
+                if depth_touch > max_depth_touch_age_real:
+                    max_depth_touch_age_real = depth_touch
+                if mv_touch > 3 or depth_touch > 3:
+                    real_touch_age_violations += 1
             else:
                 shadow_input_zero_lines += 1
                 if why and why not in shadow_input_zero_why and len(shadow_input_zero_why) < 8:
@@ -364,6 +410,28 @@ def main() -> int:
         else:
             check("dlss_frames_evaluated", False, "no DLSS eval evidence (not proof of visual quality)")
         check("no_fatal_markers", not fatal, f"{len(fatal)} fatal markers")
+
+        if args.real_test:
+            # REAL mode freshness proof checks
+            check("real_inputs_observed", shadow_input_real_lines > 0,
+                  f"{shadow_input_real_lines} REAL input lines (expect >0 after F9 toggle)")
+            check("no_reset_failures",
+                  len(shadow_failures) == 0 and len(shadow_eval_failures) == 0,
+                  f"{len(shadow_failures)} shadow reset failures, {len(shadow_eval_failures)} eval failures")
+            check("no_breaker_lines",
+                  not any("breaker" in line.lower() for line in target_lines),
+                  "no breaker state lines in current PID log")
+            check("real_touch_ages_in_window",
+                  max_mv_touch_age_real <= 3 and max_depth_touch_age_real <= 3,
+                  f"max mvTouchAge={max_mv_touch_age_real}, max depthTouchAge={max_depth_touch_age_real} "
+                  f"(expect <=3 for double/triple buffering); {real_touch_age_violations} violations")
+            # Inconclusive depth note (no DSV hook — depth relies on barrier/SRV traffic only)
+            if max_depth_touch_age_real > 3:
+                result["depth_inconclusive"] = (
+                    "depthTouchAge >3: no DSV write hook exists; depth freshness "
+                    "relies solely on barrier traffic + SRV creation. Visual A/B "
+                    "on depth is INCONCLUSIVE until per-frame depth write is instrumented."
+                )
         result["counts"] = {"frame_markers": len(frames), "render_evidence": len(render_evidence),
                              "present_snapshots": len(present_progress), "injection_markers": len(injections),
                              "shadow_eval_ok": len(shadow_ok), "shadow_eval_handoff": len(shadow_handoff),
@@ -375,7 +443,10 @@ def main() -> int:
                              "shadow_input_real_why": list(shadow_input_real_why),
                              "shadow_input_zero_why": list(shadow_input_zero_why),
                              "last_input_mode": last_input_mode,
-                             "shadow_input_note": shadow_input_note}
+                             "shadow_input_note": shadow_input_note,
+                             "max_mv_touch_age_real": max_mv_touch_age_real,
+                             "max_depth_touch_age_real": max_depth_touch_age_real,
+                             "real_touch_age_violations": real_touch_age_violations}
         result["evaluate_failure_samples"] = eval_failures[:20]
         result["fatal_samples"] = fatal[:20]
         base_pass = loaded and initialized and render_pass and not fatal
