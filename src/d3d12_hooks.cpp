@@ -2418,6 +2418,21 @@ static bool LookupTrackedStates(ID3D12Resource* a, D3D12_RESOURCE_STATES* aOut,
     return aTr && bTr;
 }
 
+// Locked state-map restore WITHOUT recording: when a command list is
+// discarded unexecuted (e.g. NGX faulted mid-record and the list won't
+// Close), the GPU never saw our transitions, so the map must return to
+// entry values — otherwise the next frame's barriers no-op against a lie
+// while the GPU sits in the old state. Lock lives here, never in __try
+// frames (C2712: BookGuard requires unwinding).
+static void NoteTrackedStates(ID3D12Resource* a, D3D12_RESOURCE_STATES aState,
+                              ID3D12Resource* b, D3D12_RESOURCE_STATES bState)
+{
+    if (!a || !b) return;
+    BookGuard _bg;
+    g_resourceStates[a] = aState;
+    g_resourceStates[b] = bState;
+}
+
 void CreateDlssOut()
 {
     if (!g_device || g_displayW == 0 || g_displayH == 0) return;
@@ -2607,6 +2622,22 @@ void DoInjection(ID3D12GraphicsCommandList* list)
     // path records NGX work into the ENGINE's command list - illegal when
     // the feature lives on the bridge device. Hard-disable in DLAA mode.
     if (g_dlaaMode) return;
+    // LEGACY EVAL DISABLED (2026-10-08, run 20261008T144341Z): this path
+    // records NGX Evaluate into the engine's own command list, which we can
+    // neither discard nor repair — when NGX faults mid-record (observed:
+    // EvaluateFeature AV then game AV death seconds later), the poisoned
+    // engine list executes and kills the game. The shadow own-list path is
+    // the live path (discard-safe); legacy has never recorded a success
+    // (0 injection markers in every recent run). Early-out keeps discovery
+    // (viewport patch, triggers, logs) intact for diagnosis.
+    // Reversal: delete this block; rebuild; rerun.
+    {
+        static volatile LONG s_legacyOffLogs = 0;
+        if (InterlockedIncrement(&s_legacyOffLogs) <= 3)
+            Log("hooks: legacy DoInjection eval disabled - shadow path owns NGX (see STATUS)");
+        (void)list;
+        return;
+    }
     EnsureUpscalerInit(false);
     if (!g_upscaler || !g_upscaler->IsReady()) return;
 
@@ -7093,17 +7124,28 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     }
 
     unsigned slot = (g_shFlip++) & 1;
-    if (SafeGetFenceCompleted(g_shFence) < g_shFenceDone[slot]) {
+    // Fence + reset diagnostics: both early exits below used to go quiet
+    // after 3 logs, hiding stall-vs-poisoned-allocator ambiguity forever.
+    // completed<expected = GPU never finished our work (signal skipped or
+    // queue wedged); reset-fail with completed>=expected = allocator/list
+    // state poisoned (e.g. unclosable list after an NGX fault).
+    unsigned long long shCompleted = SafeGetFenceCompleted(g_shFence);
+    if (shCompleted < g_shFenceDone[slot]) {
         static volatile LONG s_shSkips = 0;
         if (InterlockedIncrement(&s_shSkips) <= 3)
-            Log("hooks: shadow-eval skipped - prior frame still in flight");
+            Log("hooks: shadow-eval skipped - prior frame still in flight (completed=%llu expected=%llu)",
+                shCompleted, (unsigned long long)g_shFenceDone[slot]);
         bb->Release();
         return;
     }
-    if (FAILED(g_shAlloc[slot]->Reset()) || FAILED(g_shList[slot]->Reset(g_shAlloc[slot], nullptr))) {
+    HRESULT shAllocHr = g_shAlloc[slot]->Reset();
+    HRESULT shListHr = FAILED(shAllocHr) ? E_FAIL : g_shList[slot]->Reset(g_shAlloc[slot], nullptr);
+    if (FAILED(shAllocHr) || FAILED(shListHr)) {
         static volatile LONG s_shResetFails = 0;
-        if (InterlockedIncrement(&s_shResetFails) <= 3)
-            Log("hooks: shadow-eval allocator/list reset failed");
+        if (InterlockedIncrement(&s_shResetFails) <= 5)
+            Log("hooks: shadow-eval allocator/list reset failed (alloc=0x%08X list=0x%08X completed=%llu expected=%llu)",
+                (unsigned)shAllocHr, (unsigned)shListHr,
+                shCompleted, (unsigned long long)g_shFenceDone[slot]);
         bb->Release();
         return;
     }
@@ -7293,12 +7335,46 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         list->ResourceBarrier(1, &b);
     }
-    list->Close();
-    ID3D12CommandList* lists[1] = { list };
-    queue->ExecuteCommandLists(1, lists);
-    UINT64 fv = g_shFenceNext++;
-    queue->Signal(g_shFence, fv);
-    g_shFenceDone[slot] = fv;
+    // Submit, unless the list is unusable: a faulted NGX record can leave
+    // the list unclosable, and submitting it (or leaving the allocator
+    // stuck) kills every later frame silently — observed as permanent
+    // reset-failure after a single CreateFeature AV. On failure the GPU
+    // never saw this list, so discarding + resetting is state-neutral;
+    // CPU-side tracked states are restored to entry values to match.
+    // POD locals only (__try present in this frame; C2712).
+    bool submitted = false;
+    __try {
+        HRESULT chr = list->Close();
+        if (SUCCEEDED(chr)) {
+            ID3D12CommandList* lists[1] = { list };
+            queue->ExecuteCommandLists(1, lists);
+            UINT64 fv = g_shFenceNext++;
+            queue->Signal(g_shFence, fv);
+            g_shFenceDone[slot] = fv;
+            submitted = true;
+        } else {
+            static volatile LONG s_shCloseFails = 0;
+            if (InterlockedIncrement(&s_shCloseFails) <= 5)
+                Log("hooks: shadow-eval list Close failed hr=0x%08X (present %llu)", (unsigned)chr, presentSerial);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        static volatile LONG s_shSubmitFaults = 0;
+        if (InterlockedIncrement(&s_shSubmitFaults) <= 5)
+            Log("hooks: shadow-eval submit faulted (code 0x%08X present %llu)", (unsigned)GetExceptionCode(), presentSerial);
+    }
+    if (!submitted) {
+        if (useReal) NoteTrackedStates(inMv, mvBefore, inDepth, depthBefore);
+        __try {
+            list->Close();
+            g_shAlloc[slot]->Reset();
+            g_shList[slot]->Reset(g_shAlloc[slot], nullptr);
+            g_shList[slot]->Close();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static volatile LONG s_shDiscardFaults = 0;
+            if (InterlockedIncrement(&s_shDiscardFaults) <= 3)
+                Log("hooks: shadow-eval discard faulted (code 0x%08X)", (unsigned)GetExceptionCode());
+        }
+    }
     bb->Release();
 
     if (ok) {
@@ -7306,12 +7382,13 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         LONG n = InterlockedIncrement(&s_shOk);
         if (n <= 10 || (n % 600) == 0) {
             Log("hooks: shadow-eval ok #%ld (present %llu handoff %d)", n, presentSerial, handoffNow ? 1 : 0);
-            Log("hooks: shadow-eval inputs %s why=%s mv=%p depth=%p mvScale=%.0fx%.0f frame=%u mvAge=%u depthAge=%u mvClass=%s depthClass=%s depthFmt=%u srvSrc=%d",
+            Log("hooks: shadow-eval inputs %s why=%s mv=%p depth=%p mvScale=%.0fx%.0f frame=%u mvAge=%u depthAge=%u mvClass=%s depthClass=%s depthFmt=%u srvSrc=%d present=%llu mvStateB=%u depthStateB=%u",
                 useReal ? "REAL" : "ZERO", realWhy, (void*)inMv, (void*)inDepth,
                 mvScaleX, mvScaleY, g_frameCounter,
                 g_mvValid ? (g_frameCounter - g_mvStamp) : 9999,
                 g_depthValid ? (g_frameCounter - g_depthStamp) : 9999,
-                shMvClass, shDepthClass, shDepthFmt, shDepthSrvSrc);
+                shMvClass, shDepthClass, shDepthFmt, shDepthSrvSrc,
+                presentSerial, (unsigned)mvBefore, (unsigned)depthBefore);
         }
         if (was >= 30)
             Log("hooks: shadow-eval recovered after %ld-fault streak (ok #%ld)", was, n);

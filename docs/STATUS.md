@@ -2474,6 +2474,45 @@ blindly copy this workaround to another installation without checking its files.
  already-failing path; live reset test awaits the next fault storm or
  F7/size-change run).
 
+## Poisoned-list death + legacy gate (2026-10-08, runs 143325Z/144202Z/144341Z/144802Z/145016Z)
+
+**Mechanism (verified):** run 143325Z selected REAL on the first eval
+ (both classes ENGINE) but NGX `CreateFeature` AV'd; every later
+ present then failed allocator/list Reset forever (0 evals, silent after
+ bounded logs). A faulted NGX record leaves the own list unclosable, so
+ all future Resets fail — one transient fault permanently kills the
+ path. Same class as 192627Z.
+**Fix (source change, this turn):** submit only onClose-success under
+ SEH with Close-HRESULT check; on any submit failure, discard the list
+ (Close+Reset+Reset+Close under SEH) and restore the CPU state map to
+ entry values (`NoteTrackedStates` — the GPU never saw the discarded
+ list, so map must match), without advancing the fence. Fence/alloc/list
+ diagnostics now carry completed/expected values + per-call HRESULTs to
+ separate GPU-stall from poisoned-allocator. Files:
+ `src/d3d12_hooks.cpp` only (helper + diagnostics + submit/discard).
+ Behavior on healthy paths byte-identical (verified 144802Z).
+ Reversal: revert the three hunks; rebuild; rerun.
+**Legacy DoInjection DISABLED (same turn):** run 144341Z woke the
+ dormant legacy path (viewport patch applied 4× after display churn) →
+ NGX fault on engine-list record → game AV death. Legacy records into
+ the ENGINE's list, which cannot be discarded or repaired — same poison
+ class, unfixable in place, zero successes ever. Gate returns early with
+ bounded log; discovery/patch/trigger logging untouched. Reversal:
+ delete the gate block; rebuild; rerun.
+**Runs:** 144202Z loading-phase AV death pre-init (code paths never
+ executed; unrelated to changes — environmental/stale-process class).
+ 144341Z legacy-fire crash (above). 144802Z fallback smoke PASS (17
+ oks, 0 faults; patch applied 3×, legacy stayed gated, 0 legacy evals).
+ 145016Z fallback PASS, ok #9000, 0 faults — but NEVER left ZERO
+ (depth-size ×26): MV candidate ALT/fmt-34/display-stable all run while
+ the depth slot churned through transient candidates into garbage
+ (fmt 0, 256x1 at eval). MV stable + depth transient is the pairing
+ asymmetry blocking REAL. Not a REAL result; not counted as one.
+**Next targeted step:** depth-slot rotation/stability evidence (bounded
+ rotation counter or age-at-transition logging) to decide whether
+ stability-gating can find usable depth; no blind reruns. No
+ image-quality claim; Stage-5 A/B stays gated on proven REAL.
+
 ## Prioritized cleanup proposal (from 4-auditor health review; NOT implemented)
 
 P1 — small correctness hygiene (each independently verifiable, no
