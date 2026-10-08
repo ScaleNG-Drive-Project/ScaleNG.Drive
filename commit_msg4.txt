@@ -1,7 +1,0 @@
-config: test helper=0 for single-device mode
-
-The cross-device architecture blocker is confirmed: NGX evaluates on helper's device
-but resources are on game's device -> "NGX rejected the frame".
-
-The ReShade-based dxgi.dll proxy architecture is the correct solution - it runs
-NGX on the game's device directly (same device as resources).
