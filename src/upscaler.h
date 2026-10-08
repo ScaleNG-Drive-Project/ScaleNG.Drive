@@ -15,6 +15,7 @@ struct UpscalerInitParams {
     int perfQuality = 1;   // NVSDK_NGX_PerfQuality_Value: 0=MaxPerf 1=Balanced 2=MaxQuality 3=UltraPerf 4=UltraQuality
     bool mvJittered = true;
     bool autoExposure = true;
+    bool depthInverted = false; // engine uses reversed-Z (NVSDK_NGX_DLSS_Feature_Flags_DepthInverted)
 };
 
 struct UpscalerEvaluateParams {

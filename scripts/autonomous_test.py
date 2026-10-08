@@ -360,7 +360,7 @@ def main() -> int:
         real_touch_age_violations = 0
         last_input_mode = "unknown"
         for line in target_lines:
-            mode_match = re.search(r"inputs (REAL|ZERO)", line)
+            mode_match = re.search(r"inputs (REAL|ZERO) why=", line)
             if not mode_match:
                 continue
             why_match = re.search(r"why=([A-Za-z-]+)", line)

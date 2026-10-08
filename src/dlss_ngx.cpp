@@ -355,6 +355,7 @@ bool NvDlssUpscaler::Init(const UpscalerInitParams& params)
     m_perfQuality = params.perfQuality;
     m_mvJittered = params.mvJittered;
     m_autoExposure = params.autoExposure;
+    m_depthInverted = params.depthInverted;
     m_firstEvaluate = true;
 
     if (!LoadNGX(params.dlssDllPath))
@@ -608,6 +609,7 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     int flags = m_forceHDR ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
     if (m_mvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (m_autoExposure) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    if (m_depthInverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
     m_paramStore->SetI(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
 

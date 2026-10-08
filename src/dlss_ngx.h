@@ -223,6 +223,7 @@ private:
     int m_perfQuality = 1;
     bool m_mvJittered = true;
     bool m_autoExposure = true;
+    bool m_depthInverted = false;
     bool m_enabled = true;
     bool m_initialized = false;
     bool m_featureCreated = false;

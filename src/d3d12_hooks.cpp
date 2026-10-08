@@ -2623,6 +2623,7 @@ void EnsureUpscalerInit(bool bypassQuietGate)
     ip.perfQuality = g_cfg.perfQuality;
     ip.mvJittered = g_cfg.mvJittered;
     ip.autoExposure = g_cfg.autoExposure;
+    ip.depthInverted = g_cfg.depthInverted;
     if (!g_upscaler->Init(ip)) {
         Log("hooks: DLSS init failed - upscaling disabled");
         g_upscaler->SetEnabled(false);
@@ -5263,6 +5264,7 @@ static bool B2SendSetup(UINT w, UINT h, DXGI_FORMAT fmt)
     ip.perfQuality = g_cfg.perfQuality;
     ip.mvJittered = g_cfg.mvJittered != 0;
     ip.autoExposure = g_cfg.autoExposure != 0;
+    ip.depthInverted = g_cfg.depthInverted;
     {
         static wchar_t dllPath[MAX_PATH];
         HMODULE self = nullptr;
@@ -7375,6 +7377,19 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
                 g_mvLastTouchPresent ? (presentSerial - g_mvLastTouchPresent) : 9999,
                 g_depthLastTouchPresent ? (presentSerial - g_depthLastTouchPresent) : 9999);
         }
+    }
+
+    // Diagnostic: log validation chain outcome unconditionally when REAL inputs
+    // are active, BEFORE the NGX evaluation call — so the result survives a fault.
+    if (g_shadowRealInputs) {
+        Log("hooks: shadow-eval real-inputs why=%s useReal=%d mvTouchAge=%llu depthTouchAge=%llu "
+            "mvTouch=%llu depthTouch=%llu present=%llu",
+            realWhy, useReal ? 1 : 0,
+            g_mvLastTouchPresent ? (presentSerial - g_mvLastTouchPresent) : 9999,
+            g_depthLastTouchPresent ? (presentSerial - g_depthLastTouchPresent) : 9999,
+            (unsigned long long)g_mvLastTouchPresent,
+            (unsigned long long)g_depthLastTouchPresent,
+            (unsigned long long)presentSerial);
     }
 
     UpscalerEvaluateParams ep = {};
