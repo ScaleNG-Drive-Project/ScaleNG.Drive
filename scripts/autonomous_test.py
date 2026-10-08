@@ -257,18 +257,30 @@ def main() -> int:
         if args.real_test:
             # Toggle F9 to switch from zero placeholders to engine REAL MV/depth.
             # F8 (shadowHandoff) stays ON per INI shadowHandoff=1 / realInputs=0 default.
-            send_hotkey(0x78)  # VK_F9
+            # The shadow-eval hook may start 10-15s after gameplay_ready (engine
+            # needs to set up its first render pipeline). Sending F9 too early
+            # means the key is released before the hook begins checking it.
+            # Strategy: send F9 every 500ms for the first 20s of observation
+            # to guarantee detection once the hook is live.
             result["real_test_toggle_sent"] = True
-            if args.extra_settle:
-                print(f"REAL test: F9 toggled; settling {args.extra_settle}s for engine to feed REAL inputs...", flush=True)
-                time.sleep(args.extra_settle)
+            print("REAL test: sending F9 to enable REAL inputs (rebroadcast for 20s)", flush=True)
 
         observed_start = time.monotonic()
         log_offset = baseline_size
+        # Track whether the REAL-inputs toggle has been confirmed in logs.
+        f9_toggle_confirmed = False
         while time.monotonic() - observed_start < args.duration:
             if process is not None and process.poll() is not None:
                 result["errors"].append(f"BeamNG exited during test (code {process.returncode})")
                 break
+            # Re-broadcast F9 every loop iteration while we haven't seen the
+            # toggle confirmed in the log. The shadow-eval hotkey detection
+            # starts ~10-15s after gameplay_ready, so key presses before that
+            # window are harmless (s_f9Prev just stays false). Once confirmed,
+            # stop sending to avoid toggling back to ZERO.
+            now = time.monotonic()
+            if args.real_test and not f9_toggle_confirmed and now < 30.0:
+                send_hotkey(0x78)  # VK_F9
             try:
                 if GAME_LOG.exists():
                     size = GAME_LOG.stat().st_size
@@ -278,10 +290,22 @@ def main() -> int:
                         stream.seek(log_offset)
                         new = stream.read()
                         log_offset = stream.tell()
-                    live_lines.extend(new.decode("utf-8", errors="replace").splitlines())
+                        new_text = new.decode("utf-8", errors="replace")
+                        new_lines = new_text.splitlines()
+                        live_lines.extend(new_lines)
+                        # Check for F9 toggle confirmation in newly-read lines.
+                        if args.real_test and not f9_toggle_confirmed:
+                            for nl in new_lines:
+                                if "inputs REAL MV/depth" in nl and "(F9)" in nl:
+                                    f9_toggle_confirmed = True
+                                    print("REAL test: F9 toggle confirmed in log", flush=True)
+                                    break
             except OSError as exc:
                 result["errors"].append(f"Could not read plugin log: {exc}")
             time.sleep(1)
+
+        if args.real_test:
+            result["f9_toggle_confirmed"] = f9_toggle_confirmed
 
         fresh_log = GAME_LOG.read_bytes() if GAME_LOG.exists() else b""
         if hashlib.sha256(fresh_log).hexdigest() != baseline_signature:
