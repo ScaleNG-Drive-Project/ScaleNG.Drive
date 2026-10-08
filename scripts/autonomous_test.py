@@ -301,6 +301,49 @@ def main() -> int:
                     shadow_handoff.append(line)
             elif "hooks: shadow-eval ok #" in line:
                 shadow_ok.append(line)
+        # Evidence-only: maximum ok counter #N seen. The ok lines are sampled
+        # (first 10, then every 600th), so len(shadow_ok) undercounts total
+        # evals on long runs; the counter is the true total.
+        shadow_eval_max_ok = 0
+        for line in shadow_ok:
+            ok_num = re.search(r"hooks: shadow-eval ok #(\d+)", line)
+            if ok_num:
+                try:
+                    value = int(ok_num.group(1))
+                except ValueError:
+                    continue
+                if value > shadow_eval_max_ok:
+                    shadow_eval_max_ok = value
+        # Evidence-only: input-mode breakdown from "shadow-eval inputs"
+        # lines. Scoped to target_lines (current PID), same as shadow_ok.
+        # Defensive: match only "inputs (REAL|ZERO)" and "why=([A-Za-z-]+)";
+        # the remainder of inputs lines is free-form and must not be parsed.
+        shadow_input_real_lines = 0
+        shadow_input_zero_lines = 0
+        shadow_input_real_why: list[str] = []
+        shadow_input_zero_why: list[str] = []
+        last_input_mode = "unknown"
+        for line in target_lines:
+            mode_match = re.search(r"inputs (REAL|ZERO)", line)
+            if not mode_match:
+                continue
+            why_match = re.search(r"why=([A-Za-z-]+)", line)
+            why = why_match.group(1) if why_match else None
+            if mode_match.group(1) == "REAL":
+                shadow_input_real_lines += 1
+                if why and why not in shadow_input_real_why and len(shadow_input_real_why) < 8:
+                    shadow_input_real_why.append(why)
+                last_input_mode = "REAL"
+            else:
+                shadow_input_zero_lines += 1
+                if why and why not in shadow_input_zero_why and len(shadow_input_zero_why) < 8:
+                    shadow_input_zero_why.append(why)
+                last_input_mode = "ZERO"
+        shadow_input_total = shadow_input_real_lines + shadow_input_zero_lines
+        if shadow_input_total == 0 and shadow_ok:
+            shadow_input_note = "inputs_lines: 0 (modes unknown)"
+        else:
+            shadow_input_note = f"inputs_lines: {shadow_input_total}"
         eval_failures = [line for line in target_lines if "DLSS evaluate failed" in line or "EvaluateFeature failed" in line]
         fatal = [line for line in target_lines if any(marker.lower() in line.lower() for marker in FATAL_MARKERS)]
         check("plugin_loaded_this_run", loaded, f"BeamNG PID {pid}; based on fresh log bytes")
@@ -325,7 +368,14 @@ def main() -> int:
                              "present_snapshots": len(present_progress), "injection_markers": len(injections),
                              "shadow_eval_ok": len(shadow_ok), "shadow_eval_handoff": len(shadow_handoff),
                              "shadow_eval_failures": len(shadow_failures),
-                             "evaluate_failures": len(eval_failures), "fatal_markers": len(fatal)}
+                             "evaluate_failures": len(eval_failures), "fatal_markers": len(fatal),
+                             "shadow_eval_max_ok": shadow_eval_max_ok,
+                             "shadow_input_real_lines": shadow_input_real_lines,
+                             "shadow_input_zero_lines": shadow_input_zero_lines,
+                             "shadow_input_real_why": list(shadow_input_real_why),
+                             "shadow_input_zero_why": list(shadow_input_zero_why),
+                             "last_input_mode": last_input_mode,
+                             "shadow_input_note": shadow_input_note}
         result["evaluate_failure_samples"] = eval_failures[:20]
         result["fatal_samples"] = fatal[:20]
         base_pass = loaded and initialized and render_pass and not fatal

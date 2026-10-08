@@ -1958,6 +1958,17 @@ Rollback note (correction): never revert doc work with whole-file checkout —
  Reversal: per-hunk revert as documented in each section; full list in the
  implementation-stack section. No DLSS visual claim yet.
 
+**Run 20261007T204943Z null visual (user F9 session, p12764).**
+  Fact: 7x F9-ON each engaged REAL (`why=real`) with 0 FAILED/FAULTED.
+  Fact: F8 handoff bit followed F8 independently; observed visual result was null.
+  Fact: MV slot held genuine engine MV (placed-heap, RTV role, engine traffic).
+  Fact: depth slot held SELF depth (own zero placeholder: committed heap, SRV-only, born ~present 842).
+  Inference: the evals ran genuine-MV + zero-depth at DLAA-native with frozen jitter 0 over ~2-5 s windows, so a null is the expected subtle outcome.
+  Hypothesis (not proven): full genuine-MV + genuine-depth over longer windows may show a visible delta; needs the A-G human protocol.
+  Inference: this null does NOT invalidate REAL. REAL today gates liveness/size/format plus per-input age only, with no MV-depth co-freshness check (see depth-gate note in Real MV/depth inputs). A half-void signal passing REAL is consistent with the current gate strength.
+**F9 consumer (fact, source-verified).** Shipped config (`dlaa=0`) has a single effective F9 consumer: `ShadowEvalAtPresent` (`src/d3d12_hooks.cpp:6825-6828`) toggling `g_shadowRealInputs`. The legacy F9 block in `InjectAtPresentImpl` (`src/d3d12_hooks.cpp:5884`) toggles `g_showHud` (overlay) and is unreachable at `dlaa=0` (Present-time callers gate `InjectAtPresentImpl` on `g_dlaaMode`). Zero `hud: overlay` lines in the 204943Z artifact corroborate. Latent hazard only: if `dlaa=1` ever reactivates the legacy path, two F9 meanings coexist (log-confusing, different variables) -- noted, not fixed.
+**Pixel-diff validity (fact).** Screenshot pixel-diff while moving is INVALID for this scene: null control (no toggle) differs 87-96% with no F9/F8 change. Metric tooling (`sharpness_ab`/`diff_pair`) stays validated for static scenes only. No image-quality claim from any eval count.
+
 ## NGX CORE LOADER FIX — Init_Ext SUCCEEDED + feature created + evals run
  (2026-10-07, runs 20261007T165257Z/193649Z+, commit pending)
 
@@ -2240,6 +2251,16 @@ blindly copy this workaround to another installation without checking its files.
  re-attempt REAL on a stable baseline. No image-quality improvement
  claimed; no 20-min run (user directive).
 
+**MV semantics: verified-vs-unknown (facts vs unknowns vs hypotheses kept separate).**
+  Fact (source + NVIDIA primary sources): MV format R16G16_FLOAT at display size with mvScale W/H and MVLowRes unset is self-consistent (full-res MV assumption). Jitter 0 + MVJittered=1 is a subtract-0 no-op (self-consistent, not a mismatch). Create/eval flags set only IsHDR/MVJittered/AutoExposure (src/dlss_ngx.cpp:608-610,748-750).
+  Fact: legacy render-vs-MV size path is SUSPECT (legacy path inert at dlaa=0).
+  Unknown (no readback by policy, unmeasured): MV sign/direction, Y-axis orientation, per-frame association/alignment, value range beyond the UV [0,1] prev-minus-cur assumption, jitter inclusion.
+  Hypothesis guide for future eyes (symptoms if wrong, not diagnoses): wrong sign -> inverted-side ghosting. Wrong scale -> frozen smear or shimmer. Y-flip -> vertical-only ghosting. Stale frame -> lag trails with static camera perfect. Jitter mismatch -> drift/softness or crawl. No image-quality claim.
+**Known limitation: depth-staleness gate is the weakest REAL gate (described, NOT fixed).**
+  Fact: ShadowEvalAtPresent REAL-input validation (src/d3d12_hooks.cpp:7177-7178) gates MV age >10 and depth age >20000 on g_frameCounter (camera-frame units). There is NO MV-depth co-freshness or same-frame association check.
+  Inference: fresh MV + minutes-stale depth can pass REAL as why=real. History persists across F9 toggles (no feature reset on toggle), so a poisoned history also persists by design.
+  Hypothesis: tightening the depth window or adding co-freshness may reject half-void REALs, at the risk of rejecting valid inputs given camera-frame clock stall. Needs approval, not done here.
+
 ## REAL ENGAGED (2026-10-07, run 20261007T194541Z, p2256, 120s)
 
 **What happened:** with `realInputs=1` deployed (dist stayed 0), the
@@ -2278,13 +2299,13 @@ blindly copy this workaround to another installation without checking its files.
 **Reversal:** unchanged (INI flag; hunk revert as above). No source
  changed this turn.
 
-## TRUE DEPTH + 9000 REAL evals (2026-10-07, run 20261007T200358Z, p7012)
+## ENGINE DEPTH-FAMILY INPUT + 9000 REAL evals (2026-10-07, run 20261007T200358Z, p7012)
 
 **Depth identification hardening (source change, this turn):**
  `IsDepthFamilyFormat()` (SDK-verified numerics 39/40/41/44/45/46);
  copy-heuristic now adopts ONLY depth-family DSTs via guarded desc read
  (also fixes a pre-existing unguarded `GetDesc` on a weak pointer) and
- never overwrites SRV-sourced true depth (`g_depthSrvSourced`, cleared
+ never overwrites SRV-sourced depth (`g_depthSrvSourced`, cleared
  on both invalidation paths). MV ALT fallback widened to wrong-sized
  primaries (stable 1902x1033 primary vs live 1920x1080 ALTs observed).
  Run 200000Z proved the gate: fmt-34 velocity copy REJECTED,
@@ -2295,16 +2316,18 @@ blindly copy this workaround to another installation without checking its files.
  0 FAULTED.** REAL from the first eval: **ok #1 (present 842) → ok
  #9000 (present 9841), handoff 1 throughout**, normal exit. MV
  `FF7AACB9D0` fmt-34 1920x1080 ALT (placed + RTV-created, provenance
- logged); depth `FF6D983C90` **fmt-45 D24_UNORM_S8_UINT 1920x1080,
- SRV-adopted true depth** (engine barrier 192→2048=COPY_SOURCE + engine
+ logged); depth `FF6D983C90` **fmt-45 depth-family 1920x1080
+ (D24_UNORM_S8_UINT resource format; value convention UNKNOWN),
+ SRV-adopted engine depth** (engine barrier 192→2048=COPY_SOURCE + engine
  copy FROM it at present 186 — alive and in engine use). NGX consumed
- the D24S8 resource directly 9000x with zero faults: **no depth
+ the resource directly 9000x with zero faults: **no depth
  conversion shader is needed.** mvScale 1920x1080 (UV hypothesis),
  jitter 0/0, HDR flags. Deployed INI restored to `realInputs=0`.
 **Status vs success criteria:** (1) init+feature ✓; (2) real MV +
- TRUE depth ✓ (role-correct; same-frame association strong-supported:
+ engine depth-family input ✓ (engine-owned depth-format resource with
+ live engine traffic; same-frame association strong-supported:
  stable pointers + engine use + age gates, frame clock frozen so strict
- proof limited); (3) handoff into presented frames ✓ (9000);
+ proof limited, value convention UNKNOWN); (3) handoff into presented frames ✓ (9000);
  (4) moving-scene IQ benefit ⏳ NEEDS EYES — bot pixel comparison is
  drift-invalid (proven); (5) drop-in packaging ⏳ later. Zero-fault
  cluster (194541Z) did NOT recur (195249Z zeros clean); baseline
@@ -2350,6 +2373,25 @@ blindly copy this workaround to another installation without checking its files.
  default): PASS_DLSS_EVAL, ok #7800 (present 8641, handoff 1),
  0 FAILED/FAULTED, breaker silent, self-adopt guard firing (loop
  blocked, fallbacks correct).
+
+## Evidence-gap instrumentation verified (2026-10-08, run 20261008T141752Z, p14512)
+
+**Shipped (three single-file agent builds, integrated + verified):**
+ per-eval NGX parameter echo (`src/dlss_ngx.cpp`: jitter/mvScale/
+ render/display/reset/sharpness/create-flags, first-10 + every-600);
+ per-input source-class tags on both selection lines
+ (`src/d3d12_hooks.cpp`: `mvClass/depthClass` ENGINE_*/PLACEHOLDER from
+ pointer identity + `depthFmt`/`srvSrc`, append-only); harness reports
+ max ok counter + REAL/ZERO breakdown (`scripts/autonomous_test.py`,
+ thresholds untouched). Reversal: revert the three hunks; rebuild; rerun.
+**Run 141752Z (90s, zeros default): PASS_DLSS_EVAL, 21 sampled oks,**
+ 0 FAILED/FAULTED. New evidence live: `DLSS: eval params
+ jitter=0.00/0.00 mvScale=1.0x1.0 render=1920x1080 display=1920x1080
+ reset=1→0 sharp=0.00 flags=0x45` (0x45 = IsHDR|MVJittered|AutoExposure
+ as created); `mvClass=PLACEHOLDER depthClass=PLACEHOLDER depthFmt=41`;
+ harness `shadow_eval_max_ok=6600` (vs 21 sampled lines — undercount
+ fixed), 0 REAL / 22 ZERO lines, `why=[off]`, last=ZERO. No quality
+ claim; next is a REAL-mode run with class tags + human A/B.
 
 ## User F9 session forensics + self-adoption fix (2026-10-07/08, runs 204943Z/211024Z/220445Z)
 

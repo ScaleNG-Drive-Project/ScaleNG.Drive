@@ -7191,6 +7191,17 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             }
         }
     }
+    // Source-class evidence (logging only): pointer identity of the SELECTED
+    // inputs against the owned zero placeholders (g_shMv/g_shDepth). Fallback
+    // and toggle-off both leave inMv/inDepth on the placeholders, so classes
+    // read PLACEHOLDER/PLACEHOLDER with the fallback reason by construction.
+    const char* shMvClass = (inMv == g_shMv) ? "PLACEHOLDER" : "ENGINE_MV";
+    const char* shDepthClass = (inDepth == g_shDepth) ? "PLACEHOLDER" : "ENGINE_DEPTH";
+    int shDepthSrvSrc = g_depthSrvSourced ? 1 : 0;
+    unsigned shDepthFmt = 0;
+    D3D12_RESOURCE_DESC shDepthDesc = {};
+    if (inDepth && SafeGetDesc(inDepth, &shDepthDesc))
+        shDepthFmt = (unsigned)shDepthDesc.Format;
     {
         // Bounded source diagnostics: transitions always; periodic identity
         // below with the ok counter. Never per-frame. Prints the CANDIDATE
@@ -7210,13 +7221,13 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             ID3D12Resource* depP = depCand ? depCand : inDepth;
             bool mOk = mvP && SafeGetDesc(mvP, &mvd2);
             bool dOk = depP && SafeGetDesc(depP, &depd2);
-            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f",
+            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s",
                 useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
                 mOk ? (unsigned)mvd2.Format : 0, mOk ? (unsigned)mvd2.Width : 0, mOk ? (unsigned)mvd2.Height : 0,
                 (mvP == g_mvResourceAlt) ? " ALT" : "",
                 (void*)depP,
                 dOk ? (unsigned)depd2.Format : 0, dOk ? (unsigned)depd2.Width : 0, dOk ? (unsigned)depd2.Height : 0,
-                mvScaleX, mvScaleY);
+                mvScaleX, mvScaleY, shMvClass, shDepthClass);
         }
     }
 
@@ -7295,11 +7306,12 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         LONG n = InterlockedIncrement(&s_shOk);
         if (n <= 10 || (n % 600) == 0) {
             Log("hooks: shadow-eval ok #%ld (present %llu handoff %d)", n, presentSerial, handoffNow ? 1 : 0);
-            Log("hooks: shadow-eval inputs %s why=%s mv=%p depth=%p mvScale=%.0fx%.0f frame=%u mvAge=%u depthAge=%u",
+            Log("hooks: shadow-eval inputs %s why=%s mv=%p depth=%p mvScale=%.0fx%.0f frame=%u mvAge=%u depthAge=%u mvClass=%s depthClass=%s depthFmt=%u srvSrc=%d",
                 useReal ? "REAL" : "ZERO", realWhy, (void*)inMv, (void*)inDepth,
                 mvScaleX, mvScaleY, g_frameCounter,
                 g_mvValid ? (g_frameCounter - g_mvStamp) : 9999,
-                g_depthValid ? (g_frameCounter - g_depthStamp) : 9999);
+                g_depthValid ? (g_frameCounter - g_depthStamp) : 9999,
+                shMvClass, shDepthClass, shDepthFmt, shDepthSrvSrc);
         }
         if (was >= 30)
             Log("hooks: shadow-eval recovered after %ld-fault streak (ok #%ld)", was, n);

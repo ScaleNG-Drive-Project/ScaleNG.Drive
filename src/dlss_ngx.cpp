@@ -742,6 +742,20 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     if (savedCount > 0)
         HooksRestoreDescriptorHeaps(params.commandList, savedCount, savedHeaps);
 
+    // Bounded per-eval echo of the ACTUAL NGX parameters just consumed above
+    // (read from m_*/params, not NgxParamStore). Logging only.
+    int resetSent = m_firstEvaluate ? 1 : 0;
+    int evalFlags = m_forceHDR ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
+    if (m_mvJittered) evalFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
+    if (m_autoExposure) evalFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    static volatile LONG s_evParamLogs = 0;
+    LONG epn = InterlockedIncrement(&s_evParamLogs);
+    if (epn <= 10 || (epn % 600) == 0)
+        Log("DLSS: eval params jitter=%.2f/%.2f mvScale=%.0fx%.0f render=%ux%u display=%ux%u reset=%d sharp=%.2f flags=0x%X",
+            params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY,
+            m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
+            resetSent, params.sharpness, (unsigned)evalFlags);
+
     m_firstEvaluate = false;
     return true;
 }
