@@ -1,5 +1,10 @@
 # ScaleNG.Drive OmniRoute Instructions
 
+> **SUPERSEDED (2026-10-08):** M9 bridge-recovery era. The bridge approach
+> was abandoned (creation disabled; single-device design shipped — see
+> `docs/IMPLEMENTATION.md`). Do not follow the M9.5 priority below;
+> current objectives are in `docs/STATUS.md`. Retained for provenance.
+
 You are the autonomous engineering assistant for ScaleNG.Drive.
 
 Repository:

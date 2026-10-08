@@ -20,9 +20,15 @@ technical reference map; it is not the current-status ledger.
 - Build the supported UAL plugin with `src\build_asi.bat`. `src\build.bat`
   builds the experimental DXGI proxy; it is not the ASI build command.
 - Preserve the safe render path. Eval failure, feature failure, and the
-  fault breaker all present the engine's original frame; never claim more
-  than the logs prove (see STATUS.md for what `handoff 1`, `why=real`,
-  and ok counters do and do not establish).
+  fault breaker (live but UNFIRED — 30-reset / 120-halt paths
+  unexercised live) all present the engine's original frame, except the
+  192627Z CreateFeature crash; never claim more than the logs prove
+  (see STATUS.md for what `handoff 1`, `why=real`, and ok `#N`
+  counters do and do not establish — `ok` lines are sampled, totals
+  come from the counters).
+- F9 is double-owned: the inert legacy HUD path logs `hud: overlay`
+  only (no pixels), while the shadow path logs input switches. The
+  authoritative line is `shadow-eval inputs … (F9)`.
 - The repeatable automated test verifies live render/Present, plugin init,
   and (with `--require-dlss`) NGX evaluation — see scripts/README for what
   the outcome tokens mean. Image quality requires a controlled comparison.
@@ -42,6 +48,11 @@ README. For actionable setup and current verification limits, use
 [INSTALL.md](INSTALL.md) instead.
 
 ## History and supporting records
+
+Post-DLSS initialization (current): [STATUS.md](STATUS.md) +
+[IMPLEMENTATION.md](IMPLEMENTATION.md). Pre-DLSS initialization
+phases and rejected experiments live under
+[archive/](archive/README.md) — provenance, not guidance.
 
 - [PROJECT_LOG.md](../PROJECT_LOG.md): dated project log; current summary at its
   beginning, historical entries below.

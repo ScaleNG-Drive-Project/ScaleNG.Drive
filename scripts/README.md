@@ -39,15 +39,20 @@ Do not start another BeamNG instance during a run. Each run creates
 `logs/test_runs/<UTC timestamp>/result.json` with its checks, outcome, and
 deployment backup location; build output and fresh plugin logs are kept beside
 it. The current deployed `ScaleNG.ini` is preserved if present; if absent, the
-runner installs the build's default config.
+runner installs the build's default config. The runner does NOT sync
+INI — a stale deployed INI silently wins. Compare `dist\ScaleNG.ini`
+with the deployed file by hand after changing defaults (see
+[docs/INSTALL.md](../docs/INSTALL.md)).
 
 Outcomes include `PASS`, `PASS_DLSS_EVAL`, `INCONCLUSIVE_DLSS`,
 `GAME_CRASHED_AFTER_PLUGIN_INIT`, and `FAIL`. (`PASS_DLSS_INJECTION` is
-accepted for old logs but no longer emitted.) A plain `PASS` verifies
+a dead token — accepted when scanning old logs but no longer emitted.)
+A plain `PASS` verifies
 D3D12 render / Present activity and ScaleNG hooks, not DLSS image
 quality — it is awarded even with zero DLSS evidence unless
 `--require-dlss` is passed (which requires eval markers, including
-`shadow-eval ok`, and yields `INCONCLUSIVE_DLSS` without them).
+`shadow-eval ok`, and yields `INCONCLUSIVE_DLSS` without them;
+`INCONCLUSIVE_DLSS` is only emitted with `--require-dlss`).
 `PASS_DLSS_EVAL` counts `shadow-eval ok` markers for zeros AND real
 inputs alike — check the `why=real` / `why=<reason>` input lines and the
 per-eval `handoff` bit, not just the token. Eval `ok` lines are sampled

@@ -53,6 +53,9 @@ The file is read once at load; **INI changes require a game restart**.
 
 `[bridge]` keys (`helper`, `replaceOutput`, `deferredOutput`, `queueCopy`)
 are parsed but ineffectual while bridge creation is disabled.
+UNRESOLVED inconsistency: `dist\ScaleNG.ini` ships
+`deferredOutput=1` vs the code default `0` — neither takes effect
+while bridge creation is disabled, but do not rely on either value.
 Deployment warning: the test runner deploys ASI/helper but does **not**
 sync `ScaleNG.ini` — a stale deployed INI silently wins. Compare
 `dist\ScaleNG.ini` with the deployed file by hand after changing defaults.
@@ -66,9 +69,10 @@ sync `ScaleNG.ini` — a stale deployed INI silently wins. Compare
 | F7 | HDR ↔ LDR color mode (recreates the feature) |
 | F10 | Legacy DLAA/HUD toggle path (no eval effect in current config) |
 
-Note: F9 is also read by the inert legacy HUD path (`hud: overlay` log
-only; no pixels in current config). If both logs appear on one press, the
-`shadow-eval inputs … (F9)` line is the authoritative one.
+Note: F9 is double-owned — also read by the inert legacy HUD path
+(`hud: overlay` log only; no pixels in current config). If both logs
+appear on one press, the `shadow-eval inputs … (F9)` line is the
+authoritative one.
 
 ## Disable / uninstall / rollback
 

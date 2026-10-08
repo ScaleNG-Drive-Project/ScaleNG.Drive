@@ -68,32 +68,42 @@ never true).
 Validation rejects to zeros with a logged reason (`no-mv`,
 `mv-retired`, `mv-format`, `self-input`, `mv-size`, `no-depth`,
 `depth-retired`, `depth-fmt`, `depth-size`, `mv-stale` (>10 frames),
-`depth-stale`, `untracked-state`). Our own textures can never be adopted
-as engine inputs (`IsOwnResource` + `StoreTracked` bool + metadata
-early-outs; `self-adopt rejected` proves it live).
+`depth-stale`, `untracked-state`). Our own textures are blocked from
+adoption as engine inputs in all observed cases (`IsOwnResource` +
+`StoreTracked` bool + metadata early-outs; `self-adopt rejected`
+observed live — guard live, not a proof of impossibility).
 
 ## Safety fallbacks
 
-- **Fault circuit breaker:** 30 consecutive eval faults → feature reset
+- **Fault circuit breaker (live but UNFIRED — reset/halt paths
+  unexercised live):** 30 consecutive eval faults → feature reset
   (fresh NGX history, logged); 120 → halt evals for the session so the
   game presents unmodified frames (logged once). Fault logging is
   bounded (first 10 + every 600). `DestroyFeature` is SEH-guarded with
   null-before-release (no dangling handle).
 - Failures never corrupt the frame: eval failure, feature failure, and
-  halt all present the engine's original backbuffer.
+  halt all present the engine's original backbuffer (except the
+  192627Z CreateFeature crash, which crashed before any frame
+  fallback could present).
 
 ## Proven vs open (see STATUS.md for run IDs)
 
 - Proven: NGX init → feature → thousands of consecutive eval+handoff
-  frames (up to ok #9000) on zeros, on engine MV + engine velocity, and
-  on engine MV + engine depth-family input; F8 visibly gates handoff;
-  F9 switches input sets (7/7 logged); fallbacks and breaker paths.
+  frames (ok `#N` counters; `ok` lines sampled — up to #9000) on
+  zeros, on engine MV + engine velocity-as-depth, and on engine MV +
+  engine depth-family input (fmt-45 family; depth value convention
+  UNKNOWN); F8 visibly gates handoff; F9 switches input sets
+  (7/7 logged in user run 20261007T204943Z) with fail-closed
+  fallback to zeros; breaker paths are live but unfired.
 - Open / unknown: same-frame color/MV/depth association (frame clock
   frozen); MV sign/axis/scale and depth value conventions; any
   image-quality improvement (screenshot pixel-diff is invalid while the
   camera moves — null control differs 87–96% with no toggle); baseline
-  crash-freedom (CreateFeature AV and two fault storms observed, causes
-  undetermined). INI `scale` (sub-native rendering) and camera jitter
+  crash-freedom UNKNOWN (CreateFeature AV 192627Z and two fault
+  storms observed — 1904-fault cluster 194541Z and 7390-storm
+  200904Z starting 1 ms after an F9 press with F9/focus involvement
+  UNRESOLVED both directions, storm continuing after toggling back —
+  causes undetermined). INI `scale` (sub-native rendering) and camera jitter
   injection are not active, so REAL currently differs from fallback only
   by MV/depth content at native resolution with frozen jitter.
 
@@ -103,4 +113,6 @@ Legacy engine-list injection (`DoInjection`), viewport render-scale
 patch, bridge/b2 cross-device flow, HUD overlay drawing, synthetic
 smoke test, deferred output. `dlaa=1` currently yields no eval path
 (silent no-op). `[bridge]` INI keys are parsed but ineffectual while
-bridge creation is disabled.
+bridge creation is disabled. UNRESOLVED inconsistency: `dist\`
+ships `deferredOutput=1` vs code default `0`. `enabled=0` is dead
+(forced on after load).

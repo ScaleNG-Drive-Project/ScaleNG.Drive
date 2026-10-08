@@ -10,21 +10,25 @@
  backbuffer as color plus either owned zero MV/depth (default fallback)
  or validated engine MV/depth (`realInputs=1`/F9, fail-closed to zeros),
  then hands the output into the presented frame (F8, default on). Best
- streaks: ok #9000 with engine MV + engine depth-family input
- (20261007T200358Z), #7200 with engine MV + engine velocity-as-depth
- (20261007T194541Z), #7800 zeros ×2 runs. F9 switches input sets 7/7
- logged with zero faults; F8 visibly gates the handoff. Fault logging is
- bounded; a 30/120 consecutive-fault breaker resets the feature, then
- halts to unmodified presenting. Our own textures can never be adopted
- as engine inputs (guard + metadata early-outs, proven live).
+ streaks (ok `#N` counters; `ok` lines are sampled): `#9000` with
+ engine MV + engine depth-family input (20261007T200358Z; depth value
+ convention UNKNOWN), `#7200` with engine MV + engine
+ velocity-as-depth (20261007T194541Z), `#7800` zeros refs. F9
+ switches input sets 7/7 logged with zero faults in user run
+ 204943Z (genuine MV + SELF zero depth, null visual); F8 visibly
+ gates the handoff. Fault logging is bounded; the 30/120
+ consecutive-fault breaker is live but UNFIRED (reset/halt paths
+ unexercised live). Our own textures are blocked from adoption as
+ engine inputs in all observed cases (guard + metadata early-outs).
 **Unknowns / not proven.** Same-frame color/MV/depth association;
  MV sign/axis/scale and depth value conventions; any image-quality
  improvement; baseline crash-freedom.
-**Known crashes/faults.** One `CreateFeature` AV crash (192627Z); two
- self-sustaining `EvaluateFeature` fault storms with identical logged
- inputs (194541Z zeros-era recovered; 200904Z permanent) — mechanisms
- undetermined. All failures present the original frame; no device loss
- observed.
+**Known crashes/faults.** One `CreateFeature` AV crash (192627Z);
+ 1904-fault cluster 194541Z; 7390-storm 200904Z starting 1 ms after
+ an F9 press (F9/focus involvement UNRESOLVED both directions —
+ storm continued after toggling back) — mechanisms undetermined.
+ All failures present the original frame except the 192627Z crash;
+ no device loss observed.
 **Blockers.** (1) Controlled moving-scene visual comparison needs eyes
  (bot pixel-diff invalid while moving; human A–G protocol designed,
  awaiting driver). (2) INI `scale` and camera-jitter injection inactive,
@@ -34,12 +38,17 @@
  semantics measurement → jittered/sub-native rendering → P1–P3 cleanup
  (dead code, config/docs sync, INI deploy sync) → packaging.
 **Key runs.** 200358Z REAL#9000 PASS_DLSS_EVAL · 194541Z REAL#7200 FAIL
- (1904 pre-handoff faults) · 204943Z user F9 7×REAL + null visual ·
- 200904Z fault storm 7390 · 192627Z CreateFeature crash ·
- 204943Z/120239Z/224756Z/201932Z/195249Z clean zeros references.
+ (1904 faults, clustered pre-recovery — distribution uncounted) ·
+ 204943Z user F9 7×REAL + null visual ·
+ 200904Z fault storm 7390 (F9-adjacent, unresolved) · 192627Z
+ CreateFeature crash · 224756Z/201932Z/195249Z clean zeros
+ references (120239Z is zeros-based but contains 8 F9 toggles —
+ not pure-zeros).
  Completion criteria: live REAL eval (done) + controlled moving-scene
  visual benefit without regressions (open) + drop-in package with safe
  fallback (open). Details below are the chronological lab record.
+Phase history: [Pre-DLSS initialization](archive/pre-dlss-initialization/README.md)
+ · [Post-DLSS initialization](archive/post-dlss-initialization/README.md).
 
 ## Latest DLSS investigation
 

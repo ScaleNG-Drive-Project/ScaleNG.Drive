@@ -7,6 +7,14 @@ For current facts and next steps, read [STATUS.md](../STATUS.md). For currently
 supported operations, read [the test guide](../../scripts/README.md) and
 [install guide](../INSTALL.md).
 
+## Phase archives (Post-DLSS initialization reorganization)
+
+- [Pre-DLSS initialization](pre-dlss-initialization/README.md) — everything
+  before the first verified NGX init + feature (run 20261007T165257Z):
+  phase index + init-failure elimination ledger.
+- [Post-DLSS initialization](post-dlss-initialization/README.md) — eval,
+  real-input, handoff, and fault records since the boundary run.
+
 | Document | Historical purpose | Reading caveat |
 |---|---|---|
 | [Architecture rewrite plan](ARCHITECTURE_REWRITE_PLAN.md) | Proposed architecture phases and source mapping | DXGI/ReShade approach is not validated for deployment; ASI render/Present test is the confirmed live path. |

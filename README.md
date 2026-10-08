@@ -5,17 +5,35 @@ UAL-loaded ASI plugin. The plugin hooks the game's D3D12 calls, evaluates
 NVIDIA DLSS on presented frames, and hands the result back into the
 presented backbuffer.
 
-## Current state (2026-10-08)
+## Current state (2026-10-08) — Post-DLSS initialization era
 
-- **Working:** NGX init → native-size DLSS feature → thousands of
-  consecutive evaluated + presented frames (up to ok #9000), on zero
-  placeholders, on engine MV + engine velocity, and on engine MV +
-  engine depth-family inputs. F8 visibly gates the handoff; F9 switches
-  input sets with fail-closed fallback to zeros.
+- **Boundary:** run `20261007T165257Z` is the first verified NGX
+  `Init_Ext` + feature + evals (loader commit `5e2b6c2`).
+  Pre-DLSS initialization history lives in
+  [docs/archive/](docs/archive/README.md); everything below is
+  Post-DLSS initialization.
+- **Working:** DLAA-native shadow eval (render == display ==
+  backbuffer) → thousands of consecutive evaluated + presented
+  frames (ok `#N` counters; `ok` lines are sampled). Best streaks:
+  REAL `#9000` with engine MV + engine depth-family fmt-45 input
+  (20261007T200358Z; depth value convention UNKNOWN),
+  REAL `#7200` with engine MV + engine velocity-as-depth
+  (20261007T194541Z), zeros `#7800` refs. User run
+  20261007T204943Z: 7 F9 REAL engagements (genuine MV + SELF zero
+  depth) with null visual. F8 visibly gates the handoff (default
+  ON); F9 switches input sets with fail-closed fallback to owned
+  zero MV/depth placeholders. Jitter 0/0, mvScale 1.0 on zeros /
+  W×H on real, HDR default with F7 LDR toggle, sharpness
+  SDK-unsupported. 30/120 fault breaker is live but UNFIRED;
+  self-adopt guard blocked in all observed cases.
 - **Not proven:** image-quality improvement (no controlled comparison
   yet), same-frame input association, MV/depth value semantics,
-  baseline crash-freedom (one CreateFeature crash + two fault storms on
-  record, causes undetermined).
+  baseline crash-freedom (UNKNOWN — one CreateFeature crash
+  192627Z + 1904-fault cluster 194541Z + 7390-storm 200904Z
+  starting 1 ms after an F9 press, F9 involvement UNRESOLVED both
+  directions). Failures present the original frame except the
+  192627Z crash. Run 120239Z contains 8 F9 toggles — not a
+  pure-zeros reference.
 - **Defaults are the safe fallback:** zero MV/depth inputs, handoff on,
   real inputs off. See [docs/INSTALL.md](docs/INSTALL.md) (config table)
   and [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) (what the build does).
