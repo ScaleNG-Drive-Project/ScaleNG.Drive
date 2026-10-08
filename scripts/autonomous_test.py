@@ -416,8 +416,8 @@ def main() -> int:
             check("real_inputs_observed", shadow_input_real_lines > 0,
                   f"{shadow_input_real_lines} REAL input lines (expect >0 after F9 toggle)")
             check("no_reset_failures",
-                  len(shadow_failures) == 0 and len(shadow_eval_failures) == 0,
-                  f"{len(shadow_failures)} shadow reset failures, {len(shadow_eval_failures)} eval failures")
+                  len(shadow_failures) == 0 and len(eval_failures) == 0,
+                  f"{len(shadow_failures)} shadow reset failures, {len(eval_failures)} eval failures")
             check("no_breaker_lines",
                   not any("breaker" in line.lower() for line in target_lines),
                   "no breaker state lines in current PID log")
