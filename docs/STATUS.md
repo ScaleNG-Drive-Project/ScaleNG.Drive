@@ -2537,6 +2537,31 @@ blindly copy this workaround to another installation without checking its files.
 **Still gated:** controlled human A/B (Stage 5) — requested below. No
  image-quality claim from counts.
 
+## Passthrough disambiguation logging + storm pattern (2026-10-08, run 154129Z)
+
+**Change (source, this turn):** halted path now emits a bounded
+ heartbeat (`passthrough src=HALTED handoffSetting=%d`, first 3 + every
+ 600 presents) so breaker-passthrough is distinguishable from F8-OFF,
+ fence-skip silence, and silent eval-fail stretches; transition line
+ gains ages + entry states + present (`frame/mvAge/depthAge/mvStateB/
+ depthStateB/present`) so a future failing REAL attempt records its
+ entry states even when no ok ever succeeds. Logging only, no guards
+ touched. Files: `src/d3d12_hooks.cpp` (2 hunks). Reversal: revert both
+ hunks; rebuild; rerun.
+**Run 154129Z (60s, zeros default): PASS_DLSS_EVAL,** 17 oks,
+ 0 faults; new fields verified live (fallback states 0=COMMON as
+ expected, no transition attempted); halt heartbeat correctly absent.
+**Storm/input pattern across runs:** faults onset with zeros twice
+ (194541Z→recovered-REAL, 200904Z→permanent), with REAL once
+ (152749Z→permanent), never with REAL twice (200358Z, 145625Z clean
+ #9000s). No consistent input→fault mapping: onset is input-independent
+ as far as evidence goes; trigger mechanism UNKNOWN. The new logging
+ captures entry states + passthrough source for the next event.
+**A/B classification:** the user's visual observation remains
+ timestamp-uncorrelated (no manual session in artifacts; only in-bot
+ F9, key source unlogged) → INCONCLUSIVE, not evidence for or against
+ REAL quality.
+
 ## Breaker fires live for the first time (2026-10-08, run 20261008T152749Z, p13760)
 
 **Run 152749Z (60s, zeros default): FAIL** (10 fatal markers) —

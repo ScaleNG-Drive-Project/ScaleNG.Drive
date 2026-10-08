@@ -6855,7 +6855,18 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     static volatile LONG s_shOk = 0, s_shFail = 0;
     static volatile LONG s_shConsecFail = 0;
     static volatile LONG s_shHalted = 0;
-    if (InterlockedCompareExchange(&s_shHalted, 0, 0)) return;
+    if (InterlockedCompareExchange(&s_shHalted, 0, 0)) {
+        // Bounded heartbeat: halt is otherwise fully silent, making
+        // breaker-passthrough indistinguishable from F8-OFF, fence-skip,
+        // or silent eval-fail stretches. Logs the CURRENT handoff setting
+        // so the passthrough cause is explicit. POD-only (__try below).
+        static volatile LONG s_shHaltLogs = 0;
+        LONG hn = InterlockedIncrement(&s_shHaltLogs);
+        if (hn <= 3 || (presentSerial % 600) == 0)
+            Log("hooks: shadow-eval passthrough src=HALTED handoffSetting=%d (present %llu)",
+                g_shadowHandoff ? 1 : 0, presentSerial);
+        return;
+    }
     // F8 edge-triggered handoff toggle for live A/B comparison.
     // F7 edge-triggered HDR/LDR mode toggle (recreates feature).
     // F9 edge-triggered real/zero MV+depth input toggle (logged).
@@ -7277,13 +7288,17 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             ID3D12Resource* depP = depCand ? depCand : inDepth;
             bool mOk = mvP && SafeGetDesc(mvP, &mvd2);
             bool dOk = depP && SafeGetDesc(depP, &depd2);
-            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s",
+            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s frame=%u mvAge=%u depthAge=%u mvStateB=%u depthStateB=%u present=%llu",
                 useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
                 mOk ? (unsigned)mvd2.Format : 0, mOk ? (unsigned)mvd2.Width : 0, mOk ? (unsigned)mvd2.Height : 0,
                 (mvP == g_mvResourceAlt) ? " ALT" : "",
                 (void*)depP,
                 dOk ? (unsigned)depd2.Format : 0, dOk ? (unsigned)depd2.Width : 0, dOk ? (unsigned)depd2.Height : 0,
-                mvScaleX, mvScaleY, shMvClass, shDepthClass);
+                mvScaleX, mvScaleY, shMvClass, shDepthClass,
+                g_frameCounter,
+                g_mvValid ? (g_frameCounter - g_mvStamp) : 9999,
+                g_depthValid ? (g_frameCounter - g_depthStamp) : 9999,
+                (unsigned)mvBefore, (unsigned)depthBefore, presentSerial);
         }
     }
 
