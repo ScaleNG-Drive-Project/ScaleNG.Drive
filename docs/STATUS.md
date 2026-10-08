@@ -2537,6 +2537,23 @@ blindly copy this workaround to another installation without checking its files.
 **Still gated:** controlled human A/B (Stage 5) — requested below. No
  image-quality claim from counts.
 
+## Breaker fires live for the first time (2026-10-08, run 20261008T152749Z, p13760)
+
+**Run 152749Z (60s, zeros default): FAIL** (10 fatal markers) —
+ game survived, normal exit. Sequence: zeros oks #1–10 + #600
+ (handoff 1) through present 1441 → every eval faults from present
+ 1556 → `30 consecutive faults - feature reset` (present 1585) →
+ faults continue → `HALTED after 120 consecutive faults` (present
+ 1675) → unmodified presenting to run end (present 6725).
+**Evidence:** the breaker works as designed (graceful halt, no crash,
+ no device loss, game exits normally). The feature reset did NOT
+ recover this storm — reset-ineffective, which weakens the
+ poisoned-history hypothesis for this event (a fresh feature + history
+ faulted identically). Mechanism still unknown; identical-input
+ appearance preserved (zeros throughout). No source change: behavior
+ matches design; the finding is about NGX/driver state, not our logic.
+ Reversal: n/a (no code change; STATUS-only record).
+
 ## Prioritized cleanup proposal (from 4-auditor health review; NOT implemented)
 
 P1 — small correctness hygiene (each independently verifiable, no
