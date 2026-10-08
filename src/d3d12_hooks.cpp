@@ -6855,6 +6855,9 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     static volatile LONG s_shOk = 0, s_shFail = 0;
     static volatile LONG s_shConsecFail = 0;
     static volatile LONG s_shHalted = 0;
+    // Reset-fail streak for the heartbeat below (declared up-front: both
+    // the reset-fail early return and the ok path below touch it).
+    static volatile LONG s_shResetStreak = 0;
     if (InterlockedCompareExchange(&s_shHalted, 0, 0)) {
         // Bounded heartbeat: halt is otherwise fully silent, making
         // breaker-passthrough indistinguishable from F8-OFF, fence-skip,
@@ -7167,9 +7170,14 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     HRESULT shListHr = FAILED(shAllocHr) ? E_FAIL : g_shList[slot]->Reset(g_shAlloc[slot], nullptr);
     if (FAILED(shAllocHr) || FAILED(shListHr)) {
         static volatile LONG s_shResetFails = 0;
-        if (InterlockedIncrement(&s_shResetFails) <= 5)
-            Log("hooks: shadow-eval allocator/list reset failed (alloc=0x%08X list=0x%08X completed=%llu expected=%llu)",
-                (unsigned)shAllocHr, (unsigned)shListHr,
+        // Streak heartbeat: reset-death is otherwise silent after 5 logs
+        // while presents continue, indistinguishable from healthy idle.
+        // Cleared on any successful submit below. No halt attached: the
+        // path is already dead; halting would only freeze the user's F-keys.
+        LONG rc = InterlockedIncrement(&s_shResetStreak);
+        if (InterlockedIncrement(&s_shResetFails) <= 5 || (rc % 600) == 0)
+            Log("hooks: shadow-eval allocator/list reset failed (src=RESET-DEAD streak=%ld alloc=0x%08X list=0x%08X completed=%llu expected=%llu)",
+                rc, (unsigned)shAllocHr, (unsigned)shListHr,
                 shCompleted, (unsigned long long)g_shFenceDone[slot]);
         bb->Release();
         return;
@@ -7312,6 +7320,15 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     ep.mvScaleX = mvScaleX; ep.mvScaleY = mvScaleY;
     ep.sharpness = g_cfg.sharpness;
     bool ok = g_upscaler->Evaluate(ep);
+    // All post-eval driver calls (restore, handoff record, Close, submit)
+    // run under ONE guard: a faulted NGX record poisons recorder state and
+    // any of these calls can AV — previously only the submit tail was
+    // guarded, so an AV during restore/handoff recording unwound past
+    // discard, abandoning the list open and wedging the allocator forever
+    // (run 154828Z: fault → outer-guard AV → permanent reset E_FAIL).
+    // Healthy paths byte-identical. POD locals only (C2712).
+    bool submitted = false;
+    __try {
     if (useReal) {
         // Restore engine resources to entry states in the same list.
         Barrier(list, inMv, mvBefore);
@@ -7370,9 +7387,8 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     // reset-failure after a single CreateFeature AV. On failure the GPU
     // never saw this list, so discarding + resetting is state-neutral;
     // CPU-side tracked states are restored to entry values to match.
-    // POD locals only (__try present in this frame; C2712).
-    bool submitted = false;
-    __try {
+    // Submit runs under the single outer guard above (record + submit
+    // share one __except; a separate inner guard would double-handle).
         HRESULT chr = list->Close();
         if (SUCCEEDED(chr)) {
             ID3D12CommandList* lists[1] = { list };
@@ -7389,7 +7405,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static volatile LONG s_shSubmitFaults = 0;
         if (InterlockedIncrement(&s_shSubmitFaults) <= 5)
-            Log("hooks: shadow-eval submit faulted (code 0x%08X present %llu)", (unsigned)GetExceptionCode(), presentSerial);
+            Log("hooks: shadow-eval record/submit faulted (code 0x%08X present %llu)", (unsigned)GetExceptionCode(), presentSerial);
     }
     if (!submitted) {
         if (useReal) NoteTrackedStates(inMv, mvBefore, inDepth, depthBefore);
@@ -7408,6 +7424,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
 
     if (ok) {
         LONG was = InterlockedExchange(&s_shConsecFail, 0);
+        InterlockedExchange(&s_shResetStreak, 0);
         LONG n = InterlockedIncrement(&s_shOk);
         if (n <= 10 || (n % 600) == 0) {
             Log("hooks: shadow-eval ok #%ld (present %llu handoff %d)", n, presentSerial, handoffNow ? 1 : 0);

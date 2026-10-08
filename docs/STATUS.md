@@ -2562,6 +2562,34 @@ blindly copy this workaround to another installation without checking its files.
  F9, key source unlogged) → INCONCLUSIVE, not evidence for or against
  REAL quality.
 
+## Unified post-eval guard + F9 findings (2026-10-08, runs 164301Z/164503Z)
+
+**Fix (source, this turn):** all post-eval driver calls (engine-state
+ restore, handoff record, Close, submit) now run under ONE `__try`
+ (previously only the submit tail was guarded, so an AV during
+ restore/handoff recording unwound past discard and wedged the
+ allocator permanently — the 154828Z signature). Healthy paths
+ byte-identical (same calls, same order). Plus reset-fail streak
+ heartbeat (`src=RESET-DEAD`, first 5 + every 600th, auto-cleared on
+ ok) so persistent reset-death is explicit instead of silent; no halt
+ attached (path already dead; halting would only freeze F-keys).
+ Reversal: revert the two hunks; rebuild; rerun.
+**F9 finding:** six identical toggle lines REQUIRE six rising edges —
+ debounce proof (contiguous poll/store, dual-Present shared static,
+ low-bit consumption). The "single press → six lines" theory is
+ refuted; the presses were separate inputs (0.5s double-tap included).
+ No key-handling fix. Legacy HUD F9 unreachable at dlaa=0 (no callers).
+**F8 finding:** F8 gates only the eval-output copy; with evals dead
+ (reset-fail) there is nothing to hand off, so F8 is visibly inert —
+ this fully explains "F8 no longer changed the image" without breaker
+ involvement (breaker correctly never fired: it counts eval results).
+**Runs:** 164301Z fallback smoke PASS (11 oks, 0 faults) after two
+ OpenBLAS harness failures (env thread-alloc under memory pressure;
+ workaround `OPENBLAS_NUM_THREADS=1`/`OMP_NUM_THREADS=1` recorded in
+ test protocol). 164503Z (temp INI=1) PASS, 14 oks, 0 faults — but
+ `mv-format` ×15, never left fallback: clean fail-closed run, NOT a
+ REAL result. INI restored to 0 both times, verified.
+
 ## Allocator death with healthy fence (2026-10-08, run 20261008T154828Z, p4440)
 
 **Run 154828Z (60s, zeros default): FAIL** (2 fatal markers) — game
