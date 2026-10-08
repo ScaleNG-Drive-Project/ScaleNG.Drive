@@ -2562,6 +2562,34 @@ blindly copy this workaround to another installation without checking its files.
  F9, key source unlogged) → INCONCLUSIVE, not evidence for or against
  REAL quality.
 
+## Allocator death with healthy fence (2026-10-08, run 20261008T154828Z, p4440)
+
+**Run 154828Z (60s, zeros default): FAIL** (2 fatal markers) — game
+ survived, normal exit. Healthy zeros oks to #1200 (present 2041), then
+ 2 adjacent `EvaluateFeature` faults (~present 2050) followed from
+ :977 by `allocator/list reset failed (alloc=0x80004005 list=0x80004005`
+ with `completed=1318 >= expected` — fence healthy, GPU queue alive
+ (presents continued to 6365). No Close-failed/submit/discard lines:
+ the faulted evals submitted normally; death struck at the NEXT
+ Resets. No further oks (#1800 never logged); breaker never involved
+ (it counts eval failures, and no eval was attempted after).
+**Findings:** (1) New fence diagnostics rule OUT queue-stall for this
+ event (completed advanced) — the failure is allocator-object-local
+ despite a live queue; leading hypothesis NGX-fault fallout on our
+ allocator objects, mechanism UNPROVEN. (2) Breaker coverage gap:
+ reset-fail death bypasses the breaker entirely (no reset/halt attempt,
+ silent after budgets). (3) The user pressed F9 six times during this
+ bot run (ON :945/:658/:699, OFF :684/:201/:591 — vs "twice" reported
+ earlier for 142937Z); no REAL transition resulted, and post-:014
+ silence cannot distinguish continued reset-fails from validation
+ rejects. User keypresses during bot runs are now a recurring confound:
+ correlate by log, never by assumption.
+**Not changed:** breaker design (counts eval failures by design);
+ no source change this turn. Next: decide whether reset-fail streaks
+ should feed the breaker (design decision with false-positive risk on
+ transient upload-fence races), and keep F9-press awareness in test
+ protocol.
+
 ## Breaker fires live for the first time (2026-10-08, run 20261008T152749Z, p13760)
 
 **Run 152749Z (60s, zeros default): FAIL** (10 fatal markers) —
