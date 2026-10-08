@@ -9051,6 +9051,46 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                         g_depthLastTouchPresent = SceneSetNow();
                     if (res == g_mvResource || res == g_mvResourceAlt)
                         g_mvLastTouchPresent = SceneSetNow();
+                    else if (g_shadowRealInputs) {
+                        // Broader MV touch: engines using implicit COMMON-state
+                        // transitions never call ResourceBarrier on the MV texture,
+                        // so the pointer-match check above never fires. Catch any
+                        // display-sized R16G16F resource transition as a touch.
+                        D3D12_RESOURCE_DESC brd = {};
+                        if (res && SafeGetDesc(res, &brd) &&
+                            brd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                            (unsigned)brd.Width == g_displayW && brd.Height == g_displayH &&
+                            !IsOwnResource(res)) {
+                            if (brd.Format == DXGI_FORMAT_R16G16_FLOAT) {
+                                if (res != g_mvResource && res != g_mvResourceAlt) {
+                                    StoreTracked(&g_mvResourceAlt, res);
+                                    g_mvStamp = g_frameCounter;
+                                    if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
+                                    g_mvW = (unsigned int)brd.Width; g_mvH = (unsigned int)brd.Height;
+                                    static int s_broadMvLog = 0;
+                                    if (s_broadMvLog++ < 4)
+                                        Log("hooks: MV broad-adopt on barrier %p (%ux%u)",
+                                            (void*)res, (unsigned)brd.Width, (unsigned)brd.Height);
+                                }
+                                g_mvLastTouchPresent = SceneSetNow();
+                                g_mvStamp = g_frameCounter;
+                            }
+                            if (IsDepthFamilyFormat((unsigned)brd.Format)) {
+                                if (res != g_depthResource) {
+                                    StoreTracked(&g_depthResource, res);
+                                    g_depthStamp = g_frameCounter;
+                                    g_depthValid = true;
+                                    g_depthRealFmt = brd.Format;
+                                    static int s_broadDepLog = 0;
+                                    if (s_broadDepLog++ < 4)
+                                        Log("hooks: depth broad-adopt on barrier %p (%ux%u fmt=%u)",
+                                            (void*)res, (unsigned)brd.Width, (unsigned)brd.Height, (unsigned)brd.Format);
+                                }
+                                g_depthLastTouchPresent = SceneSetNow();
+                                g_depthStamp = g_frameCounter;
+                            }
+                        }
+                    }
                 }
             }
         }
