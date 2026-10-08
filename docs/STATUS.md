@@ -2513,6 +2513,30 @@ blindly copy this workaround to another installation without checking its files.
  stability-gating can find usable depth; no blind reruns. No
  image-quality claim; Stage-5 A/B stays gated on proven REAL.
 
+## REAL#9000 with full provenance (2026-10-08, run 20261008T145625Z, p5028)
+
+**Run 145625Z (120s, temp INI realInputs=1, restored to 0 after):**
+ PASS_DLSS_EVAL, `why=real` ×26, ok #1 (present 842) → ok #9000
+ (present 9841) handoff 1 throughout, 0 FAILED/FAULTED/breaker/discard.
+ `mvClass=ENGINE_MV depthClass=ENGINE_DEPTH`, fmt-34 ALT MV +
+ fmt-45 D24 depth, `srvSrc=1`, mvScale 1920x1080. NGX echo confirms
+ REAL params (`mvScale=1920.0x1080.0`, flags 0x45, reset 0 after first).
+ Entry barrier states logged: `mvStateB=4` (RENDER_TARGET → legal PSR
+ transition), `depthStateB=192` (already PSR|NON_PS → correct no-op);
+ both restored post-eval. Rotation census: 5 depth changes, ALL within
+ the first 1.2s of loading (frame 0), then stable all run — depth
+ stabilizes after load; no stability gate needed on this trajectory.
+**Acceptance (same standard as 200358Z):** color = current backbuffer
+ (present-serial continuity); MV + depth genuine engine resources
+ (pointer-stable, format/size/state verified, engine traffic class);
+ NGX success + presented handoff. Same-frame association:
+ strong-supported (stable pointers, engine use, present continuity),
+ strict proof still limited (camera clock near-frozen: frame=2,
+ mvAge=2, depthAge=0). Depth convention + MV sign/axis still unknown.
+ Second independent REAL#9000 (with first: 200358Z).
+**Still gated:** controlled human A/B (Stage 5) — requested below. No
+ image-quality claim from counts.
+
 ## Prioritized cleanup proposal (from 4-auditor health review; NOT implemented)
 
 P1 — small correctness hygiene (each independently verifiable, no

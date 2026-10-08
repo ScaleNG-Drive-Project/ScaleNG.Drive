@@ -467,6 +467,20 @@ bool StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
         g_lastDiscoveryChangeFrame = g_frameCounter;
     } else if (depSlot) {
         g_lastDiscoveryChangeFrame = g_frameCounter;
+        // Rotation census (bounded, logging only): how fast does the depth
+        // slot churn? Decides whether stability-gating can find usable
+        // depth (MV proved stable; depth proved transient). Null clears
+        // excluded; same-pointer swaps early-return above.
+        if (res) {
+            static ID3D12Resource* s_lastDepth = nullptr;
+            if (res != s_lastDepth) {
+                s_lastDepth = res;
+                static volatile LONG s_depthChanges = 0;
+                LONG dc = InterlockedIncrement(&s_depthChanges);
+                if (dc <= 5 || (dc % 20) == 0)
+                    Log("hooks: depth slot rotation #%ld -> %p (frame %u)", dc, (void*)res, g_frameCounter);
+            }
+        }
     }
     // STRICTLY WEAK: never hold refs on engine-owned resources. BeamNG's
     // lifecycle is refcount-exact - any extra ref (at observation OR at
