@@ -37,15 +37,32 @@ USER32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
 
 def send_hotkey(vk_key: int) -> None:
-    """Simulate a key press+release via keybd_event (system-wide async key
-    state). The plugin uses GetAsyncKeyState which reads this state.
-    A longer hold (0.3s) ensures the ~120Hz Present hook detects the edge.
+    """Simulate a key press+release using SendInput (modern replacement for
+    keybd_event). The plugin uses GetAsyncKeyState which reads the system
+    async key state updated by SendInput, so no window focus is needed.
     """
     if USER32 is None:
         return
-    USER32.keybd_event(vk_key, 0, 0, 0)       # key down (0 = no flags)
-    time.sleep(0.3)
-    USER32.keybd_event(vk_key, 0, 2, 0)       # key up (2 = KEYEVENTF_KEYUP)
+    # Proper INPUT_KEYBOARD union via ctypes
+    class KEYBOARDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+    class _INPUT(ctypes.Union):
+        _fields_ = [("ki", KEYBOARDINPUT)]
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("ki", KEYBOARDINPUT)]
+    items = []
+    # key down
+    items.append(INPUT(type=1, ki=KEYBOARDINPUT(wVk=vk_key, wScan=0, dwFlags=0, time=0, dwExtraInfo=None)))
+    # key up
+    items.append(INPUT(type=1, ki=KEYBOARDINPUT(wVk=vk_key, wScan=0, dwFlags=0x0002, time=0, dwExtraInfo=None)))
+    arr = (INPUT * len(items))(*items)
+    USER32.SendInput(len(items), arr, ctypes.sizeof(INPUT))
 
 
 def dismiss_known_library_warning(process_id: int) -> bool:

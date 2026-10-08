@@ -9200,6 +9200,18 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                     }
                 }
             }
+            // Touch tracking for SAME-RESOURCE re-bind: the engine may bind the
+            // SAME MV RTV every frame without re-creating it (no new pointer to
+            // trip the adoption branch above). Without this, engines that rely
+            // on D3D12 implicit COMMON-state transitions (no explicit
+            // ResourceBarrier on the MV texture) never update
+            // g_mvLastTouchPresent, making the freshness check always fail.
+            if (g_boundRtvResource == g_mvResource || g_boundRtvResource == g_mvResourceAlt) {
+                g_mvLastTouchPresent = SceneSetNow();
+            }
+            if (g_boundRtvResource == g_depthResource) {
+                g_depthLastTouchPresent = SceneSetNow();
+            }
             // The engine re-creates its scene target from time to time but keeps
             // reusing the same CPU descriptor slot. Refresh the tracked scene
             // color to the CURRENT resource bound at that slot, otherwise we
