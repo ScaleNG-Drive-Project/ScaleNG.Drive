@@ -37,18 +37,15 @@ USER32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
 
 def send_hotkey(vk_key: int) -> None:
-    """Simulate a single key press+release via the global keyboard state.
-
-    The plugin uses GetAsyncKeyState, which reads the system-wide async state,
-    so no window focus manipulation is needed. F9/edge detection requires a
-    full down-then-up transition.
+    """Simulate a key press+release via keybd_event (system-wide async key
+    state). The plugin uses GetAsyncKeyState which reads this state.
+    A longer hold (0.3s) ensures the ~120Hz Present hook detects the edge.
     """
     if USER32 is None:
         return
-    # keybd_event(vk, scan, flags, extraInfo); 0 = key down, 2 = key up.
-    USER32.keybd_event(vk_key, 0, 0, 0)
-    time.sleep(0.05)
-    USER32.keybd_event(vk_key, 0, 2, 0)
+    USER32.keybd_event(vk_key, 0, 0, 0)       # key down (0 = no flags)
+    time.sleep(0.3)
+    USER32.keybd_event(vk_key, 0, 2, 0)       # key up (2 = KEYEVENTF_KEYUP)
 
 
 def dismiss_known_library_warning(process_id: int) -> bool:
