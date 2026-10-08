@@ -73,6 +73,18 @@ static bool g_depthSrvSourced = false;
 // requires fresh discoveries only.
 unsigned int g_depthStamp = 0;
 unsigned int g_mvStamp = 0;
+
+// Present-serial stamps: the last Present at which ANY observation (barrier,
+// OM-bind, SRV/RTV creation, copy) fired on each engine input resource.
+// g_frameCounter (camera clock) only advances when the engine patches
+// camera CBs — it freezes during steady state, making the frame-counter
+// age gate (10/20000 frames) certify week-old resources as "fresh".
+// g_presentSerial advances on every Present, so (presentSerial -
+// g_mvLastTouchPresent) proves the engine touched this input within a real,
+// observable frame interval. Zero = no observation since adoption (fail
+// closed on first eval).
+static unsigned long long g_mvLastTouchPresent = 0;
+static unsigned long long g_depthLastTouchPresent = 0;
 unsigned int g_evalFailStreak = 0;
 bool g_dlaaHalted = false;
 // Frame stamp of the last successful camera-CB patch: our "gameplay is
@@ -3321,6 +3333,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             StoreTracked(&g_mvResource, res);
                 g_mvValid = true;
                 g_mvStamp = g_frameCounter;
+                g_mvLastTouchPresent = SceneSetNow();
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 g_mvLastRtvKey = handle.ptr;
@@ -3330,6 +3343,8 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                     Log("hooks: motion vector RTV handle refreshed %p", (void*)res);
             } else if (res != g_mvResourceAlt) {
                 StoreTracked(&g_mvResourceAlt, res);
+                g_mvStamp = g_frameCounter;
+                g_mvLastTouchPresent = SceneSetNow();
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 Log("hooks: motion vector RTV %p (1920x1001 R16G16_FLOAT) (ALT)", (void*)res);
@@ -3389,6 +3404,7 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             g_depthValid = true;
             g_depthSrvSourced = true;
             g_depthStamp = g_frameCounter;
+            g_depthLastTouchPresent = SceneSetNow();
             g_depthRealFmt = rd.Format;
             g_depthMsaa = rd.SampleDesc.Count != 1;
             g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -6175,8 +6191,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                     mvStale ? fc2 - g_mvStamp : 0);
             doDlss = false;
             // Null the stale pointers so the null guard catches them next frame
-            if (depthStale) { g_depthResource = nullptr; g_depthValid = false; g_depthSrvSourced = false; }
-            if (mvStale) { g_mvResource = nullptr; g_mvValid = false; }
+            if (depthStale) { g_depthResource = nullptr; g_depthValid = false; g_depthSrvSourced = false; g_depthLastTouchPresent = 0; }
+            if (mvStale) { g_mvResource = nullptr; g_mvValid = false; g_mvLastTouchPresent = 0; }
         }
     }
     if (doDlss && g_dlssOut) {
@@ -6282,6 +6298,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                         else {
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
+                        g_mvLastTouchPresent = SceneSetNow();
                         if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
                         g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
@@ -6459,8 +6476,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             __except (EXCEPTION_EXECUTE_HANDLER) {
                 bridgeOk = false;
                 Log("hooks: bridge FAULTED at %s - invalidating all inputs", g_injStep);
-                StoreTracked(&g_depthResource, nullptr); g_depthValid = false; g_depthSrvSourced = false; g_depthStamp = 0;
-                StoreTracked(&g_mvResource, nullptr); g_mvValid = false; g_mvStamp = 0;
+                StoreTracked(&g_depthResource, nullptr); g_depthValid = false; g_depthSrvSourced = false; g_depthStamp = 0; g_depthLastTouchPresent = 0;
+                StoreTracked(&g_mvResource, nullptr); g_mvValid = false; g_mvStamp = 0; g_mvLastTouchPresent = 0;
                 // One-strike rule (P5 crash handling): an in-engine AV means the
                 // engine cmd list may be left inconsistent by the faulting call.
                 // Retrying next frame re-enters the same hazard; every observed
@@ -7179,6 +7196,43 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             Log("hooks: shadow-eval allocator/list reset failed (src=RESET-DEAD streak=%ld alloc=0x%08X list=0x%08X completed=%llu expected=%llu)",
                 rc, (unsigned)shAllocHr, (unsigned)shListHr,
                 shCompleted, (unsigned long long)g_shFenceDone[slot]);
+        // ONE-SHOT self-heal attempt (2026-10-08): persistent allocator/list
+        // death (e.g. 154828Z) left the path dead until process restart.
+        // Safe only when the GPU has actually drained our fence AND the
+        // device reports not-removed; otherwise stay dead (fail closed).
+        // Attempts are session-bounded; failure leaves the dead state.
+        if (s_shResetStreak >= 10 &&
+            shCompleted >= g_shFenceDone[slot] &&     // actual recorded value
+            (g_shUpFenceVal == 0 || shCompleted >= g_shUpFenceVal) &&
+            SUCCEEDED(g_device->GetDeviceRemovedReason())) {
+            static volatile LONG s_shRecreateLogs = 0;
+            if (InterlockedIncrement(&s_shRecreateLogs) <= 3) {
+                Log("hooks: shadow-eval recreate attempt (fence drained, device ok, streak=%ld)",
+                    (long)InterlockedCompareExchange(&s_shResetStreak, 0, 0));
+            }
+            __try {
+                if (g_shList[slot]) { g_shList[slot]->Close(); g_shList[slot]->Release(); g_shList[slot] = nullptr; }
+                if (g_shAlloc[slot]) { g_shAlloc[slot]->Release(); g_shAlloc[slot] = nullptr; }
+                if (g_shList[0]) { g_shList[0]->Close(); g_shList[0]->Release(); g_shList[0] = nullptr; }
+                if (g_shList[1]) { g_shList[1]->Close(); g_shList[1]->Release(); g_shList[1] = nullptr; }
+                if (g_shAlloc[0]) { g_shAlloc[0]->Release(); g_shAlloc[0] = nullptr; }
+                if (g_shAlloc[1]) { g_shAlloc[1]->Release(); g_shAlloc[1] = nullptr; }
+                if (g_shFence) { g_shFence->Release(); g_shFence = nullptr; }
+                g_shFenceNext = 0;          // avoid stale-fence gate forever-skipping
+                g_shFenceDone[0] = g_shFenceDone[1] = 0;
+                g_shUpFenceVal = 0;
+                // Re-enter the lazy infra builder (fence/alloc/lists/textures).
+                // bb is still alive here (released below) — the rebuild path
+                // runs only its creation logic; per-eval work resumes next
+                // present. If any creation step fails, s_shInit is re-armed by
+                // the builder and this slot stays dead (fail closed).
+                InterlockedExchange(&s_shInit, 0);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                static volatile LONG s_shRecreateFaults = 0;
+                if (InterlockedIncrement(&s_shRecreateFaults) <= 3)
+                    Log("hooks: shadow-eval recreate faulted (code 0x%08X)", (unsigned)GetExceptionCode());
+            }
+        }
         bb->Release();
         return;
     }
@@ -7251,6 +7305,18 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         else if (depd.Width != g_displayW || depd.Height != g_displayH) realWhy = "depth-size";
         else if (g_frameCounter < g_mvStamp || g_frameCounter - g_mvStamp > 10) realWhy = "mv-stale";
         else if (g_frameCounter < g_depthStamp || g_frameCounter - g_depthStamp > 20000) realWhy = "depth-stale";
+        // Same-frame proof: the camera clock above can freeze (g_frameCounter
+        // stops advancing when the engine stops patching camera CBs), making
+        // the 10/20000-frame gates certify week-old resources as "fresh".
+        // g_presentSerial advances on every Present, so the gap between
+        // the current present and the last barrier observed on each input
+        // proves the engine touched them within a real frame interval.
+        // Threshold 3 covers double/triple buffering. Zero = no barrier
+        // observed since adoption (fail closed — never certify unknown).
+        else if (g_mvLastTouchPresent == 0) realWhy = "mv-no-observation";
+        else if (presentSerial - g_mvLastTouchPresent > 3) realWhy = "mv-stale-present";
+        else if (g_depthLastTouchPresent == 0) realWhy = "depth-no-observation";
+        else if (presentSerial - g_depthLastTouchPresent > 3) realWhy = "depth-stale-present";
         else {
             // Tracked entry states must exist: without a known StateBefore
             // there is no legal transition (fail closed to zeros). The lookup
@@ -7296,8 +7362,7 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             ID3D12Resource* depP = depCand ? depCand : inDepth;
             bool mOk = mvP && SafeGetDesc(mvP, &mvd2);
             bool dOk = depP && SafeGetDesc(depP, &depd2);
-            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s frame=%u mvAge=%u depthAge=%u mvStateB=%u depthStateB=%u present=%llu",
-                useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
+            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s frame=%u mvAge=%u depthAge=%u mvStateB=%u depthStateB=%u present=%llu mvTouchAge=%llu depthTouchAge=%llu",                useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
                 mOk ? (unsigned)mvd2.Format : 0, mOk ? (unsigned)mvd2.Width : 0, mOk ? (unsigned)mvd2.Height : 0,
                 (mvP == g_mvResourceAlt) ? " ALT" : "",
                 (void*)depP,
@@ -7306,7 +7371,9 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
                 g_frameCounter,
                 g_mvValid ? (g_frameCounter - g_mvStamp) : 9999,
                 g_depthValid ? (g_frameCounter - g_depthStamp) : 9999,
-                (unsigned)mvBefore, (unsigned)depthBefore, presentSerial);
+                (unsigned)mvBefore, (unsigned)depthBefore, presentSerial,
+                g_mvLastTouchPresent ? (presentSerial - g_mvLastTouchPresent) : 9999,
+                g_depthLastTouchPresent ? (presentSerial - g_depthLastTouchPresent) : 9999);
         }
     }
 
@@ -8788,6 +8855,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 else {
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
+                g_depthLastTouchPresent = SceneSetNow();
                 {
                     g_depthRealFmt = ddg.Format;
                     g_depthMsaa = ddg.SampleDesc.Count != 1;
@@ -8957,10 +9025,17 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                     // uses them. Refresh stamps so the staleness gate (which
                     // protects against freed resources) only trips on real
                     // renderer transitions, not on normal steady-state play.
+                    // Frame-counter stamp (camera clock — may freeze).
                     if (res == g_depthResource)
                         g_depthStamp = g_frameCounter;
                     if (res == g_mvResource || res == g_mvResourceAlt)
                         g_mvStamp = g_frameCounter;
+                    // Present-serial stamp: the reliable same-frame signal.
+                    // Camera clock freezes; presentSerial always advances.
+                    if (res == g_depthResource)
+                        g_depthLastTouchPresent = SceneSetNow();
+                    if (res == g_mvResource || res == g_mvResourceAlt)
+                        g_mvLastTouchPresent = SceneSetNow();
                 }
             }
         }
@@ -9103,6 +9178,7 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                         else {
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
+                        g_mvLastTouchPresent = SceneSetNow();
                         if (first) g_mvFirstValidFrame = g_frameCounter;
                         g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         }
@@ -9141,6 +9217,8 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                 // dereferencing freed resources.
                 g_mvStamp = 0;
                 g_depthStamp = 0;
+                g_mvLastTouchPresent = 0;
+                g_depthLastTouchPresent = 0;
             }
         }
         if (g_sceneColorValid && SceneColorBound()) {

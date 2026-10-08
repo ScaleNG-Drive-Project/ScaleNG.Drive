@@ -2661,3 +2661,51 @@ P4 — deferred larger work (needs design/user): Present-concurrency
  (ApplyCameraCbJitter gate) and sub-native render scale for a REAL
  signal ZERO lacks; MV sign/scale/axis measurement; human A–G visual
  protocol (design ready, needs eyes); 20-min run (user dropped).
+
+## Present-serial touch tracking for MV/depth freshness (2026-10-08, untested)
+
+**Change (source-only, built OK, no run yet):** `src/d3d12_hooks.cpp` gains
+`g_mvLastTouchPresent` / `g_depthLastTouchPresent`: the last Present at
+which each engine input was observably touched by the engine. Writers:
+`TrackResourceBarriers` (any transition on the MV/depth resource, primary
+or ALT), `TrackOMBind` MV track-by-bind (per-frame RTV bind during
+gameplay), MV RTV creation + registry re-adopt, depth SRV creation +
+copy-dest adoption. All invalidation sites (stale purge, bridge fault,
+scene churn) zero them alongside the frame stamps. The REAL validation
+chain adds four fail-closed checks after the existing frame-age gates:
+`mv-no-observation` / `mv-stale-present` / `depth-no-observation` /
+`depth-stale-present`, threshold `presentSerial - lastTouch > 3`
+(double/triple-buffer slack). The inputs log line gains `mvTouchAge` /
+`depthTouchAge` (9999 = never observed).
+
+**Why:** Phase 1 audits (6/7 returned; harness/control pending) prove the
+camera clock `g_frameCounter` freezes in steady state, so the 10/20000-frame
+age gates certify arbitrarily old resources as fresh, and no per-present
+join key binds one eval's three inputs (skeptic Claims 1-2 FAIL). Present
+serial advances on every Present and is already on every inputs line, so
+touch age is the smallest falsifiable same-frame signal available without
+new interception.
+
+**Coverage basis (verified in 145625Z artifact):** only 12 game command
+lists exist session-wide, all shimmed (`covered=1`), so
+`TrackResourceBarriers` observes every barrier; barrier logging stops after
+present 200 purely by budget (`n<=80`), not by loss of observation.
+
+**Falsifiable expectation for the next REAL run:** sustained REAL requires
+`mvTouchAge<=3` AND `depthTouchAge<=3` on every inputs line. If either age
+is large, the engine is not observably touching that input per frame and
+the run correctly falls back to ZERO (`mv-stale-present` /
+`depth-stale-present`) — safe, and the ages name the missing observation.
+
+**Also in this commit:** one-shot shadow-allocator self-heal on persistent
+reset-death (streak>=10, fence drained, device not removed): releases the
+dead allocators/lists/fence, zeroes `g_shFenceNext`/`g_shFenceDone`/
+`g_shUpFenceVal`, re-arms `s_shInit` for lazy rebuild next present.
+Fail-closed on any doubt. Rationale: 154828Z death was permanent until
+process restart; every observation there is explained by audited code
+(guard AV leaves list open, discard Close fails, allocator Reset E_FAILs
+forever; breaker silent because `s_shConsecFail` counts only
+`Evaluate=false`, never guard AVs).
+
+**Not changed:** breaker design; frame-age gates (kept as-is);
+MV/depth value conventions (still UNKNOWN); no quality claim.
