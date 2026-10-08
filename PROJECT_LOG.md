@@ -1,14 +1,33 @@
-# ScaleNG.Drive - Complete Project Log
+# ScaleNG.Drive - Project Log (Historical Entries)
 ## Last Updated: 2026-10-02
+
+> **Current agenda and status:** [docs/STATUS.md](docs/STATUS.md) is the source
+> of truth. This file preserves dated development notes; many entries below
+> describe old test runners and experimental configurations. Config tables
+> and outcome tokens below predate current INI keys and `PASS_DLSS_EVAL` —
+> see [docs/INSTALL.md](docs/INSTALL.md) and [scripts/README.md](scripts/README.md).
+
+## Latest verified milestone — 2026-10-02
+
+Run `scripts\launch_test.bat --duration 30` after
+`scripts\setup_test_env.bat`. Report:
+`logs/test_runs/20261002T182709Z/result.json`. Build, deploy, TCom connection,
+smallgrid/vehicle readiness, plugin initialization, and live D3D12/Present
+activity passed. Present counter advanced 1→3605 across 35 snapshots; zero
+fatal markers. There were zero frame markers and zero DLSS injection markers.
+This verifies live rendering/Present, **not DLSS injection or image quality**.
+Use BeamNGpy 1.35.1 (TCom v1.26); see [test guide](scripts/README.md).
+
+The dated records below are chronological evidence, not a current checklist.
 
 ---
 
 ## Executive Summary
 
 **Project**: DLSS/DLAA upscaler for BeamNG.drive DX12 v0.39 as ASI plugin
-**Status**: Autonomous test PASSING (320s, 530 success markers, 0 failures)
+**Historical status (earlier runner)**: Autonomous test described as PASSING (320s, 530 success markers, 0 failures); this is not the latest test run.
 **Architecture**: ASI plugin via Ultimate ASI Loader (winmm.dll) + single-device NGX path
-**Blocker**: BeamNG v0.39 level loading via command line (`-level GridMap`) not working
+**Current DLSS status**: live render/Present passes; injection and visual quality remain unverified.
 
 ---
 
@@ -212,7 +231,7 @@ queueCopy=0
 
 ## ReShade Integration Lessons (Documented)
 
-**File**: `RESHADE_INTEGRATION_LESSONS.md`
+**File**: `docs/archive/RESHADE_INTEGRATION_LESSONS.md`
 
 | ReShade (Works) | ScaleNG (Blocked) |
 |----------------|------------------|

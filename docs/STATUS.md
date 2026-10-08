@@ -1,6 +1,45 @@
 # Current project status and agenda
 
-**Last verified: 2026-10-04.** This page is the current-status source of truth. Update it when a new test or implementation result changes the agenda. Older dated notes elsewhere are historical evidence, not current status.
+**Last verified: 2026-10-08.** This page is the current-status source of truth. Update it when a new test or implementation result changes the agenda. Older dated notes elsewhere are historical evidence, not current status.
+
+## Current state (2026-10-08) — read this first
+
+**Verified facts.** NGX initializes (`Init_Ext`) on the game device and
+ creates one native-size DLSS feature (render == display, HDR with live
+ LDR toggle). The per-Present shadow path evaluates it with the current
+ backbuffer as color plus either owned zero MV/depth (default fallback)
+ or validated engine MV/depth (`realInputs=1`/F9, fail-closed to zeros),
+ then hands the output into the presented frame (F8, default on). Best
+ streaks: ok #9000 with engine MV + engine depth-family input
+ (20261007T200358Z), #7200 with engine MV + engine velocity-as-depth
+ (20261007T194541Z), #7800 zeros ×2 runs. F9 switches input sets 7/7
+ logged with zero faults; F8 visibly gates the handoff. Fault logging is
+ bounded; a 30/120 consecutive-fault breaker resets the feature, then
+ halts to unmodified presenting. Our own textures can never be adopted
+ as engine inputs (guard + metadata early-outs, proven live).
+**Unknowns / not proven.** Same-frame color/MV/depth association;
+ MV sign/axis/scale and depth value conventions; any image-quality
+ improvement; baseline crash-freedom.
+**Known crashes/faults.** One `CreateFeature` AV crash (192627Z); two
+ self-sustaining `EvaluateFeature` fault storms with identical logged
+ inputs (194541Z zeros-era recovered; 200904Z permanent) — mechanisms
+ undetermined. All failures present the original frame; no device loss
+ observed.
+**Blockers.** (1) Controlled moving-scene visual comparison needs eyes
+ (bot pixel-diff invalid while moving; human A–G protocol designed,
+ awaiting driver). (2) INI `scale` and camera-jitter injection inactive,
+ so REAL differs from fallback only by MV/depth content. (3) `dlaa=1` is
+ a silent no-op; bridge flow inert.
+**Next (prioritized).** Human A–G drive test (F9/F8) → MV/depth
+ semantics measurement → jittered/sub-native rendering → P1–P3 cleanup
+ (dead code, config/docs sync, INI deploy sync) → packaging.
+**Key runs.** 200358Z REAL#9000 PASS_DLSS_EVAL · 194541Z REAL#7200 FAIL
+ (1904 pre-handoff faults) · 204943Z user F9 7×REAL + null visual ·
+ 200904Z fault storm 7390 · 192627Z CreateFeature crash ·
+ 204943Z/120239Z/224756Z/201932Z/195249Z clean zeros references.
+ Completion criteria: live REAL eval (done) + controlled moving-scene
+ visual benefit without regressions (open) + drop-in package with safe
+ fallback (open). Details below are the chronological lab record.
 
 ## Latest DLSS investigation
 

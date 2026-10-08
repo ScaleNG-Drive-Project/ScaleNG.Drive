@@ -1,4 +1,12 @@
-# ScaleNG.Drive - Complete Project Log
+# ScaleNG.Drive - Historical Agent Cache (not current status)
+
+> **For current status and agenda, see [STATUS.md](STATUS.md).** This cache
+> contains older experiment snapshots (including stale test summaries); treat
+> it as historical evidence, not operating guidance. Follow [scripts/README.md](../scripts/README.md)
+> and [INSTALL.md](INSTALL.md) for current procedures. Config tables and
+> outcome tokens below predate the current INI keys (`realInputs`,
+> `shadowHandoff`, `abWindow`, `ngxApiVersion`) and the `PASS_DLSS_EVAL`
+> token — see INSTALL.md and scripts/README.md for current values.
 ## Last Updated: 2026-10-02
 
 ---

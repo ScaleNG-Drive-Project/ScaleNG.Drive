@@ -1,6 +1,12 @@
-# ScaleNG.Drive — Architectural Rewrite Plan (DRAFT — Awaiting Approval)
+# ScaleNG.Drive — Architectural Rewrite Plan (Historical Draft)
 
-> **Status:** Design document — no code changes yet. Awaiting user approval before implementation.
+> **Historical proposal, not current operating guidance.** The live game test
+> documented in `AUTONOMOUS_WORKFLOW.md` and `scripts/README.md` uses the UAL
+> ASI path. In the tested installation, the competing DXGI proxy conflicted
+> with that path and was reversibly disabled for the verified run. This draft's
+> proposed DXGI architecture is not validated.
+
+> **Historical status:** proposal text below reflects the draft's original approval gate; it is not the current project status.
 > **Date:** 2026-10-02 (Updated with ReShade Integration Lessons)
 > **Build baseline:** `src/d3d12_hooks.cpp:2784` `TryVectorB` `EA07D026…` `C316…` `F0EA…` `DBA6…` `B216…` `7E44…` `9CE2…` `E6A7…` `C316…` `F585…` `EA07…` `F585A749…` `C:\games\BeamNG.drive\Bin64\plugins\ScaleNG.asi:EA07D0266B020C1253630C053F84672E554F7165E79D5B0AD6BFB0528B42A6E1` `dist==deployed` `02:41:40` `src\build.bat:56` VC2026
 > **Principle:** Replace the fragile D3D12 integration layer, preserve the 9 days of BeamNG reverse-engineering knowledge, make `ID3D12Resource*` authoritative, observe actual `OMSetRenderTargets` binding, separate generic D3D12 hooking from BeamNG classification, get to one safe visible test.
@@ -197,7 +203,7 @@ Enhanced with `[RESHADE]` prefix for DXGI events.
 
 ## 16. Codebase Migration Strategy
 
-**M0** Architecture + ReShade mapping (this doc + `RESHADE_INTEGRATION_LESSONS.md`)
+**M0** Architecture + ReShade mapping (this doc + `RESHADE_INTEGRATION_LESSONS.md` in this archive)
 
 **M1** Generic DXGI/D3D12 hook manager (`src/dxgi_hooks.cpp`, `src/events.cpp`)
 

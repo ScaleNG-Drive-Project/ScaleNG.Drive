@@ -1,5 +1,10 @@
 # ScaleNG.Drive - Tool Requirements
 
+> Current operator priority: see [docs/STATUS.md](docs/STATUS.md), then use
+> [scripts/README.md](scripts/README.md) for the tested BeamNG environment.
+> This file inventories tools; its historical optional-tool and installation
+> notes are not required steps for the automated test.
+
 ## Build Tools
 
 ### Required (Must Have)
@@ -16,7 +21,7 @@
 
 | Tool | Version | Purpose | Install Command |
 |------|---------|---------|-----------------|
-| **BeamNGpy** | 1.36+ | Python API for BeamNG automation | `pip install beamngpy` |
+| **BeamNGpy (test venv)** | 1.35.1 | BeamNG 0.39.3 TCom v1.26 automation; install through `scripts\setup_test_env.bat` |
 | **AutoHotkey v2** | 2.0+ | Macro automation for level loading | `winget install AutoHotkey.AutoHotkey` |
 | **Pulover's Macro Creator** | 5.0.5+ | Visual macro recorder/player | [Download](https://www.macrocreator.com/) |
 | **7-Zip** | 23.x | Archive extraction for level inspection | `winget install 7zip.7zip` |
@@ -55,6 +60,12 @@
 | File | Location | Source |
 |------|----------|--------|
 | `ReShade64.dll` → `dxgi.dll` | `Bin64/dxgi.dll` | [ReShade 6.x](https://reshade.me/) |
+
+> Note (2026-10-08): installing any proxy as `Bin64\dxgi.dll` conflicts
+> with UAL ASI loading — on the test installation the pre-existing proxy
+> is reversibly disabled (see [docs/INSTALL.md](docs/INSTALL.md)). Do not
+> combine ReShade-as-dxgi with ASI testing unless coexistence is the
+> subject of the test.
 
 ---
 
@@ -127,11 +138,17 @@ copy dist\nvngx_dlss.dll "C:\games\BeamNG.drive\Bin64\nvngx_dlss.dll"
 
 ### Autonomous Test
 ```bash
-python scripts/autonomous_test.py
+scripts\setup_test_env.bat
+scripts\launch_test.bat --duration 30
 ```
-- 320 second test duration
-- Monitors `ScaleNG.log` for success/failure markers
-- Requires `psutil` for process management: `pip install psutil`
+- Uses isolated `.venv-test`; do not use global BeamNGpy 1.36 (TCom v1.27).
+- Builds, deploys with backups, starts a fresh BeamNG process, loads smallgrid
+  and a vehicle, and verifies plugin initialization plus live D3D12 Present activity.
+- Output: `logs/test_runs/<UTC timestamp>/result.json` and diagnostic logs.
+- PASS proves the game rendered/presented frames and hooks initialized. It does
+  not prove DLSS injection or image quality. Use `--require-dlss` to require an
+  injection marker; absent marker is inconclusive, not a pass for DLSS.
+- Options and outcomes: `scripts/README.md`.
 
 ### Debug Logging
 - **ScaleNG.log**: `C:\games\BeamNG.drive\Bin64\plugins\ScaleNG.log`
@@ -155,8 +172,9 @@ winget install Python.Python.3.12
 winget install 7zip.7zip
 winget install AutoHotkey.AutoHotkey
 
-# Python packages
-pip install beamngpy psutil
+# Python test environment (run from the repository root instead of installing
+# an arbitrary/global BeamNGpy version)
+scripts\setup_test_env.bat
 
 # Manual installs needed:
 # 1. Visual Studio 2022 Community (with Desktop C++ workload)
@@ -179,7 +197,8 @@ pip install beamngpy psutil
 | NVIDIA DLSS SDK | 3.7.0+ | 2026-10 |
 | ReShade | 6.3.0+ | 2026-10 |
 | Ultimate ASI Loader | 9.7.4 | 2026-10 |
-| BeamNGpy | 1.36 | 2026-10 |
+| BeamNGpy test environment | 1.35.1 (TCom v1.26) | 2026-10 |
+| BeamNGpy global (incompatible with tested game) | 1.36 (TCom v1.27) | 2026-10 |
 
 ---
 
@@ -192,8 +211,10 @@ pip install beamngpy psutil
 | `nvngx_dlss.dll` not found | Download NVIDIA DLSS SDK, copy validated `nvngx_dlss.dll` to `dist/` |
 | `winmm.dll` not loading | Ensure Ultimate ASI Loader `winmm.dll` is in `Bin64/` |
 | `dxgi.dll` not loading | Windows loads system `dxgi.dll` from System32; proxy approach needs different strategy |
-| Level not loading | BeamNG v0.39 doesn't support `-level` CLI arg; use Lua script or BeamNGpy |
-| `beamngpy` connection fails | Game doesn't expose TCP port; use `-tcom -tport` args |
+| Test reports BeamNGpy protocol mismatch | Run `scripts\setup_test_env.bat`; it pins BeamNGpy 1.35.1 for TCom v1.26 |
+| Test level not loading | Use the level name `smallgrid` (default), not `gridmap.mis` |
+| Test game crashes at startup | Do not pass `-windowed`; check the run's `game.stdout.txt` and BeamNG log |
+| No DLSS injection marker | Render/Present may still pass; inspect result as `INCONCLUSIVE_DLSS`, not DLSS success |
 
 ---
 
@@ -231,15 +252,18 @@ ScaleNG.Drive/
 │   ├── dxgi.ini               # Proxy config
 │   └── dxgi_proxy.def         # Export def
 ├── scripts/
-│   ├── autonomous_test.py     # 320s test runner
-│   ├── launch_test.bat        # Batch test launcher
+│   ├── autonomous_test.py     # Build/deploy/live BeamNG integration runner
+│   ├── launch_test.bat        # Batch test launcher (isolated venv)
+│   ├── setup_test_env.bat     # Pinned BeamNGpy test environment setup
+│   ├── requirements-test.txt  # Test runtime dependencies
+│   └── README.md              # Runner usage, checks, and limits
 │   └── BeamNG_LevelLoader.pmc # Macro template
 ├── docs/
-│   ├── CACHE.md               # Fast lookup cache
-│   ├── DLSS_INTEGRATION_PLAN.md
-│   ├── ARCHITECTURE_REWRITE_PLAN.md
-│   ├── RESHADE_INTEGRATION_LESSONS.md
-│   └── PROJECT_LOG.md
+│   ├── STATUS.md              # Current verified status and agenda
+│   ├── INSTALL.md             # Supported ASI install and verification limits
+│   ├── README.md              # Documentation hub
+│   ├── CACHE.md               # Historical agent experiment ledger
+│   └── archive/               # Superseded plans and investigations
 └── research/
     └── dlss_sdk_370/
         └── nvngx_dlss.dll     # Validated DLSS snippet

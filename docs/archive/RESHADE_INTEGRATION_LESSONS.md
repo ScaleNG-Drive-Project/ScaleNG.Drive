@@ -1,7 +1,13 @@
-# ReShade Integration Lessons for ScaleNG.Drive
+# ReShade Integration Lessons for ScaleNG.Drive — Historical Investigation
+
+> The DXGI proxy/ReShade comparison below is an architectural hypothesis, not
+> validated deployment guidance. The verified live-game workflow uses the
+> UAL-loaded ASI; the existing DXGI proxy was reversibly disabled during that
+> test because of a conflict. See `AUTONOMOUS_WORKFLOW.md` before changing the
+> game's DLL setup.
 
 > **Date:** 2026-10-02
-> **Status:** Analysis complete - ready for porting phase
+> **Historical status:** proposal-era analysis; porting was not validated by the current ASI render test.
 
 ---
 

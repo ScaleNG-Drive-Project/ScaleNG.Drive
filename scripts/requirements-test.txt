@@ -1,0 +1,7 @@
+msgpack
+numpy
+Pillow
+Jinja2
+scipy
+matplotlib
+seaborn

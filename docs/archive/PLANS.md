@@ -1,4 +1,6 @@
-# ScaleNG.Drive — PLANS.md
+# ScaleNG.Drive — Historical Experiment Log
+
+> This is a dated experiment log, not the current agenda. Its state snapshot is from 2026-08-22. See `../STATUS.md` for present status and next steps.
 
 > Living document. Every attempted approach gets an entry: what it was, why it
 > seemed like a good idea, and exactly why it didn't work (or worked partially).

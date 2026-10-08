@@ -1,4 +1,6 @@
-# ScaleNG.Drive — genuine DLSS/DLAA integration plan
+# ScaleNG.Drive — Historical DLSS/DLAA Integration Proposal
+
+> The statements below are proposal-era claims and are not current verified facts. Current evidence: the ASI render/Present test passes, but no DLSS injection marker or visual-quality comparison has been verified. See `../STATUS.md`.
 
 Updated 2026-10-02 (Updated with ReShade Integration Lessons)
 
