@@ -1022,6 +1022,12 @@ static unsigned g_displayRTVHistoryNext = 0;
 
 std::map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_resourceStates;
 
+// SRV CPU handle → resource map (parallels g_rtvMap for RTVs).
+// Populated by Hook_CreateShaderResourceView and propagated by
+// Hook_CopyDescriptors*/CopyDescriptorsSimple so that descriptors copied
+// into shader-visible heaps can still be resolved back to resources.
+std::map<SIZE_T, ID3D12Resource*> g_srvMap;
+
 UINT g_setHeapCount = 0;
 ID3D12DescriptorHeap* g_setHeaps[2] = { nullptr, nullptr };
 // Heap-state snapshot lock: engine threads WRITE this state on every
@@ -1049,6 +1055,12 @@ typedef void (STDMETHODCALLTYPE* PFN_ResourceUnmap)(ID3D12Resource*, UINT, const
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreatePlacedResource)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateReservedResource)(ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+// ID3D12Device slots 16/17 (SDK 10.0.28000.0): CopyDescriptors / CopyDescriptorsSimple.
+// These copy CPU-visible descriptors into shader-visible heaps — the handles
+// used by OMSetRenderTargets / SetGraphicsRootDescriptorTable that are
+// NOT in g_rtvMap/g_srvMap unless we track the copy here.
+typedef void (STDMETHODCALLTYPE* PFN_CopyDescriptors)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
+typedef void (STDMETHODCALLTYPE* PFN_CopyDescriptorsSimple)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
 // Device4 '1'-variant creation signatures (SDK-verified slots 53/54/55; see
 // slot audit - an earlier read misreported 56/57/58 from unfiltered header
 // text with non-Windows preprocessor branches included).
@@ -1065,6 +1077,8 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_CreatePlacedResource1)(ID3D12Device*, ID
 
 PFN_CreateRenderTargetView Real_CreateRenderTargetView = nullptr;
 PFN_CreateShaderResourceView Real_CreateShaderResourceView = nullptr;
+PFN_CopyDescriptors Real_CopyDescriptors = nullptr;
+PFN_CopyDescriptorsSimple Real_CopyDescriptorsSimple = nullptr;
 PFN_CreateCommandQueue Real_CreateCommandQueue = nullptr;
 PFN_CreateCommandList Real_CreateCommandList = nullptr;
 PFN_ExecuteCommandLists Real_ExecuteCommandLists = nullptr;
@@ -3412,6 +3426,37 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             Log("hooks: depth candidate SRV %p", (void*)res);
             }
         }
+        // MV SRV discovery: when the engine creates an SRV on a display-sized
+        // R16G16_FLOAT texture, it is sampling the MV texture for temporal
+        // reprojection — a present-serial touch signal. The existing pointer-
+        // match writers (barrier/OM-bind) miss this for engines using implicit
+        // COMMON-state transitions, so this SRV-creation path is the reliable
+        // per-frame touch source.
+        // NOTE: NOT gated by g_shadowRealInputs — the engine may create SRVs
+        // before REAL mode is toggled on (config init timing is racy at
+        // startup). Unconditional storage is safe: it only adds handle→resource
+        // entries; the MV-specific touch stamp only fires on R16G16F match.
+        if (res &&
+            rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
+            rd.Format == DXGI_FORMAT_R16G16_FLOAT &&
+            (unsigned)rd.Width == g_displayW && rd.Height == g_displayH &&
+            !IsOwnResource(res)) {
+            if (res != g_mvResource && res != g_mvResourceAlt) {
+                StoreTracked(&g_mvResourceAlt, res);
+                g_mvStamp = g_frameCounter;
+                if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
+                g_mvW = (unsigned int)rd.Width; g_mvH = (unsigned int)rd.Height;
+                static int s_mvSrvLog = 0;
+                if (s_mvSrvLog++ < 4)
+                    Log("hooks: MV candidate SRV %p (%ux%u)", (void*)res, (unsigned)rd.Width, (unsigned)rd.Height);
+            }
+            g_mvLastTouchPresent = SceneSetNow();
+            g_mvStamp = g_frameCounter;
+            g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        }
+        // Store handle→resource mapping for ALL 2D SRVs so CopyDescriptors
+        // propagation can later resolve copied handles in shader-visible heaps.
+        { BookGuard _bg2; g_srvMap[handle.ptr] = res; }
     }
     if (Real_CreateShaderResourceView)
         Real_CreateShaderResourceView(device, res, desc, handle);
@@ -3420,6 +3465,145 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
 void TryDeferredInject(ID3D12CommandQueue* injQueue);
 void InjectAtPresentImpl(ID3D12CommandQueue* injQueue);
 void TryQueueOutputCopy(ID3D12CommandQueue* queue);
+
+// --------------------------------------------------------------------------
+// CopyDescriptors / CopyDescriptorsSimple hooks
+//
+// The engine renders MV by RTV and samples it via SRV. In D3D12, RTV/SRV
+// handles are typically created in a CPU-visible heap and then copied to a
+// shader-visible heap via CopyDescriptorsSimple before being bound via
+// OMSetRenderTargets or SetGraphicsRootDescriptorTable. The copy destination
+// handles are NOT in g_rtvMap/g_srvMap unless we propagate them here.
+//
+// Without this hook, TrackOMBind's g_rtvMap.find(copiedHandle) returns null,
+// g_boundRtvResource stays nullptr, and the same-resource OM-bind touch never
+// fires. This is the root cause of mvTouchAge never updating after initial
+// MV RTV creation.
+// --------------------------------------------------------------------------
+void Hook_CopyDescriptorsSimple(ID3D12Device* device, UINT numDescriptors,
+                                D3D12_CPU_DESCRIPTOR_HANDLE destStart,
+                                D3D12_CPU_DESCRIPTOR_HANDLE srcStart,
+                                D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeaps)
+{
+    if (Real_CopyDescriptorsSimple) Real_CopyDescriptorsSimple(device, numDescriptors,
+        destStart, srcStart, DescriptorHeaps);
+
+    if (numDescriptors == 0 || !device || device != g_device) return;
+
+    // Only track RTV and CBV_SRV_UAV (SRV/UAV) heap copies — these are the
+    // descriptor types used for render targets and shader resources.
+    if (DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_RTV &&
+        DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return;
+
+    // Resolve increment size to walk the descriptor range.
+    UINT incrementSize = device->GetDescriptorHandleIncrementSize(DescriptorHeaps);
+    if (incrementSize == 0) return;
+
+    const unsigned long long now = SceneSetNow();
+
+    if (DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_RTV) {
+        BookGuard _bg;
+        for (UINT i = 0; i < numDescriptors; ++i) {
+            SIZE_T srcPtr = srcStart.ptr + (SIZE_T)i * incrementSize;
+            SIZE_T destPtr = destStart.ptr + (SIZE_T)i * incrementSize;
+            auto it = g_rtvMap.find(srcPtr);
+            if (it != g_rtvMap.end()) {
+                ID3D12Resource* res = it->second;
+                g_rtvMap[destPtr] = res;
+                // Touch MV if the copied resource IS the tracked MV resource
+                if (res == g_mvResource || res == g_mvResourceAlt) {
+                    g_mvLastTouchPresent = now;
+                    g_mvStamp = g_frameCounter;
+                }
+            }
+        }
+    } else {
+        // CBV_SRV_UAV heap
+        BookGuard _bg;
+        for (UINT i = 0; i < numDescriptors; ++i) {
+            SIZE_T srcPtr = srcStart.ptr + (SIZE_T)i * incrementSize;
+            SIZE_T destPtr = destStart.ptr + (SIZE_T)i * incrementSize;
+            auto it = g_srvMap.find(srcPtr);
+            if (it != g_srvMap.end()) {
+                ID3D12Resource* res = it->second;
+                g_srvMap[destPtr] = res;
+                // Touch MV if the copied SRV resource IS the tracked MV resource
+                if (res == g_mvResource || res == g_mvResourceAlt) {
+                    g_mvLastTouchPresent = now;
+                    g_mvStamp = g_frameCounter;
+                    static int s_mvSrvCopyLog = 0;
+                    if (s_mvSrvCopyLog++ < 4)
+                        Log("hooks: MV SRV copied to shader-visible heap %p", (void*)res);
+                }
+            }
+        }
+    }
+}
+
+void Hook_CopyDescriptors(ID3D12Device* device,
+                          UINT numDestDescriptorRanges,
+                          const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts,
+                          const UINT* pDestDescriptorCounts,
+                          UINT numSrcDescriptorRanges,
+                          const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts,
+                          const UINT* pSrcDescriptorCounts,
+                          D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeaps)
+{
+    if (Real_CopyDescriptors) Real_CopyDescriptors(device, numDestDescriptorRanges,
+        pDestDescriptorRangeStarts, pDestDescriptorCounts,
+        numSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorCounts,
+        DescriptorHeaps);
+
+    if (!pDestDescriptorRangeStarts || !pSrcDescriptorRangeStarts ||
+        !pDestDescriptorCounts || !pSrcDescriptorCounts || !device || device != g_device) return;
+
+    if (DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_RTV &&
+        DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return;
+
+    UINT incrementSize = device->GetDescriptorHandleIncrementSize(DescriptorHeaps);
+    if (incrementSize == 0) return;
+
+    const unsigned long long now = SceneSetNow();
+    const bool isRtv = (DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    // CopyDescriptor copies from source ranges to destination ranges. We
+    // propagate handle→resource mappings for each copied slot.
+    // This implementation handles the general multi-range case.
+    BookGuard _bg;
+    for (UINT dRange = 0; dRange < numDestDescriptorRanges; ++dRange) {
+        SIZE_T destBase = pDestDescriptorRangeStarts[dRange].ptr;
+        UINT destCount = pDestDescriptorCounts[dRange];
+        for (UINT i = 0; i < destCount; ++i) {
+            SIZE_T destPtr = destBase + (SIZE_T)i * incrementSize;
+            // In CopyDescriptors, the source and dest ranges are parallel:
+            // source slot i maps to dest slot i for each range pair.
+            if (dRange < numSrcDescriptorRanges) {
+                SIZE_T srcPtr = pSrcDescriptorRangeStarts[dRange].ptr + (SIZE_T)i * incrementSize;
+                if (isRtv) {
+                    auto it = g_rtvMap.find(srcPtr);
+                    if (it != g_rtvMap.end()) {
+                        ID3D12Resource* res = it->second;
+                        g_rtvMap[destPtr] = res;
+                        if (res == g_mvResource || res == g_mvResourceAlt) {
+                            g_mvLastTouchPresent = now;
+                            g_mvStamp = g_frameCounter;
+                        }
+                    }
+                } else {
+                    auto it = g_srvMap.find(srcPtr);
+                    if (it != g_srvMap.end()) {
+                        ID3D12Resource* res = it->second;
+                        g_srvMap[destPtr] = res;
+                        if (res == g_mvResource || res == g_mvResourceAlt) {
+                            g_mvLastTouchPresent = now;
+                            g_mvStamp = g_frameCounter;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 void InjectAtPresent();
 bool g_inInject = false;
 
@@ -9051,7 +9235,7 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                         g_depthLastTouchPresent = SceneSetNow();
                     if (res == g_mvResource || res == g_mvResourceAlt)
                         g_mvLastTouchPresent = SceneSetNow();
-                    else if (g_shadowRealInputs) {
+                    else {
                         // Broader MV touch: engines using implicit COMMON-state
                         // transitions never call ResourceBarrier on the MV texture,
                         // so the pointer-match check above never fires. Catch any
@@ -9643,24 +9827,37 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                     Real_CreatePlacedResource = (PFN_CreatePlacedResource)vtbl[29];
                 if (!Real_CreateReservedResource)
                     Real_CreateReservedResource = (PFN_CreateReservedResource)vtbl[30];
+                // CopyDescriptors (16) / CopyDescriptorsSimple (17):
+                // SDK-verified slots for ID3D12Device. These copy descriptor
+                // handles between CPU-visible heaps. Tracking them lets us
+                // propagate g_rtvMap/g_srvMap handle→resource entries to
+                // shader-visible heaps, closing the gap where the engine
+                // copies RTV/SRV handles before binding them.
+                if (!Real_CopyDescriptors)
+                    Real_CopyDescriptors = (PFN_CopyDescriptors)vtbl[16];
+                if (!Real_CopyDescriptorsSimple)
+                    Real_CopyDescriptorsSimple = (PFN_CopyDescriptorsSimple)vtbl[17];
                 vtbl[18] = (void*)&Hook_CreateShaderResourceView;
                 vtbl[20] = (void*)&Hook_CreateRenderTargetView;
                 vtbl[27] = (void*)&Hook_CreateCommittedResource;
                 vtbl[29] = (void*)&Hook_CreatePlacedResource;
                 vtbl[30] = (void*)&Hook_CreateReservedResource;
+                // CopyDescriptors (slot 16) / CopyDescriptorsSimple (slot 17)
+                vtbl[16] = (void*)&Hook_CopyDescriptors;
+                vtbl[17] = (void*)&Hook_CopyDescriptorsSimple;
                 vtbl[14] = (void*)&Hook_CreateDescriptorHeap;
                 vtbl[0] = (void*)&Shim_DeviceQI;
                 VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
                 g_hookedDeviceVtbl = (void*)vtbl;
-                Log("hooks: device vtable SWAPPED (18, 20, 27, 29, 30) on device %p vtbl=%p", (void*)newDev, (void*)vtbl);
+                Log("hooks: device vtable SWAPPED (16, 17, 18, 20, 27, 29, 30) on device %p vtbl=%p", (void*)newDev, (void*)vtbl);
                 Log("hooks: device QI census installed (slot 0) vtbl=%p", (void*)vtbl);
                 Log("hooks: descriptor-heap inventory installed (slot 14) vtbl=%p", (void*)vtbl);
             } else {
                 Log("hooks: VirtualProtect on vtable failed - device hooks not installed on device %p", (void*)newDev);
             }
             {
-                void* targets[7] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView, (void*)Hook_CreateCommittedResource, (void*)Hook_CreatePlacedResource, (void*)Hook_CreateReservedResource, (void*)&Shim_DeviceQI, (void*)&Hook_CreateDescriptorHeap };
-                CfgMarkValid(targets, 7);
+                void* targets[9] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView, (void*)Hook_CreateCommittedResource, (void*)Hook_CreatePlacedResource, (void*)Hook_CreateReservedResource, (void*)&Shim_DeviceQI, (void*)&Hook_CreateDescriptorHeap, (void*)Hook_CopyDescriptors, (void*)Hook_CopyDescriptorsSimple };
+                CfgMarkValid(targets, 9);
             }
             }
         }
