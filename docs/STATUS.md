@@ -1,8 +1,188 @@
 # Current project status and agenda
 
-**Last verified: 2026-10-08.** This page is the current-status source of truth. Update it when a new test or implementation result changes the agenda. Older dated notes elsewhere are historical evidence, not current status.
+## Checkpoint — 2026-10-09 (latest REAL-input and MV-provenance work)
 
-## Current state (2026-10-08) — read this first
+This is the latest checkpoint. Earlier entries remain historical; use the
+run-specific artifacts for full logs and do not treat an untested diagnostic
+scaffold as active instrumentation.
+
+- **Workspace preservation:** branch `master`, HEAD
+  `daf0542197dddf0ff9672f705814aaac32e10224` at inspection. The worktree was
+  already substantially dirty, including source, harness, deployed build
+  outputs, scripts, documentation, and test artifacts. No commit, reset,
+  cleanup, or artifact deletion was performed. `realInputs=1` was the
+  user's persisted setting before the serialized test; the harness restored
+  the runtime INI afterward. The last inspected game PID was no longer running.
+- **Address-reuse hardening in `src/d3d12_hooks.cpp`:** REAL validation rejects
+  unknown generation zero; observing the same pointer does not by itself
+  refresh its generation; explicit resource-view/adoption paths do. The
+  bounded generation table records tracked candidate addresses, and creation
+  observations advance generations when a tracked address is reused. Reuse
+  also invalidates related pointer-based candidate/state records. A missing
+  braces issue in scene-ALT invalidation was corrected. This is a reuse alarm,
+  not COM lifetime management: pointer/generation reads are not an atomic
+  snapshot, validation has a check/use race, and unobserved creation/import
+  paths remain gaps.
+- **Run `20261009T192559Z` (PID 17076):** 75-second `smallgrid` test reached
+  freeroam with `thePlayer`; Present advanced 1→6965 over 63 snapshots. The
+  harness reports `FAIL` specifically because no REAL evaluation was
+  observed: 20 successful placeholder-input evaluations with handoff, 0
+  evaluation/reset failures, 0 fatal markers, 0 breaker events, 6,146 REAL
+  validation heartbeats, and 0 REAL per-evaluation records. The process exit
+  code was 1; the cause is not established, so this is not labeled a game
+  crash. Runtime INI restoration is recorded as successful in `result.json`.
+  Artifacts are preserved in `logs/test_runs/20261009T192559Z/`.
+- **MV/depth evidence from that run:** the sampled REAL rejection was
+  `mv-retired`; a previously selected MV pointer faulted during descriptor
+  inspection. Only two MV RTV observations appeared, both during startup and
+  at 1902-wide extents; no gameplay `mv-om-bind` or broad barrier-adoption
+  event was observed. The log recorded a fresh display-sized fmt-45
+  depth-family SRV candidate, but this did not produce a REAL evaluation.
+  Repeated creation events returned tracked addresses as unrelated resources
+  (including 128x128 fmt-10 and 359x379 fmt-28 textures). That confirms
+  pointer reuse occurs and the generation guard rejects some stale identities;
+  it does not prove resource contents, GPU completion, or same-frame
+  color/MV/depth association.
+- **Incomplete diagnostic scaffold:** after the above run, typedefs and
+  `CommandListShim` fields for a proposed command-list recording epoch and
+  MV-target draw census were added in `src/d3d12_hooks.cpp`. The current source
+  was subsequently rebuilt successfully, so these declarations compile. No
+  wrappers, vtable slot installation, counters, submission snapshot, or log
+  path were completed; the fields are inert and have **not** been runtime
+  tested. No result may be attributed to them. This work was intentionally
+  stopped at the user's request. Before relying on this diagnostic, finish or
+  remove the scaffold as a targeted edit and run a gameplay test.
+- **Current blocker / next agenda:** the observed MV pointer is frequently
+  retired/reused, and the latest run did not observe gameplay OM binding of a
+  display-sized fmt-34 target. We therefore cannot yet show that an MV render
+  pass is recorded and submitted near the evaluation point. The planned
+  bounded diagnostic would track Reset→recording epoch→OM bind to display-sized
+  fmt-34→draw calls→Close, then correlate the sealed record with ECL submission
+  using pointer-only registry snapshots. Even a positive result proves only a
+  recorded draw and later submission of that list, not fresh contents, GPU
+  completion, or same-frame association; unshimmed lists, ExecuteIndirect,
+  bundles, and unobserved paths remain limitations. Do not loosen REAL gates.
+- **Verification and reversal:** after the run, `src\\build_asi.bat` completed
+  successfully with the partial scaffold present; the four parser/INI unit
+  tests and Python compilation passed, and `git diff --check` passed. No new
+  gameplay run was performed, and the run above did not meet the REAL-input
+  criterion. No source rollback was performed. To reverse only that
+  scaffold, remove its newly added typedefs and fields after reviewing the
+  source diff; do not revert the whole file, because it contains unrelated
+  user work. Existing pre-build snapshots and run artifacts remain untouched.
+
+## Historical checkpoint — 2026-10-09 (resource address reuse and REAL gate)
+
+This earlier checkpoint is retained for its exact 191646Z evidence; later
+results and the latest agenda are recorded above.
+
+This historical checkpoint records the earlier 191646Z evidence and is
+superseded by the latest checkpoint above.
+
+- **Workspace:** branch `master`, starting HEAD
+  `daf0542197dddf0ff9672f705814aaac32e10224`; substantial pre-existing dirty
+  worktree preserved. `realInputs=1` was the user's persisted setting in both
+  `dist/ScaleNG.ini` and deployed plugin INI. No BeamNG process was active
+  before this test.
+- **Code hardening in `src/d3d12_hooks.cpp`:** unknown generation zero now
+  fails validation; same-pointer observations no longer implicitly refresh a
+  token; explicit view/adoption paths refresh it; the bounded table is limited
+  to tracked candidates; and a missing-braces bug in scene ALT invalidation
+  was corrected. Reuse of a currently tracked address advances its generation
+  and clears several pointer maps/state records. This is an address-reuse
+  alarm, not a COM lifetime guarantee: generation checks still have a
+  check/use race, candidate pointer+generation are not one atomic snapshot,
+  and unhooked creation/import paths remain outside coverage.
+- **Verification:** `src\build_asi.bat` succeeded; `scripts/autonomous_test.py`
+  compiled; all four parser/INI unit tests passed; `git diff --check` passed.
+  Before launch, `dist/ScaleNG.ini` and the deployed INI had matching SHA-256
+  (`9524EDF5…E9A7509`).
+- **Run `20261009T191646Z` (PID 3344):** smallgrid freeroam + `thePlayer`,
+  7,085 Presents across 64 snapshots, 20 successful placeholder-input shadow
+  evaluations with handoff, zero fatal markers, zero eval/reset failures, and
+  no breaker events. Harness correctly reports **FAIL for REAL inputs**:
+  6,336 REAL-mode heartbeats but no REAL evaluation or complete
+  `ENGINE_MV`+`ENGINE_DEPTH` input record. The harness records exit code 1;
+  its cause is not established and is not called a game crash. Runtime INI was
+  restored and its hash still matches `dist`.
+- **What this run established:** depth pointer `81098C9A50` was later returned
+  by `CreatePlacedResource` as a 359×379 fmt-28 resource. The generation gate
+  rejected it (`depth-generation-stale`) rather than accepting the recycled
+  address as the prior depth candidate. A later SRV observation found a
+  1920×1080 fmt-45 depth-family candidate (`8149F94D70`) at Present 844.
+  REAL remained blocked by `mv-stale-present`: the latest MV OM-bind was at
+  Present 199 / ECL 751. That record and repeated list submissions do not prove
+  fresh MV contents for later Presents.
+- **Next action:** strengthen same-list evidence for the MV producer: correlate
+  its RTV bind with a recorded draw/dispatch, then correlate that exact list's
+  submission to the Present timeline. This can show a recorded MV-producing
+  pass is repeatedly submitted; it cannot alone prove same-frame color/MV/depth
+  values. Do not weaken the 3-Present observation gate or claim frame alignment
+  from ECL counts alone.
+- **Rollback:** `realInputs=0` remains the safe runtime fallback. The run's
+  `deployment_backup` and pre-build snapshots in
+  `logs/test_runs/_prebuild_backup_reset_halt_20261009/` and
+  `logs/test_runs/_prebuild_pointer_invalidation_20261009/` preserve prior
+  deployed binaries. Source is uncommitted alongside unrelated user changes;
+  reverse only the named generation helper/slot-token hunks after reviewing
+  `git diff`—never whole-file checkout/reset. Run artifacts remain preserved.
+
+## Checkpoint — 2026-10-09 (REAL-input gate test)
+
+Historical checkpoint, superseded by the resource-generation checkpoint above.
+
+The dated investigation below remains historical evidence.
+
+- **Build:** `src\build_asi.bat` succeeded on the current working-tree source.
+  The resulting `dist` ASI/helper were deployed for run
+  `20261009T183116Z` (PID 15128). The test run's deployment backups are in
+  that run directory. No commit was made.
+- **Harness:** `scripts/autonomous_test.py` now parses per-evaluation input
+  classes separately from per-Present observation-age heartbeats, treats
+  missing ages as missing (not zero), and fails REAL-mode runs without actual
+  `ENGINE_MV` + `ENGINE_DEPTH` evaluation records. Four parser/INI unit tests,
+  Python compilation, and `git diff --check` passed. The harness now captures
+  the runtime INI before deployment so cleanup restores pre-run bytes.
+- **Run `20261009T183116Z`:** smallgrid freeroam + `thePlayer`; 7,205 Presents
+  across 65 snapshots; 20 sampled successful evaluation records, all logged
+  with handoff; 0 fatal markers, 0 evaluation faults, 0 allocator/list Reset
+  failures, 0 breaker events. Harness outcome is correctly **FAIL for REAL
+  input**, not a gameplay failure: 6,392 REAL-mode validation heartbeats but
+  **zero REAL evaluation records**, zero `ENGINE_MV` + `ENGINE_DEPTH` records,
+  and zero REAL-use age records. The original runtime INI was restored
+  byte-for-byte (`realInputs=1` before and after this run). Both `dist` and
+  runtime INIs were already identical at the start, with `realInputs=1`; this
+  run did not change the user's persistent mode setting.
+- **Rejection evidence:** first sampled evaluation rejected REAL inputs as
+  `depth-size`; its selected depth candidate was `359x379` while the gate
+  requires the display extent. Subsequent checks reported `mv-stale-present`;
+  the last sampled MV OM-bind observation was at Present 210, while evaluation
+  began at Present 842. These are observations recorded during command-list
+  recording, not proof of executed writes or same-frame association. The new
+  DSV-bind records prove that DSV handles resolved to resource pointers on
+  recorded lists, but do not yet identify a display-sized depth input or prove
+  a depth-writing draw executed.
+- **Safety change:** a failed Reset of ScaleNG's own shadow allocator/list now
+  halts further shadow evaluation for the session and returns to unmodified
+  game-frame presentation instead of repeatedly retrying. The branch was not
+  exercised in this run; its runtime behavior remains unverified. The existing
+  30/120 eval-fault breaker was not triggered.
+- **Next:** investigate why the selected depth resource is undersized and why
+  recorded MV/depth observations do not recur near Present-time evaluation.
+  Use bounded, execution-aware evidence before changing freshness gates or
+  selecting/promoting resources. Do not call this run proof of REAL DLSS or
+  same-frame inputs. Keep fallback behavior and existing artifacts intact.
+
+Rollback for this checkpoint: revert only the reviewed source/harness hunks
+and rebuild; the pre-build binary/PDB copies are preserved under
+`logs/test_runs/_prebuild_backup_reset_halt_20261009_212922/`, and the
+pre-run deployed plugin files are preserved under
+`logs/test_runs/20261009T183116Z/deployment_backup/`. The run artifacts are
+kept; no repository history was rewritten.
+
+**Last verified: 2026-10-09.** This page is the current-status source of truth. Update it when a new test or implementation result changes the agenda. Older dated notes elsewhere are historical evidence, not current status.
+
+## Baseline snapshot (2026-10-08; superseded by the checkpoint above)
 
 **Verified facts.** NGX initializes (`Init_Ext`) on the game device and
  creates one native-size DLSS feature (render == display, HDR with live

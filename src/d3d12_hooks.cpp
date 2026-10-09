@@ -64,6 +64,20 @@ unsigned int g_mvH = 0;
 
 ID3D12Resource* g_depthResource = nullptr;
 bool g_depthValid = false;
+// A raw COM pointer can be recycled after its prior resource is released.
+// Keep a bounded address-generation table so the old weak slot becomes stale
+// on collision and only a later observed view/adoption can refresh its token.
+// No COM references are retained. Overflow fails closed for engine inputs.
+struct ResourceAddressGeneration { ID3D12Resource* resource; LONG64 generation; };
+static ResourceAddressGeneration g_resourceAddressGenerations[256] = {};
+static SRWLOCK g_resourceAddressGenerationLock = SRWLOCK_INIT;
+static volatile LONG g_resourceAddressGenerationOverflow = 0;
+static volatile LONG g_sceneAddressReuseDetected = 0;
+static volatile LONG64 g_mvResourceGeneration = 0;
+static volatile LONG64 g_mvResourceAltGeneration = 0;
+static volatile LONG64 g_depthResourceGeneration = 0;
+static volatile LONG64 g_sceneColorGeneration = 0;
+static volatile LONG64 g_sceneColorAltGeneration = 0;
 // True when the depth slot holds an SRV-sourced (depth-view) adoption rather
 // than copy-heuristic guesswork. Copies must not overwrite real depth.
 static bool g_depthSrvSourced = false;
@@ -74,8 +88,10 @@ static bool g_depthSrvSourced = false;
 unsigned int g_depthStamp = 0;
 unsigned int g_mvStamp = 0;
 
-// Present-serial stamps: the last Present at which ANY observation (barrier,
-// OM-bind, SRV/RTV creation, copy) fired on each engine input resource.
+// Present-serial stamps: last observed barrier or output-merger bind for each
+// candidate. These are only recency hints: command recording can precede
+// execution, and a bind does not prove a draw wrote the resource or that the
+// contents correspond to the color frame submitted to NGX.
 // g_frameCounter (camera clock) only advances when the engine patches
 // camera CBs — it freezes during steady state, making the frame-counter
 // age gate (10/20000 frames) certify week-old resources as "fresh".
@@ -419,6 +435,114 @@ struct BookGuard {
     BookGuard() { InitOnceExecuteOnce(&g_bookInit, InitBookCS, nullptr, nullptr); EnterCriticalSection(&g_bookCS); }
     ~BookGuard() { LeaveCriticalSection(&g_bookCS); }
 };
+
+static LONG64 GetResourceAddressGeneration(ID3D12Resource* resource)
+{
+    if (!resource) return 0;
+    LONG64 generation = 0;
+    AcquireSRWLockShared(&g_resourceAddressGenerationLock);
+    for (const auto& entry : g_resourceAddressGenerations) {
+        if (entry.resource == resource) { generation = entry.generation; break; }
+    }
+    ReleaseSRWLockShared(&g_resourceAddressGenerationLock);
+    return generation;
+}
+
+static bool ResourceGenerationMatches(ID3D12Resource* resource, LONG64 observedGeneration)
+{
+    // Generation zero means this address has never been observed through a
+    // covered resource-creation path. Unknown is not a valid generation.
+    return resource && observedGeneration > 0 &&
+        InterlockedCompareExchange(&g_resourceAddressGenerationOverflow, 0, 0) == 0 &&
+        GetResourceAddressGeneration(resource) == observedGeneration;
+}
+
+static bool EnsureResourceAddressGeneration(ID3D12Resource* resource);
+
+static void SetTrackedResourceGeneration(ID3D12Resource** slot, ID3D12Resource* resource)
+{
+    volatile LONG64* generation = nullptr;
+    if (slot == &g_mvResource) generation = &g_mvResourceGeneration;
+    else if (slot == &g_mvResourceAlt) generation = &g_mvResourceAltGeneration;
+    else if (slot == &g_depthResource) generation = &g_depthResourceGeneration;
+    else if (slot == &g_sceneColor) generation = &g_sceneColorGeneration;
+    else if (slot == &g_sceneColorAlt) generation = &g_sceneColorAltGeneration;
+    if (generation && resource) {
+        EnsureResourceAddressGeneration(resource);
+        InterlockedExchange64(generation, resource ? GetResourceAddressGeneration(resource) : 0);
+    } else if (generation) {
+        InterlockedExchange64(generation, 0);
+    }
+}
+
+static void InvalidateTrackedResourceGeneration(ID3D12Resource** slot)
+{
+    SetTrackedResourceGeneration(slot, nullptr);
+}
+
+static bool AdvanceResourceAddressGeneration(ID3D12Resource* resource,
+                                              LONG64* generationOut)
+{
+    if (!resource) return false;
+    bool found = false;
+    AcquireSRWLockExclusive(&g_resourceAddressGenerationLock);
+    ResourceAddressGeneration* freeEntry = nullptr;
+    for (auto& entry : g_resourceAddressGenerations) {
+        if (entry.resource == resource) { freeEntry = &entry; found = true; break; }
+        if (!entry.resource && !freeEntry) freeEntry = &entry;
+    }
+    if (!freeEntry) {
+        InterlockedExchange(&g_resourceAddressGenerationOverflow, 1);
+        ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+        return false;
+    }
+    if (!found) freeEntry->resource = resource;
+    ++freeEntry->generation;
+    if (generationOut) *generationOut = freeEntry->generation;
+    ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+    return true;
+}
+
+static bool EnsureResourceAddressGeneration(ID3D12Resource* resource)
+{
+    if (!resource) return false;
+    AcquireSRWLockExclusive(&g_resourceAddressGenerationLock);
+    ResourceAddressGeneration* freeEntry = nullptr;
+    for (auto& entry : g_resourceAddressGenerations) {
+        if (entry.resource == resource) {
+            ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+            return true;
+        }
+        if (!entry.resource && !freeEntry) freeEntry = &entry;
+    }
+    if (!freeEntry) {
+        InterlockedExchange(&g_resourceAddressGenerationOverflow, 1);
+        ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+        return false;
+    }
+    freeEntry->resource = resource;
+    freeEntry->generation = 1;
+    ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+    return true;
+}
+
+static bool AdvanceKnownResourceAddressGeneration(ID3D12Resource* resource,
+                                                   LONG64* generationOut)
+{
+    if (!resource) return false;
+    AcquireSRWLockExclusive(&g_resourceAddressGenerationLock);
+    for (auto& entry : g_resourceAddressGenerations) {
+        if (entry.resource == resource) {
+            ++entry.generation;
+            if (generationOut) *generationOut = entry.generation;
+            ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+            return true;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_resourceAddressGenerationLock);
+    return false;
+}
+
 // Own-texture guard (forward): our textures must never be adopted as engine
 // inputs (proven: NGX-created SRV on our g_shDepth adopted it into the depth
 // slot — REAL depth was our own zeros). Defined after the owned globals.
@@ -431,7 +555,7 @@ bool StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
 // false: the slot still holds the previous engine resource and the old
 // metadata describes it.
 {
-    if (*slot == res) return true;
+    if (*slot == res) return true; // same address is not fresh-lifetime evidence
     // SELF-ADOPTION GUARD: never track our own textures as engine inputs.
     // NGX (via the hooked device) creates views on the resources we hand it;
     // those view-creation hooks would otherwise adopt our placeholders back
@@ -450,12 +574,20 @@ bool StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
         // count as a change - otherwise the settle gate can never elapse.
         ID3D12Resource** other = (slot == (ID3D12Resource**)&g_sceneColor)
                                      ? &g_sceneColorAlt : &g_sceneColor;
-        if (*other == res) { *slot = res; return true; } // pure reassignment
+        if (*other == res) {
+            *slot = res;
+            InvalidateTrackedResourceGeneration(slot);
+            return true;
+        } // pure reassignment
         // Only PERSISTENT composite sources are real scene changes - transient
         // post targets on recycled descriptors swap constantly during play.
         int persistNow = 0;
         { AcquireSRWLockShared(&g_copyMapLock); auto ci = g_copySrcCount.find((void*)res); if (ci != g_copySrcCount.end()) persistNow = ci->second; ReleaseSRWLockShared(&g_copyMapLock); }
-        if (persistNow < 40) { *slot = res; return true; }
+        if (persistNow < 40) {
+            *slot = res;
+            InvalidateTrackedResourceGeneration(slot);
+            return true;
+        }
         g_lastSceneChangeFrame = g_frameCounter;
         g_lastDiscoveryChangeFrame = g_frameCounter;
         static unsigned s_changeFrames[8] = {};
@@ -475,7 +607,11 @@ bool StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     } else if (mvSlot) {
         ID3D12Resource** oMv = (slot == (ID3D12Resource**)&g_mvResource)
                                     ? &g_mvResourceAlt : &g_mvResource;
-        if (*oMv == res) { *slot = res; return true; }
+        if (*oMv == res) {
+            *slot = res;
+            InvalidateTrackedResourceGeneration(slot);
+            return true;
+        }
         g_lastDiscoveryChangeFrame = g_frameCounter;
     } else if (depSlot) {
         g_lastDiscoveryChangeFrame = g_frameCounter;
@@ -499,6 +635,9 @@ bool StoreTracked(ID3D12Resource** slot, ID3D12Resource* res)
     // creation) desyncs its teardown bookkeeping and corrupts its object
     // graph. Staleness stamps + bridge SEH handle freed pointers safely.
     *slot = res;
+    // Generic discovery/copy/barrier observations are not lifetime proof.
+    // Candidate eligibility is restored only by a fresh resource-view path.
+    InvalidateTrackedResourceGeneration(slot);
     return true;
 }
 // Last-seen MV RTV descriptor key. After an invalidation the engine does NOT
@@ -1011,6 +1150,7 @@ ID3D12Resource* g_boundRtvResource = nullptr;
 // resolve "what is currently bound as an RTV" to a resource even when the
 // view was created at a moment we later lost (plugin re-init, view re-creation).
 std::map<SIZE_T, ID3D12Resource*> g_rtvMap;
+std::map<SIZE_T, ID3D12Resource*> g_dsvMap;
 static std::map<SIZE_T, ID3D12Resource*> g_displayRTVMap; // persistent display-sized, not overwritten on handle reuse
 // Last display-sized RTV creation for provenance
 static D3D12_CPU_DESCRIPTOR_HANDLE g_lastDisplayRTVHandle = {};
@@ -1038,6 +1178,7 @@ ID3D12DescriptorHeap* g_setHeaps[2] = { nullptr, nullptr };
 static SRWLOCK g_heapStateLock = SRWLOCK_INIT;
 
 typedef void (STDMETHODCALLTYPE* PFN_CreateRenderTargetView)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+typedef void (STDMETHODCALLTYPE* PFN_CreateDepthStencilView)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 typedef void (STDMETHODCALLTYPE* PFN_CreateShaderResourceView)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandQueue)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandList)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
@@ -1050,12 +1191,17 @@ typedef void (STDMETHODCALLTYPE* PFN_RSSetViewports)(ID3D12GraphicsCommandList*,
 typedef void (STDMETHODCALLTYPE* PFN_RSSetScissorRects)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
 typedef void (STDMETHODCALLTYPE* PFN_ResourceBarrier)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 typedef void (STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CommandListClose)(ID3D12GraphicsCommandList*);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CommandListReset)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+typedef void (STDMETHODCALLTYPE* PFN_DrawInstanced)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstanced)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_Dispatch)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_ResourceMap)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
 typedef void (STDMETHODCALLTYPE* PFN_ResourceUnmap)(ID3D12Resource*, UINT, const D3D12_RANGE*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreatePlacedResource)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateReservedResource)(ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
-// ID3D12Device slots 16/17 (SDK 10.0.28000.0): CopyDescriptors / CopyDescriptorsSimple.
+// ID3D12Device slots 23/24 (SDK 10.0.28000.0): CopyDescriptors / CopyDescriptorsSimple.
 // These copy CPU-visible descriptors into shader-visible heaps — the handles
 // used by OMSetRenderTargets / SetGraphicsRootDescriptorTable that are
 // NOT in g_rtvMap/g_srvMap unless we track the copy here.
@@ -1076,6 +1222,7 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource2)(ID3D12Device*,
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreatePlacedResource1)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC1*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 
 PFN_CreateRenderTargetView Real_CreateRenderTargetView = nullptr;
+PFN_CreateDepthStencilView Real_CreateDepthStencilView = nullptr;
 PFN_CreateShaderResourceView Real_CreateShaderResourceView = nullptr;
 PFN_CopyDescriptors Real_CopyDescriptors = nullptr;
 PFN_CopyDescriptorsSimple Real_CopyDescriptorsSimple = nullptr;
@@ -1141,6 +1288,25 @@ struct CommandListShim {
     // + GPU handle value only; heap contents never read, referenced resource
     // never resolved here.
     PFN_SetGraphicsRootDescriptorTable setGraphicsRootDescriptorTable;
+    // Diagnostic-only recording epoch and MV-target draw census. These fields
+    // contain pointer identity/counts only; no engine COM reference is held.
+    PFN_CommandListClose close;
+    PFN_CommandListReset reset;
+    PFN_DrawInstanced drawInstanced;
+    PFN_DrawIndexedInstanced drawIndexedInstanced;
+    PFN_Dispatch dispatch;
+    volatile LONG64 recordingEpoch;
+    volatile LONG recordingClosed;
+    ID3D12Resource* volatile currentOmMvTarget;
+    ID3D12Resource* volatile recordedMvTarget;
+    volatile LONG mvTargetWidth;
+    volatile LONG mvTargetHeight;
+    volatile LONG64 mvTargetOmCount;
+    volatile LONG64 mvTargetDrawCount;
+    volatile LONG64 mvTargetIndexedDrawCount;
+    volatile LONG64 dispatchCount;
+    volatile LONG64 mvTargetRecordPresent;
+    volatile LONG64 mvTargetRecordEcl;
 };
 // Resource shim for Map/Unmap hooks on constant buffers
 struct ResourceShim {
@@ -1848,7 +2014,9 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
     UINT dstZ, const D3D12_TEXTURE_COPY_LOCATION* src,
     const D3D12_BOX* srcBox);
 static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER* pBarriers);
-static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets);
+static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRenderTargets,
+                                   const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets,
+                                   const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencil);
 
 static void STDMETHODCALLTYPE Shim_CopyTextureRegion(
     ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dst,
@@ -2140,7 +2308,7 @@ static void STDMETHODCALLTYPE Shim_OMSetRenderTargets(
     ObserveNativeOmUsage(list, count, handles, singleRange, depth);
     // LEGACY RECONNECT: bound-RTV tracking for SceneColorBound() (the
     // viewport-patch prerequisite). Forwarding below is unchanged.
-    ID3D12Resource* omRes = TrackOMBind(count, handles);
+    ID3D12Resource* omRes = TrackOMBind(list, count, handles, depth);
     // Targeted diagnostic: prove whether main gameplay OM is observed
     {
         bool isTargeted = false;
@@ -2799,6 +2967,98 @@ static bool CreateTexFilterMatch(const D3D12_RESOURCE_DESC* d)
            f == DXGI_FORMAT_R10G10B10A2_UNORM;
 }
 
+static void EraseResourceMappings(std::map<SIZE_T, ID3D12Resource*>& mapping,
+                                  ID3D12Resource* resource)
+{
+    for (auto it = mapping.begin(); it != mapping.end();) {
+        if (it->second == resource) it = mapping.erase(it);
+        else ++it;
+    }
+}
+
+// A successful D3D12 resource-creation call returning an address already held
+// in a weak candidate slot advances that address's generation. Existing slots
+// then fail validation without being cleared concurrently; a later observed
+// view can explicitly re-adopt the same address at its new generation. If the
+// fixed generation table is exhausted, all REAL inputs fail closed. No COM
+// refs are retained or released.
+static void RecordTrackedAddressReuse(const char* api, ID3D12Resource* created,
+                                      const D3D12_RESOURCE_DESC* desc,
+                                      REFIID requestedIid)
+{
+    // The raw pointer comparison is meaningful only for the interface type
+    // stored by our tracking code. Do not reinterpret some other supported
+    // creation interface as ID3D12Resource.
+    if (!created || !desc || !InlineIsEqualGUID(requestedIid, __uuidof(ID3D12Resource))) return;
+    bool depthMatch = created == g_depthResource;
+    bool mvMatch = created == g_mvResource || created == g_mvResourceAlt;
+    bool sceneMatch = created == g_sceneColor || created == g_sceneColorAlt;
+    LONG64 generation = 0;
+    bool tracked = false;
+    if (depthMatch || mvMatch || sceneMatch)
+        tracked = AdvanceResourceAddressGeneration(created, &generation);
+    else
+        tracked = AdvanceKnownResourceAddressGeneration(created, &generation);
+    if (!tracked) return;
+    if (sceneMatch) InterlockedExchange(&g_sceneAddressReuseDetected, 1);
+    static volatile LONG s_matches = 0;
+    LONG n = InterlockedIncrement(&s_matches);
+    if (n <= 24 || (n % 100) == 0)
+        Log("hooks: tracked-address-reuse generation n=%ld api=%s res=%p generation=%lld tracked=%d depth=%d mv=%d scene=%d newDesc=%ux%u fmt=%u dim=%u mips=%u samples=%u present=%llu ecl=%llu",
+            n, api, (void*)created, (long long)generation, tracked ? 1 : 0,
+            depthMatch ? 1 : 0, mvMatch ? 1 : 0,
+            sceneMatch ? 1 : 0, (unsigned)desc->Width, (unsigned)desc->Height,
+            (unsigned)desc->Format, (unsigned)desc->Dimension,
+            (unsigned)desc->MipLevels, (unsigned)desc->SampleDesc.Count,
+            (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+
+    // Drop pointer/handle lookups protected by their established locks. The
+    // candidate slots themselves stay untouched; their per-slot generation
+    // mismatch makes them fail closed until a fresh view/use observation.
+    {
+        BookGuard guard;
+        EraseResourceMappings(g_rtvMap, created);
+        EraseResourceMappings(g_dsvMap, created);
+        EraseResourceMappings(g_srvMap, created);
+        EraseResourceMappings(g_displayRTVMap, created);
+        g_resourceStates.erase(created);
+    }
+    {
+        AcquireSRWLockExclusive(&g_copyMapLock);
+        g_copySrcCount.erase((void*)created);
+        ReleaseSRWLockExclusive(&g_copyMapLock);
+    }
+    {
+        AcquireSRWLockExclusive(&g_sceneSetLock);
+        for (unsigned i = 0; i < g_sceneSetCount;) {
+            if (g_sceneSet[i].resource == created) {
+                g_sceneSet[i] = g_sceneSet[--g_sceneSetCount];
+                g_sceneSet[g_sceneSetCount] = {};
+            } else ++i;
+        }
+        ReleaseSRWLockExclusive(&g_sceneSetLock);
+    }
+    {
+        AcquireSRWLockExclusive(&g_nativeCandidateLock);
+        for (unsigned i = 0; i < g_nativeCandidateCount;) {
+            if (g_nativeCandidates[i].resource == created) {
+                g_nativeCandidates[i] = g_nativeCandidates[--g_nativeCandidateCount];
+                g_nativeCandidates[g_nativeCandidateCount] = {};
+            } else ++i;
+        }
+        ReleaseSRWLockExclusive(&g_nativeCandidateLock);
+    }
+    {
+        AcquireSRWLockExclusive(&g_sceneColorCandidateLock);
+        for (auto& candidate : g_sceneColorCandidates) {
+            if (candidate.resource == created) candidate = {};
+        }
+        ReleaseSRWLockExclusive(&g_sceneColorCandidateLock);
+    }
+
+}
+
 HRESULT WINAPI Hook_CreateCommittedResource(ID3D12Device* device,
     const D3D12_HEAP_PROPERTIES* heapProps, D3D12_HEAP_FLAGS heapFlags,
     const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
@@ -2808,6 +3068,7 @@ HRESULT WINAPI Hook_CreateCommittedResource(ID3D12Device* device,
     // Per-resource Map/Unmap shims stay dormant until a valid target is established.
     HRESULT hr = Real_CreateCommittedResource(device, heapProps, heapFlags, desc, initialState, clearValue, riid, ppResource);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc) {
+        RecordTrackedAddressReuse("Committed", (ID3D12Resource*)*ppResource, desc, riid);
         // Bounded log: large buffers only (>=1MB), first 20 then 1/100 sampling.
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
             desc->Width >= 1048576ULL) {
@@ -2852,6 +3113,7 @@ HRESULT WINAPI Hook_CreatePlacedResource(ID3D12Device* device,
     // log heap object pointer and offset only.
     HRESULT hr = Real_CreatePlacedResource(device, pHeap, heapOffset, desc, initialState, clearValue, riid, ppResource);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc) {
+        RecordTrackedAddressReuse("Placed", (ID3D12Resource*)*ppResource, desc, riid);
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
             desc->Width >= 1048576ULL) {
             static volatile LONG s_largePlacedLogs = 0;
@@ -2888,6 +3150,7 @@ HRESULT WINAPI Hook_CreateReservedResource(ID3D12Device* device,
     // Diagnostic-only forwarding hook. No heap applies to reserved resources.
     HRESULT hr = Real_CreateReservedResource(device, desc, initialState, clearValue, riid, ppResource);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc) {
+        RecordTrackedAddressReuse("Reserved", (ID3D12Resource*)*ppResource, desc, riid);
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
             desc->Width >= 1048576ULL) {
             static volatile LONG s_largeReservedLogs = 0;
@@ -2931,6 +3194,8 @@ HRESULT WINAPI Hook_CreateCommittedResource1(ID3D12Device* device,
     HRESULT hr = Real_CommittedResource1 ?
         Real_CommittedResource1(device, heapProps, heapFlags, desc, initialState,
                                 clearValue, session, riidRes, ppResource) : E_NOINTERFACE;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc)
+        RecordTrackedAddressReuse("Committed1", (ID3D12Resource*)*ppResource, desc, riidRes);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(desc)) {
         static volatile LONG s_texCommitted1Logs = 0;
         LONG nt = InterlockedIncrement(&s_texCommitted1Logs);
@@ -2980,6 +3245,8 @@ HRESULT WINAPI Hook_CreateReservedResource1(ID3D12Device* device,
     HRESULT hr = Real_ReservedResource1 ?
         Real_ReservedResource1(device, desc, initialState,
                                clearValue, session, riidRes, ppResource) : E_NOINTERFACE;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc)
+        RecordTrackedAddressReuse("Reserved1", (ID3D12Resource*)*ppResource, desc, riidRes);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(desc)) {
         static volatile LONG s_texReserved1Logs = 0;
         LONG nt = InterlockedIncrement(&s_texReserved1Logs);
@@ -3011,6 +3278,8 @@ HRESULT WINAPI Hook_CreateCommittedResource2(ID3D12Device* device,
         Real_CommittedResource2(device, heapProps, heapFlags, desc, initialState,
                                 clearValue, session, riidRes, ppResource) : E_NOINTERFACE;
     const D3D12_RESOURCE_DESC* bd = (const D3D12_RESOURCE_DESC*)desc;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc)
+        RecordTrackedAddressReuse("Committed2", (ID3D12Resource*)*ppResource, bd, riidRes);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(bd)) {
         static volatile LONG s_texCommitted2Logs = 0;
         LONG nt = InterlockedIncrement(&s_texCommitted2Logs);
@@ -3037,6 +3306,8 @@ HRESULT WINAPI Hook_CreatePlacedResource1(ID3D12Device* device,
         Real_PlacedResource1(device, pHeap, heapOffset, desc, initialState,
                              clearValue, riid, ppResource) : E_NOINTERFACE;
     const D3D12_RESOURCE_DESC* bd = (const D3D12_RESOURCE_DESC*)desc;
+    if (SUCCEEDED(hr) && ppResource && *ppResource && desc)
+        RecordTrackedAddressReuse("Placed1", (ID3D12Resource*)*ppResource, bd, riid);
     if (SUCCEEDED(hr) && ppResource && *ppResource && desc && CreateTexFilterMatch(bd)) {
         static volatile LONG s_texPlaced1Logs = 0;
         LONG nt = InterlockedIncrement(&s_texPlaced1Logs);
@@ -3239,7 +3510,6 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             bool isBbLike = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) == 0;
             if (isBbLike && (!g_bbCached || g_bbFetchFails > 0)) {
                 StoreTracked(&g_bbCached, res);
-                { BookGuard _bg; g_resourceStates[res] = D3D12_RESOURCE_STATE_COMMON; }
                 Log("hooks: backbuffer candidate cached from RTV creation %p (%ux%u fmt %u flags %X)",
                     (void*)res, (unsigned)rd.Width, (unsigned)rd.Height,
                     (unsigned)rd.Format, (unsigned)rd.Flags);
@@ -3253,12 +3523,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             IsSceneColorFormat((unsigned)desc->Format)) {
             // Display-sized HDR/UNORM color target - adopt as scene color. The size
             // is NOT hardcoded (the engine may render at e.g. 1920x1001).
-            { BookGuard _bg;
-                { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
-                }
-            }
+            { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
             if (!g_sceneColorValid) {
                 StoreTracked(&g_sceneColor, res);
                 g_sceneColorRtv = handle;
@@ -3269,8 +3534,12 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             } else if (res == g_sceneColor) {
                 // The game re-created the RTV view for the same resource
                 // (e.g. renderer re-init). Refresh the stored handle.
+                StoreTracked(&g_sceneColor, res);
                 g_sceneColorRtv = handle;
                 Log("hooks: scene color RTV handle refreshed %p", (void*)res);
+            } else if (res == g_sceneColorAlt) {
+                StoreTracked(&g_sceneColorAlt, res);
+                g_sceneColorRtvAlt = handle;
             } else if (res != g_sceneColorAlt) {
                 StoreTracked(&g_sceneColorAlt, res);
                 g_sceneColorRtvAlt = handle;
@@ -3286,10 +3555,7 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             if (IsSceneColorFormat((unsigned)desc->Format)) {
                 g_displayW = (unsigned int)rd.Width;
                 g_displayH = (unsigned int)rd.Height;
-                { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
-                }
+                { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 if (!g_sceneColorValid) {
                     StoreTracked(&g_sceneColor, res);
                     g_sceneColorRtv = handle;
@@ -3299,8 +3565,12 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 } else if (res == g_sceneColor) {
                     // The game re-created the RTV view for the same resource
                     // (e.g. renderer re-init). Refresh the stored handle.
+                    StoreTracked(&g_sceneColor, res);
                     g_sceneColorRtv = handle;
                     Log("hooks: scene color RTV handle refreshed %p", (void*)res);
+                } else if (res == g_sceneColorAlt) {
+                    StoreTracked(&g_sceneColorAlt, res);
+                    g_sceneColorRtvAlt = handle;
                 } else if (res != g_sceneColorAlt) {
                     StoreTracked(&g_sceneColorAlt, res);
                     g_sceneColorRtvAlt = handle;
@@ -3312,13 +3582,15 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
             } else if (desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
-                { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
-                }
+                { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
                 if (!g_mvValid) {
                     if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
-            StoreTracked(&g_mvResource, res);
+                    if (!StoreTracked(&g_mvResource, res)) {
+                        if (Real_CreateRenderTargetView)
+                            Real_CreateRenderTargetView(device, res, desc, handle);
+                        return;
+                    }
+                    SetTrackedResourceGeneration(&g_mvResource, res);
                     g_mvValid = true;
                     g_mvStamp = g_frameCounter;
                     g_mvLastRtvKey = handle.ptr;
@@ -3326,40 +3598,50 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
                 } else if (res == g_mvResource || res == g_mvResourceAlt) {
                     if (res == g_mvResource) {
                         if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
-            StoreTracked(&g_mvResource, res);
+                        if (StoreTracked(&g_mvResource, res))
+                            SetTrackedResourceGeneration(&g_mvResource, res);
                         Log("hooks: motion vector RTV handle refreshed %p", (void*)res);
+                    } else {
+                        if (StoreTracked(&g_mvResourceAlt, res))
+                            SetTrackedResourceGeneration(&g_mvResourceAlt, res);
                     }
                 } else if (res != g_mvResourceAlt) {
-                    StoreTracked(&g_mvResourceAlt, res);
+                    if (StoreTracked(&g_mvResourceAlt, res))
+                        SetTrackedResourceGeneration(&g_mvResourceAlt, res);
                     Log("hooks: motion vector RTV %p (%ux%u R16G16_FLOAT) (ALT)", (void*)res, g_mvW, g_mvH);
                 }
             }
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    rd.Width >= 1000 && rd.Height >= 500 && rd.MipLevels == 1 &&
                    desc->Format == DXGI_FORMAT_R16G16_FLOAT) {
-            { BookGuard _bg;
-                { BookGuard _bg;
-                    g_resourceStates[res] = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
-                }
-            }
+            { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
             if (!g_mvValid) {
                 if (!g_mvValid) g_mvFirstValidFrame = g_frameCounter;
-            StoreTracked(&g_mvResource, res);
+                if (!StoreTracked(&g_mvResource, res)) {
+                    if (Real_CreateRenderTargetView)
+                        Real_CreateRenderTargetView(device, res, desc, handle);
+                    return;
+                }
+                SetTrackedResourceGeneration(&g_mvResource, res);
                 g_mvValid = true;
                 g_mvStamp = g_frameCounter;
-                g_mvLastTouchPresent = SceneSetNow();
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 g_mvLastRtvKey = handle.ptr;
                 Log("hooks: motion vector RTV %p (1920x1001 R16G16_FLOAT)", (void*)res);
             } else if (res == g_mvResource || res == g_mvResourceAlt) {
-                if (res == g_mvResource)
+                if (res == g_mvResource) {
+                    if (StoreTracked(&g_mvResource, res))
+                        SetTrackedResourceGeneration(&g_mvResource, res);
                     Log("hooks: motion vector RTV handle refreshed %p", (void*)res);
+                } else {
+                    if (StoreTracked(&g_mvResourceAlt, res))
+                        SetTrackedResourceGeneration(&g_mvResourceAlt, res);
+                }
             } else if (res != g_mvResourceAlt) {
-                StoreTracked(&g_mvResourceAlt, res);
+                if (StoreTracked(&g_mvResourceAlt, res))
+                    SetTrackedResourceGeneration(&g_mvResourceAlt, res);
                 g_mvStamp = g_frameCounter;
-                g_mvLastTouchPresent = SceneSetNow();
                 g_mvW = (unsigned int)rd.Width;
                 g_mvH = (unsigned int)rd.Height;
                 Log("hooks: motion vector RTV %p (1920x1001 R16G16_FLOAT) (ALT)", (void*)res);
@@ -3406,7 +3688,8 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
         desc->Texture2D.MipLevels == 1) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
         ObserveNativeCandidate(res, rd, 2);
-        // Creation-time ref for depth-family targets (same safety rationale).
+        // Discovery only. Creating an SRV neither binds nor transitions the
+        // resource, so it must not be used as state or content-freshness proof.
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.MipLevels == 1 &&
             rd.Width == g_displayW && rd.Height == g_displayH &&
             (desc->Format == DXGI_FORMAT_R32_FLOAT || desc->Format == DXGI_FORMAT_R32_TYPELESS ||
@@ -3414,24 +3697,32 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             // Metadata only on a real store: a rejected self-adopt must not
             // corrupt the slot's engine metadata (valid/stamp/fmt/srvSourced).
             // Forwarding below always runs regardless.
+            ID3D12Resource* previousDepth = g_depthResource;
             if (!StoreTracked(&g_depthResource, res)) { /* rejected: keep prior engine metadata */ }
             else {
+            // This SRV is a newly observed view of the currently returned
+            // resource address, so it may refresh the slot's lifetime token.
+            SetTrackedResourceGeneration(&g_depthResource, res);
             g_depthValid = true;
             g_depthSrvSourced = true;
             g_depthStamp = g_frameCounter;
-            g_depthLastTouchPresent = SceneSetNow();
             g_depthRealFmt = rd.Format;
             g_depthMsaa = rd.SampleDesc.Count != 1;
-            g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            Log("hooks: depth candidate SRV %p", (void*)res);
+            static volatile LONG s_depthCandidateEvents = 0;
+            LONG candidateEvent = InterlockedIncrement(&s_depthCandidateEvents);
+            if (previousDepth != res || candidateEvent <= 16 || (candidateEvent % 200) == 0)
+                Log("hooks: depth-candidate source=SRV event=%ld previous=%p current=%p res=%ux%u fmt=%u samples=%u viewFmt=%u view=%llX srvSource=1 present=%llu ecl=%llu",
+                    candidateEvent, (void*)previousDepth, (void*)res,
+                    (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)rd.Format,
+                    (unsigned)rd.SampleDesc.Count, (unsigned)desc->Format,
+                    (unsigned long long)handle.ptr,
+                    (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                    (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
             }
         }
-        // MV SRV discovery: when the engine creates an SRV on a display-sized
-        // R16G16_FLOAT texture, it is sampling the MV texture for temporal
-        // reprojection — a present-serial touch signal. The existing pointer-
-        // match writers (barrier/OM-bind) miss this for engines using implicit
-        // COMMON-state transitions, so this SRV-creation path is the reliable
-        // per-frame touch source.
+        // MV SRV discovery is not an actual sample: descriptors are often
+        // created once and reused. Keep candidate discovery, but do not stamp
+        // recency or invent a shader-resource state here.
         // NOTE: NOT gated by g_shadowRealInputs — the engine may create SRVs
         // before REAL mode is toggled on (config init timing is racy at
         // startup). Unconditional storage is safe: it only adds handle→resource
@@ -3442,17 +3733,22 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
             (unsigned)rd.Width == g_displayW && rd.Height == g_displayH &&
             !IsOwnResource(res)) {
             if (res != g_mvResource && res != g_mvResourceAlt) {
-                StoreTracked(&g_mvResourceAlt, res);
-                g_mvStamp = g_frameCounter;
-                if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
-                g_mvW = (unsigned int)rd.Width; g_mvH = (unsigned int)rd.Height;
-                static int s_mvSrvLog = 0;
-                if (s_mvSrvLog++ < 4)
-                    Log("hooks: MV candidate SRV %p (%ux%u)", (void*)res, (unsigned)rd.Width, (unsigned)rd.Height);
+                if (StoreTracked(&g_mvResourceAlt, res)) {
+                    SetTrackedResourceGeneration(&g_mvResourceAlt, res);
+                    g_mvStamp = g_frameCounter;
+                    if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
+                    g_mvW = (unsigned int)rd.Width; g_mvH = (unsigned int)rd.Height;
+                    static int s_mvSrvLog = 0;
+                    if (s_mvSrvLog++ < 4)
+                        Log("hooks: MV candidate SRV %p (%ux%u)", (void*)res, (unsigned)rd.Width, (unsigned)rd.Height);
+                }
+            } else if (res == g_mvResource) {
+                if (StoreTracked(&g_mvResource, res))
+                    SetTrackedResourceGeneration(&g_mvResource, res);
+            } else {
+                if (StoreTracked(&g_mvResourceAlt, res))
+                    SetTrackedResourceGeneration(&g_mvResourceAlt, res);
             }
-            g_mvLastTouchPresent = SceneSetNow();
-            g_mvStamp = g_frameCounter;
-            g_resourceStates[res] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         }
         // Store handle→resource mapping for ALL 2D SRVs so CopyDescriptors
         // propagation can later resolve copied handles in shader-visible heaps.
@@ -3462,6 +3758,21 @@ void Hook_CreateShaderResourceView(ID3D12Device* device, ID3D12Resource* res,
         Real_CreateShaderResourceView(device, res, desc, handle);
 }
 
+void Hook_CreateDepthStencilView(ID3D12Device* device, ID3D12Resource* res,
+                                 const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+    // The handle map supports later OM depth-bind observation. View creation
+    // is not evidence that the depth resource is currently bound or written.
+    if (device == g_device && handle.ptr) {
+        BookGuard guard;
+        if (res) g_dsvMap[handle.ptr] = res;
+        else g_dsvMap.erase(handle.ptr);
+    }
+    if (Real_CreateDepthStencilView)
+        Real_CreateDepthStencilView(device, res, desc, handle);
+}
+
 void TryDeferredInject(ID3D12CommandQueue* injQueue);
 void InjectAtPresentImpl(ID3D12CommandQueue* injQueue);
 void TryQueueOutputCopy(ID3D12CommandQueue* queue);
@@ -3469,17 +3780,14 @@ void TryQueueOutputCopy(ID3D12CommandQueue* queue);
 // --------------------------------------------------------------------------
 // CopyDescriptors / CopyDescriptorsSimple hooks
 //
-// The engine renders MV by RTV and samples it via SRV. In D3D12, RTV/SRV
-// handles are typically created in a CPU-visible heap and then copied to a
-// shader-visible heap via CopyDescriptorsSimple before being bound via
-// OMSetRenderTargets or SetGraphicsRootDescriptorTable. The copy destination
-// handles are NOT in g_rtvMap/g_srvMap unless we propagate them here.
-//
-// Without this hook, TrackOMBind's g_rtvMap.find(copiedHandle) returns null,
-// g_boundRtvResource stays nullptr, and the same-resource OM-bind touch never
-// fires. This is the root cause of mvTouchAge never updating after initial
-// MV RTV creation.
+// Descriptor-copy hooks propagate CPU-handle bookkeeping only. Copying a
+// descriptor does not execute GPU work, bind a resource, or prove freshness.
+// The mappings are used to resolve later RTV/DSV binds; unknown overwrites
+// invalidate prior entries rather than preserving stale identities.
 // --------------------------------------------------------------------------
+static void EraseDescriptorMappingRange(std::map<SIZE_T, ID3D12Resource*>& mapping,
+                                        SIZE_T start, UINT count, UINT incrementSize);
+
 void Hook_CopyDescriptorsSimple(ID3D12Device* device, UINT numDescriptors,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destStart,
                                 D3D12_CPU_DESCRIPTOR_HANDLE srcStart,
@@ -3493,51 +3801,55 @@ void Hook_CopyDescriptorsSimple(ID3D12Device* device, UINT numDescriptors,
     // Only track RTV and CBV_SRV_UAV (SRV/UAV) heap copies — these are the
     // descriptor types used for render targets and shader resources.
     if (DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_RTV &&
+        DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
         DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return;
 
     // Resolve increment size to walk the descriptor range.
     UINT incrementSize = device->GetDescriptorHandleIncrementSize(DescriptorHeaps);
     if (incrementSize == 0) return;
 
-    const unsigned long long now = SceneSetNow();
-
-    if (DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_RTV) {
-        BookGuard _bg;
-        for (UINT i = 0; i < numDescriptors; ++i) {
-            SIZE_T srcPtr = srcStart.ptr + (SIZE_T)i * incrementSize;
-            SIZE_T destPtr = destStart.ptr + (SIZE_T)i * incrementSize;
-            auto it = g_rtvMap.find(srcPtr);
-            if (it != g_rtvMap.end()) {
-                ID3D12Resource* res = it->second;
-                g_rtvMap[destPtr] = res;
-                // Touch MV if the copied resource IS the tracked MV resource
-                if (res == g_mvResource || res == g_mvResourceAlt) {
-                    g_mvLastTouchPresent = now;
-                    g_mvStamp = g_frameCounter;
-                }
-            }
-        }
-    } else {
-        // CBV_SRV_UAV heap
-        BookGuard _bg;
-        for (UINT i = 0; i < numDescriptors; ++i) {
-            SIZE_T srcPtr = srcStart.ptr + (SIZE_T)i * incrementSize;
-            SIZE_T destPtr = destStart.ptr + (SIZE_T)i * incrementSize;
-            auto it = g_srvMap.find(srcPtr);
-            if (it != g_srvMap.end()) {
-                ID3D12Resource* res = it->second;
-                g_srvMap[destPtr] = res;
-                // Touch MV if the copied SRV resource IS the tracked MV resource
-                if (res == g_mvResource || res == g_mvResourceAlt) {
-                    g_mvLastTouchPresent = now;
-                    g_mvStamp = g_frameCounter;
-                    static int s_mvSrvCopyLog = 0;
-                    if (s_mvSrvCopyLog++ < 4)
-                        Log("hooks: MV SRV copied to shader-visible heap %p", (void*)res);
-                }
-            }
-        }
+    // Descriptor bookkeeping is intentionally NOT a resource freshness signal:
+    // copying a CPU descriptor says nothing about GPU execution or contents.
+    // Bound the snapshot to keep this hook's work predictable. For a larger
+    // overwrite, invalidate any known destination mappings instead of risking
+    // stale handle->resource associations.
+    static const UINT kMaxTrackedCopy = 256;
+    BookGuard _bg;
+    std::map<SIZE_T, ID3D12Resource*>& mapping =
+        DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ? g_rtvMap :
+        DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_DSV ? g_dsvMap : g_srvMap;
+    if (numDescriptors > kMaxTrackedCopy) {
+        EraseDescriptorMappingRange(mapping, destStart.ptr, numDescriptors, incrementSize);
+        return;
     }
+    if ((SIZE_T)(numDescriptors - 1) > ((~(SIZE_T)0) - srcStart.ptr) / incrementSize ||
+        (SIZE_T)(numDescriptors - 1) > ((~(SIZE_T)0) - destStart.ptr) / incrementSize)
+        return;
+
+    ID3D12Resource* copied[kMaxTrackedCopy] = {};
+    for (UINT i = 0; i < numDescriptors; ++i) {
+        SIZE_T srcPtr = srcStart.ptr + (SIZE_T)i * incrementSize;
+        auto it = mapping.find(srcPtr);
+        if (it != mapping.end()) copied[i] = it->second;
+    }
+    for (UINT i = 0; i < numDescriptors; ++i)
+        mapping.erase(destStart.ptr + (SIZE_T)i * incrementSize);
+    for (UINT i = 0; i < numDescriptors; ++i) {
+        if (copied[i])
+            mapping[destStart.ptr + (SIZE_T)i * incrementSize] = copied[i];
+    }
+}
+
+static void EraseDescriptorMappingRange(std::map<SIZE_T, ID3D12Resource*>& mapping,
+                                        SIZE_T start, UINT count, UINT incrementSize)
+{
+    if (!count || !incrementSize ||
+        (SIZE_T)count > ((~(SIZE_T)0) - start) / incrementSize)
+        return;
+    const SIZE_T end = start + (SIZE_T)count * incrementSize;
+    auto it = mapping.lower_bound(start);
+    while (it != mapping.end() && it->first < end)
+        it = mapping.erase(it);
 }
 
 void Hook_CopyDescriptors(ID3D12Device* device,
@@ -3555,52 +3867,74 @@ void Hook_CopyDescriptors(ID3D12Device* device,
         DescriptorHeaps);
 
     if (!pDestDescriptorRangeStarts || !pSrcDescriptorRangeStarts ||
-        !pDestDescriptorCounts || !pSrcDescriptorCounts || !device || device != g_device) return;
+        !device || device != g_device) return;
 
     if (DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_RTV &&
+        DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
         DescriptorHeaps != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return;
 
     UINT incrementSize = device->GetDescriptorHandleIncrementSize(DescriptorHeaps);
     if (incrementSize == 0) return;
 
-    const unsigned long long now = SceneSetNow();
-    const bool isRtv = (DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
-    // CopyDescriptor copies from source ranges to destination ranges. We
-    // propagate handle→resource mappings for each copied slot.
-    // This implementation handles the general multi-range case.
+    static const UINT kMaxTrackedCopy = 256;
     BookGuard _bg;
-    for (UINT dRange = 0; dRange < numDestDescriptorRanges; ++dRange) {
-        SIZE_T destBase = pDestDescriptorRangeStarts[dRange].ptr;
-        UINT destCount = pDestDescriptorCounts[dRange];
-        for (UINT i = 0; i < destCount; ++i) {
-            SIZE_T destPtr = destBase + (SIZE_T)i * incrementSize;
-            // In CopyDescriptors, the source and dest ranges are parallel:
-            // source slot i maps to dest slot i for each range pair.
-            if (dRange < numSrcDescriptorRanges) {
-                SIZE_T srcPtr = pSrcDescriptorRangeStarts[dRange].ptr + (SIZE_T)i * incrementSize;
-                if (isRtv) {
-                    auto it = g_rtvMap.find(srcPtr);
-                    if (it != g_rtvMap.end()) {
-                        ID3D12Resource* res = it->second;
-                        g_rtvMap[destPtr] = res;
-                        if (res == g_mvResource || res == g_mvResourceAlt) {
-                            g_mvLastTouchPresent = now;
-                            g_mvStamp = g_frameCounter;
-                        }
-                    }
-                } else {
-                    auto it = g_srvMap.find(srcPtr);
-                    if (it != g_srvMap.end()) {
-                        ID3D12Resource* res = it->second;
-                        g_srvMap[destPtr] = res;
-                        if (res == g_mvResource || res == g_mvResourceAlt) {
-                            g_mvLastTouchPresent = now;
-                            g_mvStamp = g_frameCounter;
-                        }
-                    }
-                }
-            }
+    std::map<SIZE_T, ID3D12Resource*>& mapping =
+        DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ? g_rtvMap :
+        DescriptorHeaps == D3D12_DESCRIPTOR_HEAP_TYPE_DSV ? g_dsvMap : g_srvMap;
+
+    // CopyDescriptors concatenates source ranges and destination ranges; the
+    // range indexes are NOT paired. Snapshot the flattened source sequence
+    // before invalidating destinations so overlapping copies remain correct.
+    UINT destTotal = 0, srcTotal = 0;
+    bool bounded = true;
+    for (UINT r = 0; r < numDestDescriptorRanges; ++r) {
+        const UINT n = pDestDescriptorCounts ? pDestDescriptorCounts[r] : 1;
+        if (n > kMaxTrackedCopy - destTotal) { bounded = false; break; }
+        destTotal += n;
+    }
+    for (UINT r = 0; r < numSrcDescriptorRanges; ++r) {
+        const UINT n = pSrcDescriptorCounts ? pSrcDescriptorCounts[r] : 1;
+        if (n > kMaxTrackedCopy - srcTotal) { bounded = false; break; }
+        srcTotal += n;
+    }
+
+    // Invalid or oversized operations cannot safely be resolved. Invalidate
+    // known destination mappings so they cannot masquerade as current data.
+    if (!bounded || destTotal != srcTotal) {
+        for (UINT r = 0; r < numDestDescriptorRanges; ++r) {
+            const UINT n = pDestDescriptorCounts ? pDestDescriptorCounts[r] : 1;
+            EraseDescriptorMappingRange(mapping, pDestDescriptorRangeStarts[r].ptr, n, incrementSize);
+        }
+        return;
+    }
+
+    ID3D12Resource* copied[kMaxTrackedCopy] = {};
+    UINT flat = 0;
+    for (UINT r = 0; r < numSrcDescriptorRanges; ++r) {
+        const UINT n = pSrcDescriptorCounts ? pSrcDescriptorCounts[r] : 1;
+        for (UINT i = 0; i < n; ++i, ++flat) {
+            if ((SIZE_T)i > ((~(SIZE_T)0) - pSrcDescriptorRangeStarts[r].ptr) / incrementSize)
+                continue;
+            const SIZE_T srcPtr = pSrcDescriptorRangeStarts[r].ptr + (SIZE_T)i * incrementSize;
+            auto it = mapping.find(srcPtr);
+            if (it != mapping.end()) copied[flat] = it->second;
+        }
+    }
+
+    for (UINT r = 0; r < numDestDescriptorRanges; ++r) {
+        const UINT n = pDestDescriptorCounts ? pDestDescriptorCounts[r] : 1;
+        EraseDescriptorMappingRange(mapping, pDestDescriptorRangeStarts[r].ptr, n, incrementSize);
+    }
+
+    flat = 0;
+    for (UINT r = 0; r < numDestDescriptorRanges; ++r) {
+        const UINT n = pDestDescriptorCounts ? pDestDescriptorCounts[r] : 1;
+        for (UINT i = 0; i < n; ++i, ++flat) {
+            if (!copied[flat] ||
+                (SIZE_T)i > ((~(SIZE_T)0) - pDestDescriptorRangeStarts[r].ptr) / incrementSize)
+                continue;
+            const SIZE_T destPtr = pDestDescriptorRangeStarts[r].ptr + (SIZE_T)i * incrementSize;
+            mapping[destPtr] = copied[flat];
         }
     }
 }
@@ -6313,6 +6647,22 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     g_injStep = "gated";
     bool bridgeOk = true;
     bool doDlss = g_dlaaMode && !g_dlaaHalted && g_upscaler && g_upscaler->IsReady() && g_dlssOutValid;
+    if (doDlss && InterlockedCompareExchange(&g_sceneAddressReuseDetected, 0, 0)) {
+        static volatile LONG s_sceneReuseGateLogs = 0;
+        if (InterlockedIncrement(&s_sceneReuseGateLogs) <= 3)
+            Log("hooks: DLAA blocked - scene resource address generation changed; legacy scene identity is unproven");
+        doDlss = false;
+    }
+    if (doDlss &&
+        (!ResourceGenerationMatches(g_mvResource,
+             InterlockedCompareExchange64(&g_mvResourceGeneration, 0, 0)) ||
+         !ResourceGenerationMatches(g_depthResource,
+             InterlockedCompareExchange64(&g_depthResourceGeneration, 0, 0)))) {
+        static volatile LONG s_reuseGateLogs = 0;
+        if (InterlockedIncrement(&s_reuseGateLogs) <= 3)
+            Log("hooks: DLAA blocked - MV/depth resource generation is stale or unknown");
+        doDlss = false;
+    }
     if (doDlss) {
         // STALENESS INVALIDATION: if depth/MV stamps are too old, the tracked
         // pointers likely reference freed engine resources. Null them out so
@@ -6377,8 +6727,8 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                     mvStale ? fc2 - g_mvStamp : 0);
             doDlss = false;
             // Null the stale pointers so the null guard catches them next frame
-            if (depthStale) { g_depthResource = nullptr; g_depthValid = false; g_depthSrvSourced = false; g_depthLastTouchPresent = 0; }
-            if (mvStale) { g_mvResource = nullptr; g_mvValid = false; g_mvLastTouchPresent = 0; }
+            if (depthStale) { g_depthResource = nullptr; SetTrackedResourceGeneration(&g_depthResource, nullptr); g_depthValid = false; g_depthSrvSourced = false; g_depthLastTouchPresent = 0; }
+            if (mvStale) { g_mvResource = nullptr; SetTrackedResourceGeneration(&g_mvResource, nullptr); g_mvValid = false; g_mvLastTouchPresent = 0; }
         }
     }
     if (doDlss && g_dlssOut) {
@@ -6484,9 +6834,7 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                         else {
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
-                        g_mvLastTouchPresent = SceneSetNow();
                         if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
-                        g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
                         }
                     }
@@ -7253,8 +7601,21 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         // Staging buffers release in the eval path once fenced (below).
         HRESULT uhr = S_OK;
         if (ok && (g_shMvUp || g_shDepthUp) && g_shAlloc[0] && g_shList[0]) {
-            if (FAILED(g_shAlloc[0]->Reset())) uhr = E_FAIL;
-            if (SUCCEEDED(uhr) && FAILED(g_shList[0]->Reset(g_shAlloc[0], nullptr))) uhr = E_FAIL;
+            HRESULT uploadAllocResetHr = g_shAlloc[0]->Reset();
+            HRESULT uploadListResetHr = SUCCEEDED(uploadAllocResetHr)
+                ? g_shList[0]->Reset(g_shAlloc[0], nullptr) : E_FAIL;
+            if (FAILED(uploadAllocResetHr) || FAILED(uploadListResetHr)) {
+                // Initialization has its own allocator/list Reset site, before
+                // the normal eval Reset guard below. Fail closed here too:
+                // never let partially initialized zero inputs reach Evaluate
+                // on a later Present after this private recorder is unusable.
+                LONG resetStreak = InterlockedIncrement(&s_shResetStreak);
+                InterlockedExchange(&s_shHalted, 1);
+                Log("hooks: shadow-eval HALTED after upload allocator/list Reset failure (streak=%ld alloc=0x%08X list=0x%08X present %llu) - presenting unmodified",
+                    resetStreak, (unsigned)uploadAllocResetHr, (unsigned)uploadListResetHr,
+                    presentSerial);
+                uhr = E_FAIL;
+            }
             if (SUCCEEDED(uhr)) {
                 D3D12_TEXTURE_COPY_LOCATION udst = {};
                 udst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -7373,52 +7734,18 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     HRESULT shListHr = FAILED(shAllocHr) ? E_FAIL : g_shList[slot]->Reset(g_shAlloc[slot], nullptr);
     if (FAILED(shAllocHr) || FAILED(shListHr)) {
         static volatile LONG s_shResetFails = 0;
-        // Streak heartbeat: reset-death is otherwise silent after 5 logs
-        // while presents continue, indistinguishable from healthy idle.
-        // Cleared on any successful submit below. No halt attached: the
-        // path is already dead; halting would only freeze the user's F-keys.
+        // A failed Reset means this ScaleNG-owned allocator/list is unusable.
+        // Repeated Reset/recreate attempts previously flooded E_FAIL and could
+        // fault again while the game continued presenting. Stop the shadow
+        // path immediately; Hook_Present then forwards the untouched game frame.
         LONG rc = InterlockedIncrement(&s_shResetStreak);
         if (InterlockedIncrement(&s_shResetFails) <= 5 || (rc % 600) == 0)
             Log("hooks: shadow-eval allocator/list reset failed (src=RESET-DEAD streak=%ld alloc=0x%08X list=0x%08X completed=%llu expected=%llu)",
                 rc, (unsigned)shAllocHr, (unsigned)shListHr,
                 shCompleted, (unsigned long long)g_shFenceDone[slot]);
-        // ONE-SHOT self-heal attempt (2026-10-08): persistent allocator/list
-        // death (e.g. 154828Z) left the path dead until process restart.
-        // Safe only when the GPU has actually drained our fence AND the
-        // device reports not-removed; otherwise stay dead (fail closed).
-        // Attempts are session-bounded; failure leaves the dead state.
-        if (s_shResetStreak >= 10 &&
-            shCompleted >= g_shFenceDone[slot] &&     // actual recorded value
-            (g_shUpFenceVal == 0 || shCompleted >= g_shUpFenceVal) &&
-            SUCCEEDED(g_device->GetDeviceRemovedReason())) {
-            static volatile LONG s_shRecreateLogs = 0;
-            if (InterlockedIncrement(&s_shRecreateLogs) <= 3) {
-                Log("hooks: shadow-eval recreate attempt (fence drained, device ok, streak=%ld)",
-                    (long)InterlockedCompareExchange(&s_shResetStreak, 0, 0));
-            }
-            __try {
-                if (g_shList[slot]) { g_shList[slot]->Close(); g_shList[slot]->Release(); g_shList[slot] = nullptr; }
-                if (g_shAlloc[slot]) { g_shAlloc[slot]->Release(); g_shAlloc[slot] = nullptr; }
-                if (g_shList[0]) { g_shList[0]->Close(); g_shList[0]->Release(); g_shList[0] = nullptr; }
-                if (g_shList[1]) { g_shList[1]->Close(); g_shList[1]->Release(); g_shList[1] = nullptr; }
-                if (g_shAlloc[0]) { g_shAlloc[0]->Release(); g_shAlloc[0] = nullptr; }
-                if (g_shAlloc[1]) { g_shAlloc[1]->Release(); g_shAlloc[1] = nullptr; }
-                if (g_shFence) { g_shFence->Release(); g_shFence = nullptr; }
-                g_shFenceNext = 0;          // avoid stale-fence gate forever-skipping
-                g_shFenceDone[0] = g_shFenceDone[1] = 0;
-                g_shUpFenceVal = 0;
-                // Re-enter the lazy infra builder (fence/alloc/lists/textures).
-                // bb is still alive here (released below) — the rebuild path
-                // runs only its creation logic; per-eval work resumes next
-                // present. If any creation step fails, s_shInit is re-armed by
-                // the builder and this slot stays dead (fail closed).
-                InterlockedExchange(&s_shInit, 0);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                static volatile LONG s_shRecreateFaults = 0;
-                if (InterlockedIncrement(&s_shRecreateFaults) <= 3)
-                    Log("hooks: shadow-eval recreate faulted (code 0x%08X)", (unsigned)GetExceptionCode());
-            }
-        }
+        InterlockedExchange(&s_shHalted, 1);
+        Log("hooks: shadow-eval HALTED after ScaleNG-owned allocator/list Reset failure (present %llu) - presenting unmodified",
+            presentSerial);
         bb->Release();
         return;
     }
@@ -7461,12 +7788,18 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     D3D12_RESOURCE_STATES depthBefore = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* mvCand = nullptr;   // selected engine MV candidate (scope for diagnostics)
     ID3D12Resource* depCand = nullptr;  // selected engine depth candidate (scope for diagnostics)
+    LONG64 mvGeneration = 0;
+    LONG64 depthGeneration = 0;
     if (g_shadowRealInputs) {
         realWhy = "unchecked";
         ID3D12Resource* mv = g_mvResource;
         ID3D12Resource* dep = g_depthResource;
+        mvGeneration = InterlockedCompareExchange64(&g_mvResourceGeneration, 0, 0);
+        depthGeneration = InterlockedCompareExchange64(&g_depthResourceGeneration, 0, 0);
+        bool mvGenerationCurrent = ResourceGenerationMatches(mv, mvGeneration);
+        bool depthGenerationCurrent = ResourceGenerationMatches(dep, depthGeneration);
         D3D12_RESOURCE_DESC mvd = {}, depd = {};
-        bool mvAlive = mv && SafeGetDesc(mv, &mvd);
+        bool mvAlive = mvGenerationCurrent && mv && SafeGetDesc(mv, &mvd);
         // MV rotation: the engine renders into a fresh R16G16F target most
         // frames (primary + ALT pattern in every run). A retired OR
         // wrong-sized primary must not pin us to zeros while a live,
@@ -7474,31 +7807,38 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         // live 1920x1080 ALTs all run).
         if ((!mvAlive || mvd.Format != DXGI_FORMAT_R16G16_FLOAT ||
              mvd.Width != g_displayW || mvd.Height != g_displayH) &&
-            g_mvResourceAlt && SafeGetDesc(g_mvResourceAlt, &mvd)) {
+            g_mvResourceAlt &&
+            ResourceGenerationMatches(g_mvResourceAlt,
+                InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0)) &&
+            SafeGetDesc(g_mvResourceAlt, &mvd)) {
             mv = g_mvResourceAlt;
+            mvGeneration = InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0);
+            mvGenerationCurrent = true;
             mvAlive = true;
         }
         mvCand = mv; depCand = dep;
-        bool depAlive = dep && SafeGetDesc(dep, &depd);
-        if (!g_mvValid || !mv) realWhy = "no-mv";
+        bool depAlive = depthGenerationCurrent && dep && SafeGetDesc(dep, &depd);
+        if (InterlockedCompareExchange(&g_resourceAddressGenerationOverflow, 0, 0))
+            realWhy = "resource-generation-overflow";
+        else if (!g_mvValid || !mv) realWhy = "no-mv";
+        else if (!mvGenerationCurrent) realWhy = "mv-generation-stale";
         else if (!mvAlive) realWhy = "mv-retired";
         else if (mvd.Format != DXGI_FORMAT_R16G16_FLOAT) realWhy = "mv-format";
         else if (IsOwnResource(mv) || IsOwnResource(dep)) realWhy = "self-input";
         else if (mvd.Width != g_displayW || mvd.Height != g_displayH) realWhy = "mv-size";
         else if (!g_depthValid || !dep) realWhy = "no-depth";
+        else if (!depthGenerationCurrent) realWhy = "depth-generation-stale";
         else if (!depAlive) realWhy = "depth-retired";
         else if (g_depthRealFmt == DXGI_FORMAT_UNKNOWN || g_depthMsaa) realWhy = "depth-fmt";
         else if (depd.Width != g_displayW || depd.Height != g_displayH) realWhy = "depth-size";
         else if (g_frameCounter < g_mvStamp || g_frameCounter - g_mvStamp > 10) realWhy = "mv-stale";
         else if (g_frameCounter < g_depthStamp || g_frameCounter - g_depthStamp > 20000) realWhy = "depth-stale";
-        // Same-frame proof: the camera clock above can freeze (g_frameCounter
-        // stops advancing when the engine stops patching camera CBs), making
-        // the 10/20000-frame gates certify week-old resources as "fresh".
-        // g_presentSerial advances on every Present, so the gap between
-        // the current present and the last barrier observed on each input
-        // proves the engine touched them within a real frame interval.
-        // Threshold 3 covers double/triple buffering. Zero = no barrier
-        // observed since adoption (fail closed — never certify unknown).
+        // Present-serial observation-age heuristic. The observations are made
+        // while command lists are recorded; they can precede execution and do
+        // not prove a write or associate the resource contents with this color
+        // frame. Threshold 3 only bounds how recently a hook saw a qualifying
+        // bind/barrier; it is NOT a same-frame guarantee. Zero means no such
+        // observation was seen and remains fail-closed.
         else if (g_mvLastTouchPresent == 0) realWhy = "mv-no-observation";
         else if (presentSerial - g_mvLastTouchPresent > 3) realWhy = "mv-stale-present";
         else if (g_depthLastTouchPresent == 0) realWhy = "depth-no-observation";
@@ -7517,6 +7857,22 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
                 Barrier(list, inDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             }
         }
+    }
+    // Re-check after candidate validation. A changed per-address generation
+    // means this slot was retired/reused; restore the entry states and fall
+    // back instead of submitting ambiguous inputs.
+    if (useReal && (!ResourceGenerationMatches(inMv, mvGeneration) ||
+                    !ResourceGenerationMatches(inDepth, depthGeneration))) {
+        Barrier(list, inMv, mvBefore);
+        Barrier(list, inDepth, depthBefore);
+        inMv = g_shMv;
+        inDepth = g_shDepth;
+        mvCand = nullptr;
+        depCand = nullptr;
+        mvScaleX = 1.0f;
+        mvScaleY = 1.0f;
+        useReal = false;
+        realWhy = "resource-generation-changed";
     }
     // Source-class evidence (logging only): pointer identity of the SELECTED
     // inputs against the owned zero placeholders (g_shMv/g_shDepth). Fallback
@@ -7585,6 +7941,25 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     ep.jitterX = 0.0f; ep.jitterY = 0.0f;
     ep.mvScaleX = mvScaleX; ep.mvScaleY = mvScaleY;
     ep.sharpness = g_cfg.sharpness;
+    // Final fail-closed check closes the interval between candidate logging
+    // and the NGX call. If a collision arrived after the earlier check, undo
+    // the real-input transitions and change the submitted parameters to the
+    // proven placeholder pair.
+    if (useReal && (!ResourceGenerationMatches(inMv, mvGeneration) ||
+                    !ResourceGenerationMatches(inDepth, depthGeneration))) {
+        Barrier(list, inMv, mvBefore);
+        Barrier(list, inDepth, depthBefore);
+        inMv = g_shMv;
+        inDepth = g_shDepth;
+        ep.depth = inDepth;
+        ep.motionVectors = inMv;
+        ep.mvScaleX = 1.0f;
+        ep.mvScaleY = 1.0f;
+        useReal = false;
+        realWhy = "resource-generation-changed";
+        Log("hooks: shadow-eval inputs ZERO why=resource-generation-changed mvClass=PLACEHOLDER depthClass=PLACEHOLDER present=%llu (forced immediately before NGX call)",
+            presentSerial);
+    }
     bool ok = g_upscaler->Evaluate(ep);
     // All post-eval driver calls (restore, handoff record, Close, submit)
     // run under ONE guard: a faulted NGX record poisons recorder state and
@@ -7677,13 +8052,29 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         if (useReal) NoteTrackedStates(inMv, mvBefore, inDepth, depthBefore);
         __try {
             list->Close();
-            g_shAlloc[slot]->Reset();
-            g_shList[slot]->Reset(g_shAlloc[slot], nullptr);
-            g_shList[slot]->Close();
+            HRESULT discardAllocHr = g_shAlloc[slot]->Reset();
+            HRESULT discardListHr = FAILED(discardAllocHr) ? E_FAIL :
+                g_shList[slot]->Reset(g_shAlloc[slot], nullptr);
+            if (FAILED(discardAllocHr) || FAILED(discardListHr)) {
+                LONG resetStreak = InterlockedIncrement(&s_shResetStreak);
+                InterlockedExchange(&s_shHalted, 1);
+                Log("hooks: shadow-eval HALTED after discard allocator/list Reset failure (streak=%ld alloc=0x%08X list=0x%08X present %llu) - presenting unmodified",
+                    resetStreak, (unsigned)discardAllocHr, (unsigned)discardListHr,
+                    presentSerial);
+            } else {
+                HRESULT discardCloseHr = g_shList[slot]->Close();
+                if (FAILED(discardCloseHr)) {
+                    InterlockedExchange(&s_shHalted, 1);
+                    Log("hooks: shadow-eval HALTED after discard list Close failure hr=0x%08X (present %llu) - presenting unmodified",
+                        (unsigned)discardCloseHr, presentSerial);
+                }
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             static volatile LONG s_shDiscardFaults = 0;
+            InterlockedExchange(&s_shHalted, 1);
             if (InterlockedIncrement(&s_shDiscardFaults) <= 3)
-                Log("hooks: shadow-eval discard faulted (code 0x%08X)", (unsigned)GetExceptionCode());
+                Log("hooks: shadow-eval HALTED after discard fault (code 0x%08X present %llu) - presenting unmodified",
+                    (unsigned)GetExceptionCode(), presentSerial);
         }
     }
     bb->Release();
@@ -8935,8 +9326,10 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     if (g_sceneColorAlt) {
                         // Weak pointer: may be freed since adoption. A fault
                         // here means dead ALT - clear it for replacement.
-                        if (!Local::AltIsPairHalf(g_sceneColorAlt))
+                        if (!Local::AltIsPairHalf(g_sceneColorAlt)) {
                             g_sceneColorAlt = nullptr;
+                            SetTrackedResourceGeneration(&g_sceneColorAlt, nullptr);
+                        }
                     }
                     if (!srcIsTracked && !g_sceneColorAlt) {
                         // Metadata only on a real store (self-adopt guard).
@@ -9054,15 +9447,10 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                 else {
                 g_depthValid = true;
                 g_depthStamp = g_frameCounter;
-                g_depthLastTouchPresent = SceneSetNow();
                 {
                     g_depthRealFmt = ddg.Format;
                     g_depthMsaa = ddg.SampleDesc.Count != 1;
                 }
-                BookGuard _bgCopy;
-        auto it = g_resourceStates.find(dst->pResource);
-                if (it == g_resourceStates.end())
-                    g_resourceStates[dst->pResource] = D3D12_RESOURCE_STATE_COPY_DEST;
                 static int s_depthCandidates = 0;
                 if (s_depthCandidates < 8) {
                     ++s_depthCandidates;
@@ -9220,17 +9608,15 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                 ID3D12Resource* res = pBarriers[i].Transition.pResource;
                 if (res) {
                     { BookGuard _bgRb; g_resourceStates[res] = pBarriers[i].Transition.StateAfter; }
-                    // LIVENESS: the engine transitions depth/MV every frame it
-                    // uses them. Refresh stamps so the staleness gate (which
-                    // protects against freed resources) only trips on real
-                    // renderer transitions, not on normal steady-state play.
-                    // Frame-counter stamp (camera clock — may freeze).
+                    // Observation recency only: a recorded transition is not
+                    // proof the list executed, nor that a draw wrote this
+                    // resource. Never interpret these stamps as same-frame data.
                     if (res == g_depthResource)
                         g_depthStamp = g_frameCounter;
                     if (res == g_mvResource || res == g_mvResourceAlt)
                         g_mvStamp = g_frameCounter;
-                    // Present-serial stamp: the reliable same-frame signal.
-                    // Camera clock freezes; presentSerial always advances.
+                    // Present serial is only the time at which this hook saw
+                    // the recorded barrier; the command list may be replayed.
                     if (res == g_depthResource)
                         g_depthLastTouchPresent = SceneSetNow();
                     if (res == g_mvResource || res == g_mvResourceAlt)
@@ -9247,28 +9633,30 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                             !IsOwnResource(res)) {
                             if (brd.Format == DXGI_FORMAT_R16G16_FLOAT) {
                                 if (res != g_mvResource && res != g_mvResourceAlt) {
-                                    StoreTracked(&g_mvResourceAlt, res);
-                                    g_mvStamp = g_frameCounter;
-                                    if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
-                                    g_mvW = (unsigned int)brd.Width; g_mvH = (unsigned int)brd.Height;
-                                    static int s_broadMvLog = 0;
-                                    if (s_broadMvLog++ < 4)
-                                        Log("hooks: MV broad-adopt on barrier %p (%ux%u)",
-                                            (void*)res, (unsigned)brd.Width, (unsigned)brd.Height);
+                                    if (StoreTracked(&g_mvResourceAlt, res)) {
+                                        g_mvStamp = g_frameCounter;
+                                        if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
+                                        g_mvW = (unsigned int)brd.Width; g_mvH = (unsigned int)brd.Height;
+                                        static int s_broadMvLog = 0;
+                                        if (s_broadMvLog++ < 4)
+                                            Log("hooks: MV broad-adopt on barrier %p (%ux%u)",
+                                                (void*)res, (unsigned)brd.Width, (unsigned)brd.Height);
+                                    }
                                 }
                                 g_mvLastTouchPresent = SceneSetNow();
                                 g_mvStamp = g_frameCounter;
                             }
                             if (IsDepthFamilyFormat((unsigned)brd.Format)) {
                                 if (res != g_depthResource) {
-                                    StoreTracked(&g_depthResource, res);
-                                    g_depthStamp = g_frameCounter;
-                                    g_depthValid = true;
-                                    g_depthRealFmt = brd.Format;
-                                    static int s_broadDepLog = 0;
-                                    if (s_broadDepLog++ < 4)
-                                        Log("hooks: depth broad-adopt on barrier %p (%ux%u fmt=%u)",
-                                            (void*)res, (unsigned)brd.Width, (unsigned)brd.Height, (unsigned)brd.Format);
+                                    if (StoreTracked(&g_depthResource, res)) {
+                                        g_depthStamp = g_frameCounter;
+                                        g_depthValid = true;
+                                        g_depthRealFmt = brd.Format;
+                                        static int s_broadDepLog = 0;
+                                        if (s_broadDepLog++ < 4)
+                                            Log("hooks: depth broad-adopt on barrier %p (%ux%u fmt=%u)",
+                                                (void*)res, (unsigned)brd.Width, (unsigned)brd.Height, (unsigned)brd.Format);
+                                    }
                                 }
                                 g_depthLastTouchPresent = SceneSetNow();
                                 g_depthStamp = g_frameCounter;
@@ -9311,7 +9699,9 @@ void Hook_SetDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT numHeaps,
 // on every invocation and from Hook_OMSetRenderTargets below.
 // Newly-live GetDesc calls use the guarded form (previously ran only under
 // the bridge-era gate, now reachable on the record path).
-static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets)
+static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRenderTargets,
+                                   const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargets,
+                                   const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencil)
 {
     if (numRenderTargets >= 1 && pRenderTargets) {
         g_boundRtv = pRenderTargets[0];
@@ -9375,7 +9765,6 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                     g_sceneColorRtv = pRenderTargets[0];
                     g_sceneColorValid = true;
                     AdoptDisplaySize((unsigned int)rd.Width, (unsigned int)rd.Height);
-                    g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     Log("hooks: scene color adopted from RTV bind %p (%ux%u)", (void*)g_sceneColor,
                         (unsigned int)rd.Width, (unsigned int)rd.Height);
                     SceneSetNote(g_sceneColor, (unsigned int)rd.Width, (unsigned int)rd.Height,
@@ -9415,26 +9804,43 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                         // No log on this path by design (per-frame bind frequency).
                         if (!StoreTracked(&g_mvResource, g_boundRtvResource)) { /* keep prior MV metadata */ }
                         else {
+                        // A current RTV mapping was resolved from this bind;
+                        // that concrete view observation refreshes the token.
+                        SetTrackedResourceGeneration(&g_mvResource, g_boundRtvResource);
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
                         g_mvLastTouchPresent = SceneSetNow();
                         if (first) g_mvFirstValidFrame = g_frameCounter;
-                        g_resourceStates[g_mvResource] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         }
                     }
                 }
             }
-            // Touch tracking for SAME-RESOURCE re-bind: the engine may bind the
-            // SAME MV RTV every frame without re-creating it (no new pointer to
-            // trip the adoption branch above). Without this, engines that rely
-            // on D3D12 implicit COMMON-state transitions (no explicit
-            // ResourceBarrier on the MV texture) never update
-            // g_mvLastTouchPresent, making the freshness check always fail.
+            // Same-list bind observation for an already-known MV. This is
+            // useful for candidate recency, but does NOT prove a draw occurred
+            // or that a replayed command list belongs to the current Present.
             if (g_boundRtvResource == g_mvResource || g_boundRtvResource == g_mvResourceAlt) {
+                bool currentViewMapping = false;
+                {
+                    BookGuard _bgCurrentView;
+                    auto currentView = g_rtvMap.find(g_boundRtv.ptr);
+                    currentViewMapping = currentView != g_rtvMap.end() &&
+                                         currentView->second == g_boundRtvResource;
+                }
+                if (currentViewMapping) {
+                    if (g_boundRtvResource == g_mvResource)
+                        SetTrackedResourceGeneration(&g_mvResource, g_boundRtvResource);
+                    else
+                        SetTrackedResourceGeneration(&g_mvResourceAlt, g_boundRtvResource);
+                }
                 g_mvLastTouchPresent = SceneSetNow();
-            }
-            if (g_boundRtvResource == g_depthResource) {
-                g_depthLastTouchPresent = SceneSetNow();
+                static volatile LONG64 s_mvOmBindCount = 0;
+                LONG64 observed = InterlockedIncrement64(&s_mvOmBindCount);
+                if (observed <= 10 || (observed % 500) == 0)
+                    Log("hooks: mv-om-bind observed=%llu list=%p res=%p rtv=%llX present=%llu ecl=%llu",
+                        (unsigned long long)observed, (void*)list, (void*)g_boundRtvResource,
+                        (unsigned long long)pRenderTargets[0].ptr,
+                        (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                        (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
             }
             // The engine re-creates its scene target from time to time but keeps
             // reusing the same CPU descriptor slot. Refresh the tracked scene
@@ -9449,7 +9855,6 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
                 g_boundRtv.ptr == g_sceneColorRtv.ptr &&
                 g_boundRtvResource != g_sceneColor) {
                 StoreTracked(&g_sceneColor, g_boundRtvResource);
-                g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 Log("hooks: scene color refreshed on bind %p", (void*)g_sceneColor);
                 D3D12_RESOURCE_DESC rd = {};
                 if (SafeGetDesc(g_sceneColor, &rd) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
@@ -9483,6 +9888,37 @@ static ID3D12Resource* TrackOMBind(UINT numRenderTargets, const D3D12_CPU_DESCRI
         g_boundRtvValid = false;
         g_boundRtvResource = nullptr;
     }
+    if (pDepthStencil && pDepthStencil->ptr) {
+        ID3D12Resource* boundDepth = nullptr;
+        {
+            BookGuard depthGuard;
+            auto depthIt = g_dsvMap.find(pDepthStencil->ptr);
+            if (depthIt != g_dsvMap.end()) boundDepth = depthIt->second;
+        }
+        // A DSV bind is stronger identity evidence than SRV creation, but still
+        // does not prove that a depth-writing draw executed in this Present.
+        if (boundDepth) {
+            const bool selectedDepth = boundDepth == g_depthResource;
+            if (selectedDepth) g_depthLastTouchPresent = SceneSetNow();
+            static volatile LONG64 s_depthOmBindCount = 0;
+            LONG64 observed = InterlockedIncrement64(&s_depthOmBindCount);
+            if (observed <= 10 || (observed % 500) == 0)
+            {
+                D3D12_RESOURCE_DESC boundDesc = {};
+                const bool descOk = SafeGetDesc(boundDepth, &boundDesc);
+                Log("hooks: depth-om-bind observed=%llu list=%p res=%p selected=%d selectedRes=%p dsv=%llX descOk=%d size=%ux%u fmt=%u samples=%u present=%llu ecl=%llu",
+                    (unsigned long long)observed, (void*)list, (void*)boundDepth,
+                    selectedDepth ? 1 : 0, (void*)g_depthResource,
+                    (unsigned long long)pDepthStencil->ptr, descOk ? 1 : 0,
+                    descOk ? (unsigned)boundDesc.Width : 0,
+                    descOk ? (unsigned)boundDesc.Height : 0,
+                    descOk ? (unsigned)boundDesc.Format : 0,
+                    descOk ? (unsigned)boundDesc.SampleDesc.Count : 0,
+                    (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                    (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+            }
+        }
+    }
     // Bind recency for rotation tracking (members only; unknown pointers are
     // ignored here - creation/adoption paths are the entry gates).
     SceneSetTouch(g_boundRtvResource);
@@ -9501,7 +9937,7 @@ void Hook_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT numRenderTarg
                                 RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
         return;
     }
-    TrackOMBind(numRenderTargets, pRenderTargets);
+    TrackOMBind(list, numRenderTargets, pRenderTargets, pDepthStencilDescriptor);
     if (Real_OMSetRenderTargets) Real_OMSetRenderTargets(list, numRenderTargets, pRenderTargets,
                             RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
 }
@@ -9821,43 +10257,46 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                     Real_CreateShaderResourceView = (PFN_CreateShaderResourceView)vtbl[18];
                 if (!Real_CreateRenderTargetView)
                     Real_CreateRenderTargetView = (PFN_CreateRenderTargetView)vtbl[20];
+                if (!Real_CreateDepthStencilView)
+                    Real_CreateDepthStencilView = (PFN_CreateDepthStencilView)vtbl[21];
                 if (!Real_CreateCommittedResource)
                     Real_CreateCommittedResource = (PFN_CreateCommittedResource)vtbl[27];
                 if (!Real_CreatePlacedResource)
                     Real_CreatePlacedResource = (PFN_CreatePlacedResource)vtbl[29];
                 if (!Real_CreateReservedResource)
                     Real_CreateReservedResource = (PFN_CreateReservedResource)vtbl[30];
-                // CopyDescriptors (16) / CopyDescriptorsSimple (17):
+                // CopyDescriptors (23) / CopyDescriptorsSimple (24):
                 // SDK-verified slots for ID3D12Device. These copy descriptor
                 // handles between CPU-visible heaps. Tracking them lets us
                 // propagate g_rtvMap/g_srvMap handle→resource entries to
                 // shader-visible heaps, closing the gap where the engine
                 // copies RTV/SRV handles before binding them.
                 if (!Real_CopyDescriptors)
-                    Real_CopyDescriptors = (PFN_CopyDescriptors)vtbl[16];
+                    Real_CopyDescriptors = (PFN_CopyDescriptors)vtbl[23];
                 if (!Real_CopyDescriptorsSimple)
-                    Real_CopyDescriptorsSimple = (PFN_CopyDescriptorsSimple)vtbl[17];
+                    Real_CopyDescriptorsSimple = (PFN_CopyDescriptorsSimple)vtbl[24];
                 vtbl[18] = (void*)&Hook_CreateShaderResourceView;
                 vtbl[20] = (void*)&Hook_CreateRenderTargetView;
+                vtbl[21] = (void*)&Hook_CreateDepthStencilView;
                 vtbl[27] = (void*)&Hook_CreateCommittedResource;
                 vtbl[29] = (void*)&Hook_CreatePlacedResource;
                 vtbl[30] = (void*)&Hook_CreateReservedResource;
-                // CopyDescriptors (slot 16) / CopyDescriptorsSimple (slot 17)
-                vtbl[16] = (void*)&Hook_CopyDescriptors;
-                vtbl[17] = (void*)&Hook_CopyDescriptorsSimple;
+                // CopyDescriptors (slot 23) / CopyDescriptorsSimple (slot 24)
+                vtbl[23] = (void*)&Hook_CopyDescriptors;
+                vtbl[24] = (void*)&Hook_CopyDescriptorsSimple;
                 vtbl[14] = (void*)&Hook_CreateDescriptorHeap;
                 vtbl[0] = (void*)&Shim_DeviceQI;
                 VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
                 g_hookedDeviceVtbl = (void*)vtbl;
-                Log("hooks: device vtable SWAPPED (16, 17, 18, 20, 27, 29, 30) on device %p vtbl=%p", (void*)newDev, (void*)vtbl);
+                Log("hooks: device vtable SWAPPED (18, 20, 21, 23, 24, 27, 29, 30) on device %p vtbl=%p", (void*)newDev, (void*)vtbl);
                 Log("hooks: device QI census installed (slot 0) vtbl=%p", (void*)vtbl);
                 Log("hooks: descriptor-heap inventory installed (slot 14) vtbl=%p", (void*)vtbl);
             } else {
                 Log("hooks: VirtualProtect on vtable failed - device hooks not installed on device %p", (void*)newDev);
             }
             {
-                void* targets[9] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateShaderResourceView, (void*)Hook_CreateCommittedResource, (void*)Hook_CreatePlacedResource, (void*)Hook_CreateReservedResource, (void*)&Shim_DeviceQI, (void*)&Hook_CreateDescriptorHeap, (void*)Hook_CopyDescriptors, (void*)Hook_CopyDescriptorsSimple };
-                CfgMarkValid(targets, 9);
+                void* targets[10] = { (void*)Hook_CreateRenderTargetView, (void*)Hook_CreateDepthStencilView, (void*)Hook_CreateShaderResourceView, (void*)Hook_CreateCommittedResource, (void*)Hook_CreatePlacedResource, (void*)Hook_CreateReservedResource, (void*)&Shim_DeviceQI, (void*)&Hook_CreateDescriptorHeap, (void*)Hook_CopyDescriptors, (void*)Hook_CopyDescriptorsSimple };
+                CfgMarkValid(targets, 10);
             }
             }
         }

@@ -36,35 +36,6 @@ FATAL_MARKERS = (
 USER32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
 
-def send_hotkey(vk_key: int) -> None:
-    """Simulate a key press+release using SendInput (modern replacement for
-    keybd_event). The plugin uses GetAsyncKeyState which reads the system
-    async key state updated by SendInput, so no window focus is needed.
-    """
-    if USER32 is None:
-        return
-    # Proper INPUT_KEYBOARD union via ctypes
-    class KEYBOARDINPUT(ctypes.Structure):
-        _fields_ = [
-            ("wVk", ctypes.c_ushort),
-            ("wScan", ctypes.c_ushort),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-    class _INPUT(ctypes.Union):
-        _fields_ = [("ki", KEYBOARDINPUT)]
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_ulong), ("ki", KEYBOARDINPUT)]
-    items = []
-    # key down
-    items.append(INPUT(type=1, ki=KEYBOARDINPUT(wVk=vk_key, wScan=0, dwFlags=0, time=0, dwExtraInfo=None)))
-    # key up
-    items.append(INPUT(type=1, ki=KEYBOARDINPUT(wVk=vk_key, wScan=0, dwFlags=0x0002, time=0, dwExtraInfo=None)))
-    arr = (INPUT * len(items))(*items)
-    USER32.SendInput(len(items), arr, ctypes.sizeof(INPUT))
-
-
 def dismiss_known_library_warning(process_id: int) -> bool:
     """Choose Cancel only on BeamNG's known third-party-library dialog."""
     if USER32 is None:
@@ -96,6 +67,87 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def parse_shadow_input_evidence(lines: list[str]) -> dict[str, object]:
+    """Parse class and recency records separately; recency is not frame proof."""
+    real_whys: list[str] = []
+    zero_whys: list[str] = []
+    real_records = zero_records = engine_pair_records = 0
+    real_ages: list[tuple[int, int]] = []
+    real_heartbeat_count = 0
+    last_mode = "unknown"
+    for line in lines:
+        mode_match = re.search(r"shadow-eval inputs (REAL|ZERO) why=", line)
+        if mode_match:
+            why_match = re.search(r"why=([A-Za-z-]+)", line)
+            why = why_match.group(1) if why_match else None
+            if mode_match.group(1) == "REAL":
+                real_records += 1
+                engine_pair_records += int("mvClass=ENGINE_MV" in line and
+                                           "depthClass=ENGINE_DEPTH" in line)
+                if why and why not in real_whys and len(real_whys) < 8:
+                    real_whys.append(why)
+                last_mode = "REAL"
+            else:
+                zero_records += 1
+                if why and why not in zero_whys and len(zero_whys) < 8:
+                    zero_whys.append(why)
+                last_mode = "ZERO"
+
+        # These per-Present records report whether selected pointers were REAL
+        # and their observation ages. The input-class record above is the
+        # authoritative resource-class evidence for an actual eval.
+        if "hooks: shadow-eval real-inputs" in line:
+            real_heartbeat_count += 1
+        age_match = re.search(
+            r"shadow-eval real-inputs .*?useReal=(\d).*?mvTouchAge=(\d+).*?depthTouchAge=(\d+)", line)
+        if age_match and age_match.group(1) == "1":
+            real_ages.append((int(age_match.group(2)), int(age_match.group(3))))
+    return {
+        "real_records": real_records,
+        "zero_records": zero_records,
+        "engine_pair_records": engine_pair_records,
+        "real_whys": real_whys,
+        "zero_whys": zero_whys,
+        "last_mode": last_mode,
+        "real_ages": real_ages,
+        "real_heartbeat_count": real_heartbeat_count,
+    }
+
+
+def set_ini_key(text: str, section_name: str, key_name: str, value: str) -> str:
+    """Set one key in an INI section while preserving other lines and newline style."""
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    section = None
+    section_end = len(lines)
+    key_index = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if section == section_name.casefold():
+                section_end = index
+                break
+            section = stripped[1:-1].strip().casefold()
+        elif section == section_name.casefold() and "=" in line:
+            current_key = line.split("=", 1)[0].strip().casefold()
+            if current_key == key_name.casefold():
+                key_index = index
+    replacement = f"{key_name}={value}{newline}"
+    if key_index is not None:
+        old = lines[key_index]
+        ending = "\r\n" if old.endswith("\r\n") else "\n" if old.endswith("\n") else ""
+        lines[key_index] = f"{key_name}={value}{ending}"
+    elif section_name.casefold() in [
+            line.strip()[1:-1].strip().casefold() for line in lines
+            if line.strip().startswith("[") and line.strip().endswith("]")]:
+        lines.insert(section_end, replacement)
+    else:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += newline
+        lines.extend([f"[{section_name}]{newline}", replacement])
+    return "".join(lines)
+
+
 def port_is_free(port: int) -> bool:
     with socket.socket() as sock:
         try:
@@ -115,8 +167,7 @@ def main() -> int:
     parser.add_argument("--skip-build", action="store_true", help="use existing dist artifacts")
     parser.add_argument("--no-deploy", action="store_true", help="test currently deployed plugin without copying files")
     parser.add_argument("--real-test", action="store_true",
-                        help="after gameplay ready, toggle F9 to REAL engine MV/depth inputs "
-                             "(F8 remains ON from INI shadowHandoff=1). Verifies mvTouchAge/depthTouchAge<=3.")
+                        help="temporarily start in REAL-input mode via INI (no synthetic keypress); restores the original INI")
     parser.add_argument("--extra-settle", type=int, default=10,
                         help="seconds to settle after F9 toggle before recording (default: 10)")
     args = parser.parse_args()
@@ -135,6 +186,9 @@ def main() -> int:
     baseline_size = 0
     live_lines: list[str] = []
     game_output_file = None
+    runtime_ini_path: Path | None = None
+    runtime_ini_original: bytes | None = None
+    runtime_ini_existed_before_run = False
 
     def check(name: str, passed: bool, detail: str = "") -> None:
         result["checks"][name] = {"passed": bool(passed), "detail": detail}
@@ -165,6 +219,15 @@ def main() -> int:
             raise RuntimeError("BeamNG is already running; close it so this run only controls its own process")
         if not port_is_free(args.port):
             raise RuntimeError(f"TCom port {args.port} is occupied; choose another with --port")
+
+        # Capture the user's runtime config before deployment can replace it.
+        # REAL-test cleanup must restore the pre-run state, not merely the
+        # just-deployed dist copy.
+        if args.real_test:
+            runtime_ini_path = PLUGINS / "ScaleNG.ini"
+            runtime_ini_existed_before_run = runtime_ini_path.is_file()
+            if runtime_ini_existed_before_run:
+                runtime_ini_original = runtime_ini_path.read_bytes()
 
         dist = ROOT / "dist"
         if not args.skip_build:
@@ -206,6 +269,21 @@ def main() -> int:
             if not config.is_file():
                 shutil.copy2(dist / "ScaleNG.ini", config)
                 result["deployment_backup_config"] = "not present before this run"
+        if args.real_test:
+            if not runtime_ini_path.is_file():
+                raise RuntimeError("REAL test requires a runtime ScaleNG.ini")
+            backup_config = run_dir / "runtime_ini_before_real_test.ini"
+            if runtime_ini_original is not None:
+                backup_config.write_bytes(runtime_ini_original)
+                current_config = runtime_ini_original.decode("utf-8-sig", errors="strict")
+            else:
+                current_config = runtime_ini_path.read_text(encoding="utf-8-sig", errors="strict")
+            runtime_ini_path.write_text(
+                set_ini_key(current_config, "ScaleNG", "realInputs", "1"),
+                encoding="utf-8", newline="")
+            result["real_test_ini_override"] = {
+                "key": "[ScaleNG] realInputs", "value": 1,
+                "backup": str(backup_config) if runtime_ini_original is not None else "file absent before run"}
         baseline_size = GAME_LOG.stat().st_size if GAME_LOG.exists() else 0
         baseline_log = GAME_LOG.read_bytes() if GAME_LOG.exists() else b""
         baseline_signature = hashlib.sha256(baseline_log).hexdigest()
@@ -268,33 +346,12 @@ def main() -> int:
         if not gameplay_ready:
             raise RuntimeError("Game did not reach freeroam with a vehicle before timeout")
 
-        if args.real_test:
-            # Toggle F9 to switch from zero placeholders to engine REAL MV/depth.
-            # F8 (shadowHandoff) stays ON per INI shadowHandoff=1 / realInputs=0 default.
-            # The shadow-eval hook may start 10-15s after gameplay_ready (engine
-            # needs to set up its first render pipeline). Sending F9 too early
-            # means the key is released before the hook begins checking it.
-            # Strategy: send F9 every 500ms for the first 20s of observation
-            # to guarantee detection once the hook is live.
-            result["real_test_toggle_sent"] = True
-            print("REAL test: sending F9 to enable REAL inputs (rebroadcast for 20s)", flush=True)
-
         observed_start = time.monotonic()
         log_offset = baseline_size
-        # Track whether the REAL-inputs toggle has been confirmed in logs.
-        f9_toggle_confirmed = False
         while time.monotonic() - observed_start < args.duration:
             if process is not None and process.poll() is not None:
                 result["errors"].append(f"BeamNG exited during test (code {process.returncode})")
                 break
-            # Re-broadcast F9 every loop iteration while we haven't seen the
-            # toggle confirmed in the log. The shadow-eval hotkey detection
-            # starts ~10-15s after gameplay_ready, so key presses before that
-            # window are harmless (s_f9Prev just stays false). Once confirmed,
-            # stop sending to avoid toggling back to ZERO.
-            now = time.monotonic()
-            if args.real_test and not f9_toggle_confirmed and now < 30.0:
-                send_hotkey(0x78)  # VK_F9
             try:
                 if GAME_LOG.exists():
                     size = GAME_LOG.stat().st_size
@@ -307,19 +364,9 @@ def main() -> int:
                         new_text = new.decode("utf-8", errors="replace")
                         new_lines = new_text.splitlines()
                         live_lines.extend(new_lines)
-                        # Check for F9 toggle confirmation in newly-read lines.
-                        if args.real_test and not f9_toggle_confirmed:
-                            for nl in new_lines:
-                                if "inputs REAL MV/depth" in nl and "(F9)" in nl:
-                                    f9_toggle_confirmed = True
-                                    print("REAL test: F9 toggle confirmed in log", flush=True)
-                                    break
             except OSError as exc:
                 result["errors"].append(f"Could not read plugin log: {exc}")
             time.sleep(1)
-
-        if args.real_test:
-            result["f9_toggle_confirmed"] = f9_toggle_confirmed
 
         fresh_log = GAME_LOG.read_bytes() if GAME_LOG.exists() else b""
         if hashlib.sha256(fresh_log).hexdigest() != baseline_signature:
@@ -382,53 +429,31 @@ def main() -> int:
                     continue
                 if value > shadow_eval_max_ok:
                     shadow_eval_max_ok = value
-        # Evidence-only: input-mode breakdown from "shadow-eval inputs"
-        # lines. Scoped to target_lines (current PID), same as shadow_ok.
-        # Defensive: match only "inputs (REAL|ZERO)" and "why=([A-Za-z-]+)";
-        # the remainder of inputs lines is free-form and must not be parsed.
-        shadow_input_real_lines = 0
-        shadow_input_zero_lines = 0
-        shadow_input_real_why: list[str] = []
-        shadow_input_zero_why: list[str] = []
-        # Touch-age tracking for REAL freshness proof (present-serial same-frame).
-        # mvTouchAge/depthTouchAge <= 3 on sustained REAL inputs lines is the
-        # falsifiable expectation (see STATUS.md). 9999 = never observed.
-        max_mv_touch_age_real = 0
-        max_depth_touch_age_real = 0
-        real_touch_age_violations = 0
-        last_input_mode = "unknown"
-        for line in target_lines:
-            mode_match = re.search(r"inputs (REAL|ZERO) why=", line)
-            if not mode_match:
-                continue
-            why_match = re.search(r"why=([A-Za-z-]+)", line)
-            why = why_match.group(1) if why_match else None
-            mv_age_match = re.search(r"mvTouchAge=(\d+)", line)
-            depth_age_match = re.search(r"depthTouchAge=(\d+)", line)
-            mv_touch = int(mv_age_match.group(1)) if mv_age_match else 9999
-            depth_touch = int(depth_age_match.group(1)) if depth_age_match else 9999
-            if mode_match.group(1) == "REAL":
-                shadow_input_real_lines += 1
-                if why and why not in shadow_input_real_why and len(shadow_input_real_why) < 8:
-                    shadow_input_real_why.append(why)
-                last_input_mode = "REAL"
-                if mv_touch > max_mv_touch_age_real:
-                    max_mv_touch_age_real = mv_touch
-                if depth_touch > max_depth_touch_age_real:
-                    max_depth_touch_age_real = depth_touch
-                if mv_touch > 3 or depth_touch > 3:
-                    real_touch_age_violations += 1
-            else:
-                shadow_input_zero_lines += 1
-                if why and why not in shadow_input_zero_why and len(shadow_input_zero_why) < 8:
-                    shadow_input_zero_why.append(why)
-                last_input_mode = "ZERO"
+        input_evidence = parse_shadow_input_evidence(target_lines)
+        shadow_input_real_lines = int(input_evidence["real_records"])
+        shadow_input_zero_lines = int(input_evidence["zero_records"])
+        shadow_input_real_why = input_evidence["real_whys"]
+        shadow_input_zero_why = input_evidence["zero_whys"]
+        real_eval_records = shadow_input_real_lines
+        real_class_complete_records = int(input_evidence["engine_pair_records"])
+        real_ages = input_evidence["real_ages"]
+        real_mode_heartbeat_records = int(input_evidence["real_heartbeat_count"])
+        real_touch_age_records = len(real_ages)
+        max_mv_touch_age_real = max((age[0] for age in real_ages), default=None)
+        max_depth_touch_age_real = max((age[1] for age in real_ages), default=None)
+        real_touch_age_violations = sum(1 for mv_age, depth_age in real_ages
+                                        if mv_age > 3 or depth_age > 3)
+        last_input_mode = input_evidence["last_mode"]
         shadow_input_total = shadow_input_real_lines + shadow_input_zero_lines
         if shadow_input_total == 0 and shadow_ok:
             shadow_input_note = "inputs_lines: 0 (modes unknown)"
         else:
             shadow_input_note = f"inputs_lines: {shadow_input_total}"
         eval_failures = [line for line in target_lines if "DLSS evaluate failed" in line or "EvaluateFeature failed" in line]
+        reset_failures = [line for line in target_lines if "shadow-eval allocator/list reset failed" in line.lower()
+                          or "shadow-eval reset failed" in line.lower()]
+        breaker_lines = [line for line in target_lines if any(marker in line.lower() for marker in (
+            "shadow-eval 30 consecutive faults", "shadow-eval halted", "dlaa halted"))]
         fatal = [line for line in target_lines if any(marker.lower() in line.lower() for marker in FATAL_MARKERS)]
         check("plugin_loaded_this_run", loaded, f"BeamNG PID {pid}; based on fresh log bytes")
         check("plugin_initialized", initialized, "fresh initialization-complete marker")
@@ -450,30 +475,42 @@ def main() -> int:
         check("no_fatal_markers", not fatal, f"{len(fatal)} fatal markers")
 
         if args.real_test:
-            # REAL mode freshness proof checks
-            check("real_inputs_observed", shadow_input_real_lines > 0,
-                  f"{shadow_input_real_lines} REAL input lines (expect >0 after F9 toggle)")
+            # Start mode is set via a temporary INI override, without sending
+            # keys to the game. Require the runtime heartbeat and actual eval
+            # records; absent evidence is never treated as a vacuous pass.
+            check("real_mode_enabled", real_mode_heartbeat_records > 0,
+                  f"{real_mode_heartbeat_records} REAL-mode validation heartbeats")
+            check("real_inputs_observed", real_eval_records > 0,
+                  f"{real_eval_records} REAL per-evaluation records")
+            check("real_engine_classes_observed", real_class_complete_records > 0,
+                  f"{real_class_complete_records} records identify ENGINE_MV + ENGINE_DEPTH")
             check("no_reset_failures",
-                  len(shadow_failures) == 0 and len(eval_failures) == 0,
-                  f"{len(shadow_failures)} shadow reset failures, {len(eval_failures)} eval failures")
+                  len(shadow_failures) == 0 and len(reset_failures) == 0 and len(eval_failures) == 0,
+                  f"{len(shadow_failures)} shadow failures, {len(reset_failures)} allocator/list reset failures, "
+                  f"{len(eval_failures)} eval failures")
             check("no_breaker_lines",
-                  not any("breaker" in line.lower() for line in target_lines),
-                  "no breaker state lines in current PID log")
-            check("real_touch_ages_in_window",
-                  max_mv_touch_age_real <= 3 and max_depth_touch_age_real <= 3,
-                  f"max mvTouchAge={max_mv_touch_age_real}, max depthTouchAge={max_depth_touch_age_real} "
-                  f"(expect <=3 for double/triple buffering); {real_touch_age_violations} violations")
-            # Inconclusive depth note (no DSV hook — depth relies on barrier/SRV traffic only)
-            if max_depth_touch_age_real > 3:
+                  not breaker_lines,
+                  f"{len(breaker_lines)} feature-reset/halt safety events")
+            age_observed = real_touch_age_records > 0
+            age_ok = (age_observed and max_mv_touch_age_real is not None and
+                      max_depth_touch_age_real is not None and real_touch_age_violations == 0)
+            check("real_observation_ages_in_window", age_ok,
+                  f"{real_touch_age_records} REAL-use heartbeat records; max mv={max_mv_touch_age_real}, "
+                  f"depth={max_depth_touch_age_real}; {real_touch_age_violations} over-3 observations "
+                  "(recency only; not same-frame proof)")
+            # Explicitly prevent the run from being presented as successful
+            # REAL mode when either input class or age evidence is absent.
+            if not age_ok:
                 result["depth_inconclusive"] = (
-                    "depthTouchAge >3: no DSV write hook exists; depth freshness "
-                    "relies solely on barrier traffic + SRV creation. Visual A/B "
-                    "on depth is INCONCLUSIVE until per-frame depth write is instrumented."
+                    "No adequate REAL-use recency evidence. Bind/barrier observations do not prove "
+                    "resource contents were written or correspond to the same presented frame."
                 )
         result["counts"] = {"frame_markers": len(frames), "render_evidence": len(render_evidence),
                              "present_snapshots": len(present_progress), "injection_markers": len(injections),
                              "shadow_eval_ok": len(shadow_ok), "shadow_eval_handoff": len(shadow_handoff),
                              "shadow_eval_failures": len(shadow_failures),
+                             "allocator_list_reset_failures": len(reset_failures),
+                             "safety_halt_events": len(breaker_lines),
                              "evaluate_failures": len(eval_failures), "fatal_markers": len(fatal),
                              "shadow_eval_max_ok": shadow_eval_max_ok,
                              "shadow_input_real_lines": shadow_input_real_lines,
@@ -484,12 +521,19 @@ def main() -> int:
                              "shadow_input_note": shadow_input_note,
                              "max_mv_touch_age_real": max_mv_touch_age_real,
                              "max_depth_touch_age_real": max_depth_touch_age_real,
+                             "real_touch_age_records": real_touch_age_records,
+                             "real_mode_heartbeat_records": real_mode_heartbeat_records,
+                             "real_eval_records": real_eval_records,
+                             "real_class_complete_records": real_class_complete_records,
                              "real_touch_age_violations": real_touch_age_violations}
         result["evaluate_failure_samples"] = eval_failures[:20]
         result["fatal_samples"] = fatal[:20]
         base_pass = loaded and initialized and render_pass and not fatal
         dlss_evidenced = bool(injections or shadow_ok)
-        if not base_pass:
+        real_checks_pass = all(result["checks"].get(name, {}).get("passed", False) for name in (
+            "real_mode_enabled", "real_inputs_observed", "real_engine_classes_observed",
+            "no_reset_failures", "no_breaker_lines", "real_observation_ages_in_window")) if args.real_test else True
+        if not base_pass or not real_checks_pass:
             result["outcome"] = "FAIL"
         elif args.require_dlss and not dlss_evidenced:
             result["outcome"] = "INCONCLUSIVE_DLSS"
@@ -535,6 +579,29 @@ def main() -> int:
                         result["outcome"] = "GAME_CRASHED_AFTER_PLUGIN_INIT"
                 except Exception:
                     pass
+        if runtime_ini_path is not None and runtime_ini_original is not None:
+            try:
+                runtime_ini_path.write_bytes(runtime_ini_original)
+                restored = runtime_ini_path.read_bytes() == runtime_ini_original
+                result["real_test_ini_restored"] = restored
+                if not restored:
+                    result["errors"].append("Runtime INI restoration verification failed")
+                    result["outcome"] = "FAIL"
+            except OSError as exc:
+                result["real_test_ini_restored"] = False
+                result["errors"].append(f"Runtime INI restoration failed: {exc}")
+                result["outcome"] = "FAIL"
+        elif runtime_ini_path is not None and not runtime_ini_existed_before_run:
+            # Deployment created this file during the run; restore the prior
+            # absent state rather than leave a new runtime config behind.
+            try:
+                if runtime_ini_path.exists():
+                    runtime_ini_path.unlink()
+                result["real_test_ini_restored"] = not runtime_ini_path.exists()
+            except OSError as exc:
+                result["real_test_ini_restored"] = False
+                result["errors"].append(f"Runtime INI cleanup failed: {exc}")
+                result["outcome"] = "FAIL"
         if game_output_file is not None:
             game_output_file.close()
         result["finished_utc"] = datetime.now(timezone.utc).isoformat()
