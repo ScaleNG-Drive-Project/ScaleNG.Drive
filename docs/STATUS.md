@@ -1,5 +1,104 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (E1 follow-up: reads audit + soak evidence)
+
+- **Published-state record.** Branch `master`; local HEAD `eedfa30`
+  (`eedfa30ec09aad7f9930158fe67d84c8dff316ec`); no upstream configured
+  (pushes use explicit `origin master`); remote `origin/master` ==
+  `eedfa30` at last check (re-verified after the push below).
+  `src/d3d12_hooks.cpp` and `docs/STATUS.md` match HEAD exactly
+  (`git diff HEAD -- src` empty); only pre-existing `dist/*` +
+  `src/vc140.pdb` test-build outputs plus untouched untracked helpers
+  remain dirty. E1 chain: `4b6930a` (preserve) → `2a8b7f0` (5-line fix) →
+  docs. No local-vs-published source difference.
+- **Reviewer line refs explained.** The `6755-59/6941-44/3263-68` cites
+  map onto the PRE-`4b6930a` source (`c4ba182` == `8203f77` for this
+  file): deltas (+145 purge region, +285/+293 present-flow region) match
+  the 24 inserted hunks above those regions. Canonical numbers below are
+  verified in published `2a8b7f0`:
+  `https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp`
+- **Per-access audit (`g_resourceStates`, control flow + scopes inspected):**
+  | lines | function (executing threads) | access | lock | overlaps purge? | status |
+  |---|---|---|---|---|---|
+  | 2977-78 | `Barrier` (Present, own lists) | find | `BookGuard` | reader | safe |
+  | 2988 | `Barrier` (Present) | write | `BookGuard` | same-lock | safe |
+  | 3006-09 | `LookupTrackedStates` (Present, shadow eval) | find x2, values copied out | `BookGuard` | reader | safe |
+  | 3024-25 | `NoteTrackedStates` (Present, `:8567` useReal path) | write x2 | `BookGuard` | same-lock | safe |
+  | 3051 | `CreateDlssOut` (Present `:7085` AND recording threads via `DoInjection` `:3237` <- `:9999/:10006`) | write | NONE was | YES | FIXED `2a8b7f0` |
+  | 3409 | `RecordTrackedAddressReuse` (creation-hook threads `:3455/:3500/:3537`+variants) | erase | `BookGuard` `:3404-10` | self | safe |
+  | 7040-41 | `InjectAtPresentImpl` (Present `:8703/:8748`; also queue-submit path `:5198/:5206`) | find | NONE | read-vs-write UB remains | DEFERRED (see below) |
+  | 7234-38 | same function | find x2 + reuse of `:7040` iterator | NONE | same + stale-iterator risk | DEFERRED |
+  | 9852/57/66 | `CopyTexBody` (recording threads `:2309`/`:10015`) | write | NONE was | YES | FIXED `2a8b7f0` |
+  | 9895 | `CopyTexBody` (recording) | write | NONE was | YES | FIXED `2a8b7f0` |
+  | 10125 | `TrackResourceBarriers` (recording `:2675`/`:10204`) | write | `BookGuard` | same-lock | safe |
+  No `.clear/.insert/.emplace/.at/.count/.size/.begin/.end` on this map;
+  iteration only in `EraseResourceMappings` (`:3354-61`, correct idiom),
+  sole caller the purge under guard. `StoreTracked` writes no state map.
+- **Seven questions, answered:** (1) YES — Present-thread reads
+  (`:7040`, `:7234-38`) can overlap purge erases and `CopyTexBody` writes;
+  no common lock. (2) No guaranteed sync — timing assumption only; the
+  lock comment (`:437`) is violated by exactly these two read sites
+  (writes now all guarded). (3) Guarded paths copy VALUES out under lock
+  (safe use-after); the purge's own erasures are fully scoped; the
+  unguarded sites have no protection for lookup OR use (`:7234` reuses
+  `:7040`'s iterator ~200 lines later, past an early return at
+  `:7042-45`). (4) YES possible in principle — mitigated at the COM level
+  by generation + `SafeGetDesc` fail-closed gates, but a wrong `before`
+  state can reach a barrier call. (5) `g_copySrcCount`: complete access
+  list (`:405` decl; shared reads `:595/:10376/:10387`; exclusive erase
+  `:3413`, exclusive write `:9786`) — fully disciplined, not affected.
+  All handle-map (`rtv/dsv/srv/displayRTV`) writers AND readers found are
+  guarded (`:2703/:2731/:3861/:3880/:3910/:3942/:3969/:4001/:4036/:4049/
+  :4059/:4139/:4152/:4201/:4264/:5617/:5679/:5754`); the fixed-array
+  `g_displayRTVHistory` (`:3869-77` write vs `:5628` read) is lock-free
+  but has no tree structure to corrupt (values fail-closed downstream).
+  (6) E1 adds no lock-order risk (`BookGuard` is a leaf; no lock held at
+  any of the 5 points; recursive CS; single-op scopes; C2712-safe as
+  verified) and negligible contention. (7) Coverage: full-identifier grep
+  (24 hits) + method-name grep + helper/call-graph inspection, incl.
+  early returns (`:3376/:3386` pre-lock, `:7042-45` post-find) and
+  `FAILED(hr)` paths (skip reuse hook entirely).
+- **Decision: NO further code change now.** The deferred reads use only
+  value copies for fail-closed decisions, but concurrent read-during-write
+  remains UB that could fault the READER (not corrupt the tree — readers
+  don't mutate). Guarding them inside `InjectAtPresentImpl` is IMPOSSIBLE
+  inline (direct `__try` at `:6872/:6901/...` → C2712); the safe design is
+  a `NoteTrackedStates`-style outlined helper returning value copies
+  (E2, ~10 lines). Doing E2 now would conflate it with E1's assessment and
+  touch the Present hot path without a reader-side fault ever observed.
+  E2 stays designed-but-deferred; soak decides.
+- **E1 test verification (`20261010T112850Z`, PID 4432, 40 s):**
+  source `2a8b7f0` (worktree clean at build) → built 14:28:53 → dist
+  `E8630865…FC4C49` == plugins hash, `asiBase 7FF86F340000` logged.
+  Present 1→3849, 14 ZERO-mode evals + handoff, 0 REAL evals
+  (`mv-stale-present`/`mv-retired`), 2,948 heartbeats, 0 failures/fatals/
+  breakers, exit 1 with orderly log tail (eval lines to Present 3849) and
+  live-UI game log — cleanup termination, not a crash (no PID-4432 dump,
+  INI restored `True`). Purge entered 500+ logged times (capped log;
+  every later line proves each prior purge completed).
+- **Soak test (`20261010T114023Z`, PID 13800, 75 s `--real-test`, NEW
+  run for this pass):** Present 1→6965 (63 snapshots), 20 ZERO-mode evals
+  + handoff, 6,153 heartbeats, 0 REAL evals
+  (`depth-generation-stale`/`mv-stale-present`), 0 failures/fatals/
+  breakers, exit 1, INI restored `True`, no PID-13800 dump, no leftover
+  process. Purge executed >=1,900 times (counter n=1900 at present 6830;
+  log capped at n<=24 + every 100th) while presents/evals proceeded
+  concurrently. Combined E1 evidence: ~10,800 presents, ~2,400 purge
+  executions, zero AVs. This SUPPORTS the write-race diagnosis; a clean
+  soak cannot prove a timing race impossible.
+- **Evidence ledger:** verified = exception params/shape/bytes/registers,
+  byte-identity across builds, last-log call-site, 5 unguarded writers,
+  guarded-everywhere-else, two soak runs clean. Supports = race explains
+  null-root+size-54 with a recycled key during purge. Weakens = none new
+  (no contradictory run). Unknown = exact map ID (no symbol inference);
+  unrelated heap corruption not excludable; reader-side AV never observed.
+  No fix claimed; REAL unweakened throughout.
+- **Next experiment:** continued soak incl. longer REAL-mode runs watching
+  for (a) purge-site AV (refutes E1 sufficiency) vs (b) Present-thread
+  read-shaped AV outside purge (triggers E2 reads fix).
+- **Rollback:** `git revert 2a8b7f0`, rebuild, redeploy; local-only tag
+  `local/preserved-e1-full` as extra safety. Dump/logs/runs local-only.
+
 ## Checkpoint — 2026-10-10 (reviewer handoff: verifiable source + audit)
 
 - **Source identity.** Branch `master`, HEAD `65d2152`
