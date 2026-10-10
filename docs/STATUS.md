@@ -1,6 +1,143 @@
 # Current project status and agenda
 
-## Checkpoint — 2026-10-10 (approved vector-fix soak: clean short run, not proof)
+## Checkpoint — 2026-10-10 (motion-information blocker: read-only trace complete)
+
+### Q1: Why does REAL reject with `mv-retired`?
+
+**VERIFIED.** At `ShadowEvalAtPresent` line 8368: `else if (!mvAlive) realWhy = "mv-retired"`, where `mvAlive` (line 8322) is:
+
+```
+bool mvAlive = mvGenerationCurrent && mv && SafeGetDesc(mv, &mvd);
+```
+
+The validation ladder order is: `no-mv` (8366) → `mv-generation-stale` (8367) → `mv-retired` (8368). Since `mv-retired` fires, the two prior conjuncts passed:
+- `mvGenerationCurrent == true` — the generation token in `g_mvResourceGeneration` (value `1`) matches the address-generation table entry for the pointer. The pointer was adopted during early loading and the address was never reused through a tracked creation path, so the generation was never bumped.
+- `mv != nullptr` — `g_mvResource` still holds the pointer `B4FAA12DB0`.
+
+The failing conjunct is `SafeGetDesc(mv, &mvd)` (line 841, `__try { *out = r->GetDesc(); return true; } __except(...) { return false; }`). It returns **false** — the `GetDesc()` vtable call faults with an access violation, caught by the SEH frame. The COM object at `B4FAA12DB0` is destroyed but the pointer was never nulled.
+
+### Q2: Who marks the MV resource as retired, and under what conditions?
+
+**VERIFIED: nobody explicitly nulls the pointer.** The `mv-retired` verdict is computed at validation time — it is a liveness test (`SafeGetDesc` succeeds?), not a nulling operation. No code path nulls `g_mvResource` for liveness purposes:
+
+- `RecordTrackedAddressReuse` (line 3423) — bumps the generation token for an address when a NEW resource is created at that pointer (tracked creation paths: Committed/Placed/Reserved at lines 3509-3748), then erases handle→resource mappings (lines 3457-3463) but **by design leaves candidate slots untouched** (comment at 3454-3456: "candidate slots themselves stay untouched; their per-slot generation mismatch makes them fail closed"). However, `B4FAA12DB0` was never reused — no `tracked-address-reuse` log entry shows it — so the generation was never bumped.
+- The only nulling paths are `mv-stale` (line 7239, inside `DoInjection`) and scene-churn resets (line 7522). Both require the frame counter to advance (`g_frameCounter - g_mvStamp > 5`), which never happens because `g_frameCounter` is stuck at `1` (see Q3).
+
+### Q3: Is the resource genuinely dead, or is tracking losing a usable resource?
+
+**VERIFIED: both.** The object IS genuinely freed (SafeGetDesc access-v faults — the vtable pointer at offset 0 of the object is unreadable). But tracking IS simultaneously losing new resources because:
+
+**Command-list observation hooks stop firing after early loading.** The ECL diagnostic at the end of run `20261010T132749Z` shows:
+
+```
+shimHit=0 type=4294967295 (n=114001 hits=34 misses=113967 ptrReg=113967 ptrUnreg=0
+instOk=38 instDedup=0 instFail=0)
+```
+
+- `hits=34` — only 34 submissions had matching cloned vtables (our shims active)
+- `misses=113967` — all others had vtable mismatch
+- `ptrReg=113967` — every miss's pointer IS in the shim table, but the vtable doesn't match
+- `ptrUnreg=0` — no unregistered pointers at all
+
+`WasListHooked` (line 1643-1653) checks **pointer identity only**: `if (existing.list == list) { seen = true; break; }`. When `WasListHooked` returns true, `Hook_ExecuteCommandLists` (line 4558-4559) skips `InstallCommandListHooks` entirely:
+
+```cpp
+if (!WasListHooked(cl)) {
+    InstallCommandListHooks(cl);
+}
+```
+
+And `InstallCommandListHooks`'s own dedup (line 10938-10944) also skips when the current vtable matches the stored `originalVtbl`:
+
+```cpp
+if (existing.list == list &&
+    (existing.originalVtbl == original || existing.clonedVtbl == original)) {
+    InterlockedIncrement64(&g_installDedupTotal);
+    return;  // <-- skips re-install even when driver restored original vtable
+}
+```
+
+When the D3D12 runtime/driver restores the original vtable on a command list (observed: `ptrReg=113967` with `shimHit=0` on every late submission), our hooks are lost and `WasListHooked` prevents re-installation. This breaks all command-list-level observation:
+- `Shim_ResourceBarrier` (line 2693) → `TrackResourceBarriers` (line 10171) → never fires → `g_mvLastTouchPresent` and `g_depthLastTouchPresent` never updated
+- `Shim_OMSetRenderTargets` (line 2707) → MV adopt via OM-bind (line 10374) → never fires
+- `Shim_CopyBufferRegion` (line 2433) → camera CB validation → `StartFrame()` (line 9537) → `g_frameCounter` stuck at 1, `g_loadPhase` stuck at 1
+
+**Contributing factor: `CreateCommandList1` is not hooked** (only slot 12 / `CreateCommandList` is hooked at line 10804). The engine creates 12 lists via the hooked `CreateCommandList` (16:28:00-02, all during early loading), then switches to `CreateCommandList1` for steady-state. These unhooked lists only get shims at submission time (line 4559), which is too late for the current recording — the recording barriers/OM-binds already happened without observation.
+
+**Device-level discovery (RTV/SRV creation) IS active** — depth candidates are continuously discovered via `Hook_CreateShaderResourceView` (events 14-17 at presents 566, 725, 825, 845, all 1920x1080 D24S8). But MV SRV discovery (line 4168-4189) also works — the issue is that the ALT slot was overwritten after the 1920x1080 candidate `B4FABFD0D0` was adopted (16:28:04.095) by a later resource (`B54E9B0830`, which is address-reused as a 359x379 UNORM texture by present 584). Neither touch stamp updates from SRV creation by design.
+
+### Q4: Earliest point valid motion information stops being available
+
+**VERIFIED.** Timeline from `logs/test_runs/20261010T132749Z/plugin_log_new.txt`:
+
+| Time | Present | Event |
+|---|---|---|
+| 16:28:00.892 | ~1 | Init begins |
+| 16:28:02.589 | ~1 | MV RTV `B4FAA12DB0` (1902x1033, wrong size) adopted as primary |
+| 16:28:02.642 | ~1 | MV RTV `B4FAB740B0` (1902x983) adopted as ALT |
+| 16:28:03.995-04.095 | ~1-4 | MV SRV candidates discovered (`B4FABFD0D0` = 1920x1080 R16G16F, correct size) |
+| 16:28:09.401-10.713 | 214-219 | Tracked-address-reuse for non-MV textures (B4FADF6500, etc.) |
+| 16:28:12.781-13.113 | 226 | Last OM-bind observations (scene RTV at 1920x1080, depth 1920x1080) — hooks still working |
+| 16:28:13.540 | — | `frame 1 started` — `StartFrame()` called once, then never again |
+| 16:28:16.918 | 566 | `B54E9B0830` (ALT slot) reused as 359x379 UNORM (generation bumped to 2) |
+| 16:28:20.748 | 842 | First shadow-eval: `mv-retired` — primary `B4FAA12DB0` dead, SafeGetDesc faults |
+
+Valid MV information (the 1920x1080 candidate `B4FABFD0D0`) was last observed at present ~4 (16:28:04.095). After present 230 (last touch), all barrier/OM-bind hooks cease firing, and the primary MV pointer becomes stale (freed object).
+
+### Q5: Evidence distinguishing lifetime vs tracking
+
+**VERIFIED evidence for each:**
+
+- **Genuine lifetime (the object IS freed):** `SafeGetDesc` catches an access violation (`__try`/`__except` at line 841-884). The `__try` block does `r->GetDesc()` — a vtable dispatch. Faulting = the object's vtable pointer/memory is unreadable = COM object destroyed. This is definitive.
+
+- **Tracking loss (hooks aren't observing):** The ECL diagnostic at the end shows `hits=34 misses=113967 ptrReg=113967 ptrUnreg=0` — every late submission has a shim entry (pointer registered) but a mismatched vtable (shim not active). The `WasListHooked` function at line 1649 checks `existing.list == list` (pointer only) — confirmed by source read. This prevents re-installation when the driver restores the original vtable.
+
+- **Depth side (same root cause):** Depth candidates ARE discovered via SRV (device-level hook, line 4128) at presents 566, 725, 825, 845. The depth candidate at present 842 is `B54E9C4E70(45 1920x1080)` — alive, SafeGetDesc succeeds. But `depthLedgerMatch=0` and `g_depthLastTouchPresent` is frozen at 230 → would hit `depth-stale-present` (842−230=612 > 3) if MV passed. The depth touch paths (barrier at 10241, DSV bind at 10489) also require shimmed command lists — same root cause.
+
+- **Camera CB evidence:** `StartFrame()` (line 9537, inside `Shim_CopyBufferRegion`) is called once (frame 1 at 16:28:13.540). The camera CB hook is on the command list vtable (slot 15). After early loading, lists lose their vtables and the hook stops firing → `g_frameCounter` stuck at 1, `g_loadPhase` stuck at 1 → OM-bind adopt (line 10374, requires `g_loadPhase == 0`) never fires.
+
+### Gate-order proof (MV vs depth independence)
+
+**VERIFIED from code order (lines 8366-8388):**
+```
+8366: no-mv          ← requires g_mvValid && mv
+8367: mv-generation-stale
+8368: mv-retired     ← SafeGetDesc fails (current case)
+8369: mv-format
+8370: mv-size
+8371: mv-size
+8372: no-depth       ← only reached if MV passed
+8373: depth-generation-stale
+8374: depth-retired
+...
+8385: mv-no-observation
+8386: mv-stale-present
+8387: depth-no-observation
+8388: depth-stale-present
+```
+
+`mv-retired` (8368) fires before any depth check (8372+). The current verdict entails nothing about depth — depth would independently block at `depth-stale-present` (8388) if MV passed.
+
+### Ranked hypotheses
+
+1. **(HIGH confidence) `WasListHooked` pointer-only check + `InstallCommandListHooks` dedup blocking re-install** — the driver restores original vtables on command lists (evidenced by `ptrReg=113967, shimHit=0`), and our code treats pointer-in-table as "done." This breaks ALL touch path observation. Proposed fix: check `clonedVtbl == currentVtbl` before skipping; re-install if original was restored.
+2. **(MEDIUM confidence) `CreateCommandList1` not hooked** — contributes to delayed installation (submission-time only, too late for current recording). Fixing #1 addresses this; hooking CreateCommandList1 would be a complementary improvement.
+3. **(LOW confidence) Driver vtable-swap behavior is non-standard** — some NVIDIA driver versions may swap vtables on Reset for internal bookkeeping. Cannot prove without driver internals or TSan.
+4. **(EXCLUDED) Fixed-array overflow** — bounds audit at `91fcff6` found all arrays clean.
+5. **(EXCLUDED) Unknown unsynchronized writer** — extended audit found no map aliases, no macro-generated mutations.
+
+### What this audit cannot establish
+
+- Whether the driver intentionally restores vtables (driver behavior black box)
+- Whether re-installing hooks on every submission would restore MV observation (requires live test)
+- Whether the engine creates MV textures through CreateCommandList1 or a pool that our device hooks miss (CreateCommandList1 is not hooked; we cannot intercept its creations)
+- Whether the 1920x1080 MV candidate B4FABFD0D0 was still alive at present 842 (it was replaced in the ALT slot by B54E9B0830, which is reused for non-MV textures)
+
+### Smallest safe next step (proposal, not implemented)
+
+Modify `WasListHooked` (line 1643-1653) to read the current vtable from the list and compare against `existing.clonedVtbl`. Return `true` only if the clone is currently active. When false, allow `Hook_ExecuteCommandLists` to call `InstallCommandListHooks`, and modify the dedup (line 10938-10944) to only skip on `clonedVtbl == original` (not `originalVtbl == original`). This re-installs hooks on lists whose vtables were driver-restored, restoring barrier/OM-bind/camera-CB observation without adding new locks. No REAL gates, validation, or breakers changed.
+
+
 
 - **Run `20261010T132749Z` (PID 5240, approved single 40 s `--real-test`):**
   source == reviewed `668df64` (empty diff pre-launch) → harness rebuilt
