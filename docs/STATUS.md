@@ -1,5 +1,67 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (bounds audit: all arrays clean; new lead — vector race)
+
+- **Scope/method.** Seven read-only workstreams at HEAD `aa3b008`
+  (verified by every agent; worktree `src`/`docs` clean throughout, no
+  code/build/run/commit of source in this pass). Six agent reports
+  returned; copy-path scope (WS6, agent pending) is covered by the
+  lead's own prior-turn audit (capacity gates, overflow-check direction,
+  guarded mutations — all CLEAN, labeled lead-verified below). Lead
+  independently re-read every headline claim against source; only the
+  verified items below are stated as fact.
+- **Fixed arrays: all CLEAN (no proven defect).** `g_createdRefs[256]`
+  (guard `428` precedes `430`; unreachable, zero call sites);
+  `g_owned[16]` (guards `414`/`420`; stale-alias + no-dedup hygiene only);
+  `g_sceneSet[8]` + `g_nativeCandidates[96]` (count invariants, guarded
+  increments, in-range eviction, correct swap-remove, locked on all
+  paths); `copied[256]` paths (capacity/underflow/overflow gates quoted
+  correct; mutations guarded); `g_grave[4]`, `s_bindClasses[32]`,
+  `g_displayRTVHistory[8]`, `g_sceneColorCandidates[8]`,
+  `g_listCorr[64]`, `g_qiWatchCounts[9]`, serials/counters, log buffers,
+  cloned vtables, header buffers — each bounds-checked or lock-covered;
+  residual items are theoretical (grave TOCTOU, bindClasses TOCTOU, wraps
+  needing 2^32 events, `registrations_[10]` enum-only indexing) and all
+  land in `.data`, never heap metadata. Full per-line tables were
+  returned by the agents and are not repeated here; no OOB chain exists
+  for any static array.
+- **NEW LEAD: `s_hookedLists` vector race (lead-verified just now).**
+  `Hook_ExecuteCommandLists` holds `static std::vector<...> s_hookedLists`
+  (`:4381`) with an unlock-guarded linear scan (`:4540-41`) +
+  `push_back` (`:4543`) on the documented-concurrent ECL submission path
+  (the function itself notes `__try` is illegal there, `:4447-48`).
+  Concurrent submissions → scan/push_back/reallocation race = heap UB —
+  the ONLY finding in the entire audit whose overflow can reach heap
+  metadata (every static array is `.data`-bounded). It also grows
+  unboundedly (never erased) and duplicates the shim table's own locked
+  dedup (`:10924-25`), making the gate redundant.
+- **Why this fits:** E1 guarded every map writer yet the byte-identical
+  fault recurred — a lock-independent heap-damage vector explains the
+  falsification; map-node damage manifesting later in purge descents is
+  consistent (not proven). Two agents converged on it independently.
+- **What it does NOT prove:** no dump attribution (heap damage is
+  non-local; the faulting map is still unnamed by policy); temporal
+  overlap of submissions unproven (needs thread-ID/TSan evidence);
+  table-full silent drop (`:10936-41`) and no slot reuse are functional
+  coverage issues, not crash evidence.
+- **Proposal ONLY (not implemented):** either (a) a dedicated recursive
+  critical section around scan+push_back+Install call (smallest; Install
+  already holds long exclusive scopes, so hold-time precedent exists),
+  or (b) delete the redundant gate and rely on `InstallCommandListHooks`'
+  internal locked dedup (negative code, but needs review of the dedup-hit
+  path + third-party-clobber case). Risks: (a) extended ECL-path hold;
+  (b) behavior change on dedup-hit. Verify later by: thread-overlap
+  evidence or TSan, then soak watching for purge-site AVs. No code change
+  made in this pass.
+- **Ranked hypotheses:** (1) vector-reallocation heap damage → map-node
+  corruption (consistent, unproven); (2) still-unknown unsynchronized
+  writer (audit-net now covers names/methods/aliases/TUs/iterators —
+  none found); (3) fixed-array OOB (EXCLUDED by this audit);
+  (4) same-thread reentrancy (no evidence). Motion/H1-H2 work is
+  orthogonal and waits on crash resolution.
+- **Rollback:** none needed (docs-only pass; zero source/build/run
+  changes). Crash evidence and all artifacts intact.
+
 ## Checkpoint — 2026-10-10 (E3 blocked: second early-loading crash, E1-falsifying)
 
 - **E3 motion test DID NOT EXECUTE (Outcome D).** Run `20261010T124606Z`
