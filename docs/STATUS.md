@@ -1,10 +1,322 @@
 # Current project status and agenda
 
-## Checkpoint — 2026-10-09 (latest REAL-input and MV-provenance work)
+## Checkpoint — 2026-10-10 (offline crash triage: map race; docs-only pass)
 
-This is the latest checkpoint. Earlier entries remain historical; use the
-run-specific artifacts for full logs and do not treat an untested diagnostic
-scaffold as active instrumentation.
+- **Dump triage completed offline (read-only; no game run, no code edit).**
+  `dist/dmpscan.exe` runs headless; venv-python parsed the MINIDUMP streams.
+  WinDbgX 1.2610.1001.0 is installed (`Get-AppxPackage` verified) but its CLI
+  opens UI and hangs headless, so it was killed and not used; `cdb.exe`,
+  classic `windbg.exe`, and `dumpbin.exe` are absent (no `Debuggers` folder
+  under Windows Kits). Raw dump
+  `%LOCALAPPDATA%\CrashDumps\BeamNG.drive.x64.exe.2484.dmp` (173,141,123 B)
+  preserved; helper scripts live only in `%TEMP%\opencode` (local-only).
+- **Exception (verified from dump):** TID 14220, `0xC0000005` READ of address
+  `0x28` (params `[0x0, 0x28]`), RIP `0x7FFAF717A810` = `ScaleNG.asi+0x1A810`
+  (module base `0x7FFAF7160000`, PE timestamp `0x6ac974aa`, matching event
+  1000 report `2aecc7e1-85aa-4774-995f-9f4211f7279c`; BeamNG base
+  `0x7FF60F800000` ts `0x6a75cf2a` also matches). Fault bytes start
+  `48 39 78 28` (`cmp [rax+0x28],rdi`) with `rax=0`,
+  `rdi=rdx=0xB840472DE0` — the placed texture from the run's last log line.
+  `rcx=rbx=ScaleNG.asi+0x107280` (.data); `[rcx]=0xB7A400CFE0` (no dump
+  range: freed heap), `[rcx+8]=0x54`. Exception-time `rsp=0xB7A3EFBB60`.
+- **Byte-identity (verified):** 96 B at RVA `0x1A810` are SHA256-identical
+  across crash-run backup (`6ac9735e`), post-crash dist rebuild
+  (`6ac974d7`), stable-run `20261009T230600Z` backup (`6ac97297`), and the
+  dump's in-memory image. The faulting code is a std::map keyed descent; the
+  identical code ran 3,845 presents cleanly in `230600Z`, so this is
+  data-dependent, not a code regression at this site. No function is named
+  from the newer map/PDB (explicitly avoided); no preserved binary matches
+  `0x6ac974aa` (full sweep: 197 ASIs, zero matches).
+- **Call-site evidence (source, not symbols):** the run's last plugin line is
+  `RecordTrackedAddressReuse`'s log (`src/d3d12_hooks.cpp:3391`, n=10,
+  api=Placed, res=`B840472DE0`, present=301) — the same pointer as
+  fault-time `rdi`. The crash is therefore inside that function's post-log
+  purge (`:3403-3442`): `EraseResourceMappings` x4 + `g_resourceStates.erase`
+  (under `BookGuard`) + `g_copySrcCount.erase` (under `g_copyMapLock`
+  exclusive). The fault stack holds same-image return RVAs
+  `0x24370/0x2D72D/0x7C5DC/0x1F115` plus a BEAM caller, and stack locals
+  matching the hook's descriptor fields (1920/1080/fmt45/present301/ecl1165).
+- **Race (code evidence):** `g_resourceStates` has proven writers that do NOT
+  hold `g_bookCS`: `CreateDlssOut` (`:3051`) and `CopyTexBody`
+  (`:9852,:9857,:9866,:9895` — verified no `BookGuard` in `9586-10007` and no
+  direct `__try` there; `:9768` is inside nested `Local::AltIsPairHalf`,
+  `:10014` is the caller `Hook_CopyTextureRegion`). CopyTexBody runs on ECL
+  recording threads, creation hooks on game threads, CreateDlssOut on the
+  Present thread. Unsynchronized `std::map` insert racing the purge's erase
+  frees tree nodes underfoot -> null root with nonzero size -> `[0+0x28]`
+  read AV. `g_copySrcCount` locking is consistently correct (exclusive for
+  writes `:9786/:3413`, shared for reads) and all other `g_resourceStates`
+  writers (`:2988,:3024-25,:10125`) plus all handle-map writers are guarded.
+- **Experiment E1 (established, not yet implemented):** wrap the 5 unguarded
+  `g_resourceStates` writes in narrow `{ BookGuard _bg; ... }` scopes (same
+  discipline as every other writer; C2712-safe as verified above; no lock
+  held at those points — `g_copyMapLock` released at `:9787`,
+  `AdoptDisplaySize` takes no book lock). Rebuild, verify hashes, run ONE
+  serialized short test (changed setup, never a repeat). Falsifiable: clean
+  runs with no purge AV support the race diagnosis; a repeat AV at the same
+  site/shape refutes sufficiency. REAL stays fail-closed; no breakers, hooks,
+  or settings touched. Revert = 5 small scopes, rebuild.
+- **This pass:** STATUS text only (this section + correction below). No
+  source edit, no rebuild, no BeamNG run. Commit/push is docs-only so the web
+  reviewer can inspect; raw dump and `%TEMP%\opencode` scripts stay local.
+
+## Checkpoint — 2026-10-10 (REAL diagnostic run faulted inside ScaleNG)
+
+- **Run `20261009T231132Z` (PID 2484):** the harness reached smallgrid
+  freeroam, then exited with `0xC0000005` at about 245 Presents. Windows
+  Application Error event 1000 identifies the faulting module as
+  `C:\Games\BeamNG.drive\Bin64\plugins\ScaleNG.asi` (module timestamp
+  `0x6ac974aa`), with fault offset `0x1A810`. This corrects any earlier
+  characterization of this event as merely a BeamNG/GPU-side crash: the
+  exception occurred in our plugin. The exact function/source line is **not
+  yet symbolized**; the later rebuilt `dist/ScaleNG.map`/PDB do not match the
+  faulting module timestamp, so their nearby symbol names must not be treated
+  as attribution.
+- **Scope of the failed run:** `result.json` records 2 frame markers, Present
+  1→245, no DLSS evaluations, no REAL validation heartbeat, no Reset/eval
+  failures, no breaker event, and restored runtime INI. Therefore the newly
+  added guarded-liveness diagnostic was never observed, and the event does not
+  establish that it caused the crash. It also does not establish safe behavior
+  of the rest of the plugin during this run.
+- **Recovery:** the diagnostic helper/logging was removed, the source rebuilt,
+  and deployed `ScaleNG.asi`/helper/INI SHA-256 hashes were checked against
+  `dist`. No BeamNG process remains. The captured run artifacts and Windows
+  event are preserved; no additional BeamNG run is planned until the faulting
+  image can be matched to symbols or otherwise narrowed offline.
+- **Crash dump:** Windows created
+  `%LOCALAPPDATA%\CrashDumps\BeamNG.drive.x64.exe.2484.dmp` (about 173 MB).
+  It was found but not yet opened or analyzed. WinDbg was installed through
+  `winget` (`Microsoft.WinDbg` 1.2610.1001.0) while checking for an available
+  dump debugger; the install completed. No dump analysis or game test followed.
+  WinDbg is outside the repository and was not removed.
+- **Offline follow-up:** locate a PDB/map matching PE timestamp
+  `0x6ac974aa` (or a preserved crash dump), then resolve RVA `0x1A810` before
+  attributing the failure to a function. Audit that exact function and its
+  callers/locking/lifetime assumptions, with special attention to any code
+  newly changed in the test build. If matching symbols cannot be recovered,
+  document that limitation and use a non-invasive diagnostic plan rather than
+  repeating the same REAL run.
+- **Current REAL blocker remains:** the last stable rollback run
+  `20261009T230600Z` rejected the selected MV as `mv-retired`; no same-frame
+  REAL evaluation was proven. The later crash run provides no contrary REAL
+  evidence. Keep REAL fail-closed and fallback configuration unchanged until
+  the crash is understood.
+- **Artifacts:** `logs/test_runs/20261009T231132Z/` (`result.json`, plugin
+  logs, build output, deployment backup); Windows Application event 1000,
+  report ID `2aecc7e1-85aa-4774-995f-9f4211f7279c`.
+- **Worktree/deployment note:** no commit or push was made. Existing source
+  changes were preserved. CORRECTION (2026-10-10 audit): the worktree
+  `src/d3d12_hooks.cpp` still contains the full command-list census +
+  per-resource touch-ledger diagnostics (+595/-30 vs HEAD `8203f77`;
+  `RecordTouchLedger` et al. present, absent in `git show HEAD:`), so the
+  diagnostic code was not fully removed before rebuilding — only its REAL
+  heartbeat output was never observed in the run. Build and deploy files
+  are intentionally modified/uncommitted. Verified SHA-256: ASI
+  `CBCCBC39…BAAFEF8`, helper `D95F540A…05BE7C7`, INI
+  `9524EDF5…E9A7509`—each `dist` file matches its BeamNG plugin copy.
+
+## Historical checkpoint — reattachment experiment disabled after startup crash
+
+- **Run `20261009T230121Z` (harness PID 13072):** the experimental command-list
+  reattachment succeeded on the first attempt at `02:01:27.089`, after six
+  current-vtable entries were observed pointing into `nvwgf2umx.dll` rather
+  than the saved `D3D12Core.dll` methods. The harness then reported BeamNG
+  startup exit code `3221225477` (`0xC0000005`) at `02:01:30.300`, before any
+  shadow evaluation or DLSS handoff. Artifacts are preserved in
+  `logs/test_runs/20261009T230121Z/`. The close timing makes reattachment a
+  serious suspect, but this single run does not prove it caused the crash.
+- **Safety response:** removed the experimental vtable-copy/swap path, its ECL
+  call, helper routines, and attempt counters from `src/d3d12_hooks.cpp`.
+  Read-only findings remain in the saved run log; no repeat of this mutation is
+  planned. Existing read-only diagnostics and REAL fail-closed checks remain.
+  No game process was running at the time of inspection; runtime INI was
+  restored by the harness. No commit or push was made.
+- **Review finding:** an independent source audit found that the experimental
+  registry stored the newly replaced shim entries as their own forwarding
+  functions, creating a self-recursion path. It also identified unresolved
+  object-lifetime and publication-order risks. This is a concrete defect in
+  the experiment and a plausible explanation for the crash, though the crash
+  cause is not proven from one run.
+- **Verification/recovery:** after removing that code, `src\\build_asi.bat`
+  succeeded. The rebuilt `dist/ScaleNG.asi` and helper were copied over the
+  experimental deployed versions; SHA-256 now matches between each `dist`
+  and game-plugin file. The run's original deployed files remain preserved in
+  `logs/test_runs/20261009T230121Z/deployment_backup/`; runtime INI was not
+  changed. The deployment recovery was verified before the separate smoke/REAL
+  check recorded below. REAL evaluation, same-frame MV/depth association, and
+  image-quality benefit remain unproven.
+- **Rollback smoke/REAL check — run `20261009T230600Z` (PID 14896):** after
+  the source rollback, the harness rebuilt and deployed the safe version, then
+  reached smallgrid freeroam. Over 3,845 Presents it completed 15 placeholder
+  evaluations and handoffs, with 3,118 REAL-mode validation heartbeats, zero
+  REAL evaluations, zero reset/evaluation failures, zero fatal markers, and
+  zero breaker events. The harness correctly returned FAIL for the REAL-input
+  objective. It saw 13 OM calls, zero qualifying MV-target OM binds, zero
+  draws/submissions in the observed shims, and increasing clone mismatches;
+  this does not establish absence of MV work on unobserved tables. The runner's
+  exit code 1 is its post-observation cleanup result, not a crash report.
+  Runtime INI restoration passed and its SHA-256 still matches `dist`. Artifacts:
+  `logs/test_runs/20261009T230600Z/`.
+- **Current REAL rejection from that run:** at Present 842 the gate reported
+  `why=mv-retired` for MV pointer `E9E065A060` even though its generation and
+  coherent touch-ledger identity matched. The ledger touch was at Present 1,
+  so it was not fresh; the guarded `GetDesc`/liveness check failed and REAL was
+  rejected. The selected depth pointer also did not match the last broad-
+  barrier ledger identity. This confirms that pointer/generation metadata and
+  a prior touch do not guarantee the resource is callable or current. Do not
+  weaken the gate or AddRef unknown observations based on this evidence.
+- **Coverage audit:** the current clone observes direct `DrawInstanced` and
+  `DrawIndexedInstanced`, but not `ExecuteIndirect` (SDK slot 59) or
+  `ExecuteBundle` (slot 27). Adding either to the existing creation-time clone
+  could only report calls on lists where that clone remains installed; it
+  would not recover activity through the replacement NVIDIA table. A zero
+  count would remain inconclusive, so this is not yet the chosen fix.
+- **Next:** trace the exact `mv-retired` candidate through creation hooks,
+  reference ownership, adoption, and invalidation to explain why its guarded
+  descriptor call failed despite matching generation metadata. Audit every
+  existing AddRef/Release ownership path before considering lifetime changes;
+  do not retain arbitrary resources or relax REAL validation speculatively.
+  Keep tests serialized and preserve all crash artifacts.
+- **Rollback:** reattachment is already removed. The currently deployed plugin
+  matches the rebuilt source. If restoring the pre-test deployment is needed,
+  verify and copy only `ScaleNG.asi` and `ScaleNG_NGX_helper.exe` from the
+  preserved `deployment_backup`; do not restore the experimental binary or
+  overwrite unrelated files. Keep the run artifact untouched.
+
+## Checkpoint — 2026-10-10 (command-list MV census)
+
+This is the current checkpoint. Historical entries below remain useful for
+older evidence; the latest source and run artifacts take precedence.
+
+- **Workspace:** branch `master`, HEAD `8203f77` at this checkpoint. The
+  worktree is already substantially dirty; no commit, reset, cleanup, or
+  deletion was performed. New edits are confined to `src/d3d12_hooks.cpp` and
+  this status page. The properly separated pre-build snapshot is
+  `logs/test_runs/_prebuild_mv-record-safety_20261010_verified/{dist,runtime}/`.
+  Runtime `ScaleNG.ini` was restored after both tests; its SHA-256 matches
+  `dist/ScaleNG.ini` (`9524EDF5…E9A7509`), and `realInputs=1` remains the user's
+  persisted setting. No BeamNG process remained afterward.
+- **Diagnostic implemented and built:** per-list Reset/Close and direct
+  DrawInstanced/DrawIndexedInstanced/Dispatch observation, recording epochs,
+  Reset-in-progress/failure guards, and a bounded submission census for
+  display-sized R16G16_FLOAT RTVs. A submission record requires a closed,
+  stable recording and a matching cloned vtable. Counters cover only calls
+  that reached these shims; ExecuteIndirect, bundles, unshimmed/replayed lists,
+  other queues, and unobserved paths remain gaps. The census retains no engine
+  COM resources and changes no render state or REAL gate. An independent review
+  requested further caution: abnormal fallback forwarding is not proven
+  against arbitrary third-party vtable wrappers or raw-pointer reuse. These
+  results are scoped to the observed path, not universal D3D12 coverage.
+- **Run `20261009T222347Z` (PID 4328, 40 seconds):** build/deployment passed;
+  `smallgrid` freeroam + `thePlayer`; Present 1→3725; 14 placeholder-input
+  evaluations completed with handoff; zero fatal, Reset/evaluation, or breaker
+  events. Harness outcome **FAIL for REAL inputs**: 2,961 validation
+  heartbeats, zero REAL evaluations, `mv-retired`. The result records exit
+  code 1; the harness cleanup explicitly terminates a still-running game after
+  observation, so this code alone is not evidence of a crash. No fatal marker
+  was logged. Artifacts:
+  `logs/test_runs/20261009T222347Z/`.
+- **MV-pass evidence in that run:** list `F16ED04190`, type 0, recorded a
+  1920×1080 fmt-34 target `F17E101230`; the same recording had 2 qualifying OM
+  binds and 153 direct indexed draws. At ECL 741 / Present 195, it appeared in
+  a four-list submitted batch with its cloned vtable matching. Same-list logs
+  also show copy/barrier/viewport activity. This strongly supports an
+  MV-format render pass being recorded and submitted in that interval. It does
+  not establish GPU completion, pixel values, continuous per-frame production,
+  or same-frame color/MV/depth correspondence. It happened once, early; later
+  validation remained fail-closed.
+- **Run `20261009T222657Z` (PID 1460, 40 seconds):** build/deployment passed;
+  freeroam + `thePlayer`; Present 1→3725; 14 fallback evaluations with
+  handoff; zero fatal, Reset/evaluation, or breaker events. No eligible
+  `mv-record: submitted` entry appeared. At Present 842, alternate candidate
+  `A2255EE520` had matching generation and a successful descriptor read as
+  1920×1080 fmt-34, but its last observed touch was Present 195 (age 647), so
+  REAL remained blocked as `mv-stale-present`. This distinguishes stale
+  observation from a dead/wrong-format ALT in this run. The process exit code
+  1 is consistent with the harness's post-observation termination path and is
+  not by itself crash evidence. Motion Blur remained at the user-reported OFF
+  setting, so these runs do not test its effect. Artifacts:
+  `logs/test_runs/20261009T222657Z/`.
+- **Run `20261009T223046Z` (PID 9072, 90 seconds):** freeroam + `thePlayer`;
+  Present 1→8285; 22 placeholder-input evaluations with handoff; zero fatal,
+  Reset/evaluation, or breaker events. The harness correctly failed the REAL
+  criterion: 7,484 REAL-mode heartbeats, 0 REAL evaluations, and no submitted
+  MV-record entry. Census totals ended at 58 observed OM calls, 0 recognized
+  display-sized fmt-34 OM binds, 0 counted direct draws against a qualifying
+  MV target, 37 successful Reset calls, 37 successful Close calls, and about
+  254k sampled-command-list clone mismatches. These totals are only for the
+  observed shims; they do not prove the game issued no MV work. The harness
+  run included prompts to toggle Motion Blur ON then OFF, but no confirmation
+  of either setting change was received; therefore this is **not** evidence
+  for or against Motion Blur's effect. Runtime INI restoration was verified.
+  Artifacts: `logs/test_runs/20261009T223046Z/`.
+- **Touch-identity experiment (2026-10-10):** Run `20261009T224048Z` (PID
+  8048, 40 seconds)
+  reached freeroam and completed 14 fallback evals+handoffs, with 2,981 REAL
+  validation heartbeats, zero REAL evals, zero reset/eval failures, and zero
+  fatal markers. The harness correctly reports FAIL for REAL. At Present 842,
+  selected MV `89729CB650` generation 1 matched the last-touch MV pointer/gen
+  (barrier source), but that observation was at Present 207 (age 635); no
+  fresh MV evidence appeared. The selected depth at Present 842 was pointer
+  `89730A0E00`, whose guarded descriptor had changed to 359x379 fmt-28 and
+  whose generation failed validation. Its shared depth-touch record instead
+  named `89D5769F30`, generation 0, source broad-barrier. A later SRV event
+  selected `89CB8FDB50`; the prior shared touch still named the older pointer.
+  Earlier logging reported a different depth touch pointer, but its fields
+  were separate atomics and could interleave across recording threads; treat
+  that as a lead, not a coherent event proof. Generation validation rejected
+  the stale candidate and no REAL eval ran. Runtime INI hash was restored to
+  match `dist/ScaleNG.ini`; no BeamNG process remained. Artifacts:
+  `logs/test_runs/20261009T224048Z/`.
+- **Run `20261009T224314Z` (PID 1536, 40 seconds):** the bounded mismatch
+  snapshot build passed and reached freeroam. The harness recorded 15 fallback
+  evals with handoff, 3,073 REAL-mode validation heartbeats, zero REAL evals,
+  zero Reset/eval failures, and zero fatal markers; overall FAIL is correct
+  for REAL. No `mv-record: last-observed-on-mismatched-list` line appeared,
+  and totals showed 0 qualifying OM binds / 0 submitted MV records in the
+  observed shims. This means no prior qualifying MV OM+draw snapshot existed
+  for the mismatch logger to report; it does **not** show that BeamNG produced
+  no MV work. Runtime INI hash again matched `dist`, and no process remained.
+  Artifacts: `logs/test_runs/20261009T224314Z/`.
+- **Current blocker / next agenda:** input validation correctly fails closed,
+  but the latest trace shows a selected depth pointer can be retired/reused and
+  the shared touch identity needs coherent per-resource confirmation. The
+  existing ECL diagnostic records registered-but-vtable-mismatched lists only
+  when our shim previously observed an MV-like OM+draw recording; it labels
+  these as the *last recording observed by our shim*, not the current one. Run
+  `20261009T224314Z` built/tested it, but no qualifying snapshot existed to log.
+  Independent review says naive vtable reattachment is not safe: raw-pointer
+  reuse, immutable registry entries, clone capacity, unknown forwarding chains,
+  and concurrent recording must be handled first. No reattachment was added.
+  A coherent diagnostic-only per-resource ledger is now being added for MV
+  primary, MV ALT, and depth. It captures pointer/generation/Present/ECL/source
+  under a nonblocking per-ledger lock; contended observations are dropped and
+  counted. It will not change shared stamps, candidate selection, the 3-Present
+  threshold, fallback, or NGX calls. Numeric source values are `1=barrier`,
+  `2=broad barrier`, `3=OM bind`, `4=DSV bind`. Build/test pending. Do not relax the
+  3-Present gate or infer
+  Motion Blur behavior without a confirmed ON/OFF interval. A prior run revealed a submitted MV-format
+  draw pass; two later runs did not see a fresh qualifying MV observation
+  after Present 195. We still cannot tell whether Motion Blur changes the
+  producer path: the latest prompts were not confirmed. Do not refresh
+  liveness merely because an old candidate remains descriptor-readable, and
+  do not loosen the 3-Present fail-closed gate. The next discriminating step
+  is to confirm the Motion Blur ON/OFF transitions (or repeat them when the
+  user is available) and correlate them with the bounded telemetry. Until
+  confirmed, treat the current result as indeterminate about Motion Blur.
+- **Build and reversal:** `src\\build_asi.bat` succeeded; both tests rebuilt
+  and deployed the ASI/helper; runtime INI restoration was verified. No source
+  rollback was performed. To remove only the new census, revert its typedefs,
+  fields, wrappers, counters/snapshot helper, OM/ECL call sites, and cloned
+  slots 9/10/12/13/14 in `src/d3d12_hooks.cpp`; rebuild and run a short
+  stability test. To restore exact pre-build dist/runtime files, copy from
+  the respective `..._verified/dist/` and `..._verified/runtime/` folders.
+
+## Historical checkpoint — 2026-10-09 (REAL-input and MV-provenance work)
+
+At this historical checkpoint, the command-list diagnostic was still an
+incomplete scaffold. It was later completed and runtime-tested as documented
+above; do not apply that older status to the current source.
 
 - **Workspace preservation:** branch `master`, HEAD
   `daf0542197dddf0ff9672f705814aaac32e10224` at inspection. The worktree was
@@ -2889,3 +3201,158 @@ forever; breaker silent because `s_shConsecFail` counts only
 
 **Not changed:** breaker design; frame-age gates (kept as-is);
 MV/depth value conventions (still UNKNOWN); no quality claim.
+
+## Coherent MV/depth touch ledger and REAL diagnostic (2026-10-09, run 224854Z)
+
+**Diagnostic change:** `src/d3d12_hooks.cpp` now records the most recent
+observed touch for MV primary, MV ALT, and selected depth in separate
+per-resource ledgers. Each tuple (resource pointer, generation, Present,
+ECL, source) is read/written under a nonblocking lock; contended writes are
+dropped and counted. The REAL gate, shared touch timestamps, thresholds,
+resource selection, NGX parameters, and rendering are unchanged. This makes
+the diagnostic tuple coherent; it does not make a barrier/bind proof of
+execution, pixel writes, or same-frame contents.
+
+**Build/run:** `src\build_asi.bat` succeeded. `scripts\launch_test.bat
+--duration 40 --real-test` reached smallgrid freeroam (`thePlayer`, PID
+3984), observed 3,605 Presents and 14 successful placeholder evaluations
+with handoff enabled, and recorded zero fatal markers, Reset failures,
+evaluation failures, or breaker events. The harness correctly returned
+`FAIL` for the REAL-input objective: 2,830 REAL-mode validation heartbeats,
+zero REAL evaluations, zero ENGINE_MV+ENGINE_DEPTH evaluation records.
+`realInputs` was restored afterward; deployed and `dist\ScaleNG.ini` SHA-256
+both equal `9524EDF553808E570D462344DA7B4EA419B6CC8A7B344B4FB17C755A9E9A7509`.
+The runner recorded process exit code 1 despite no plugin fatal marker; its
+cause is not established, so this is not labeled a clean game exit or a crash.
+Artifacts: `logs/test_runs/20261009T224854Z/`.
+
+**What the ledger showed:** at the final sampled REAL validation (Present
+3671), selected MV ALT `D0BF13EDB0`, generation 1, matched its coherent last
+touch record (barrier source, ECL 715, Present 189) but that observation was
+3,482 Presents old. The selected depth candidate `D1602679D0`, generation 1,
+did not match the ledger's last record (`D16041AC70`, generation 0, broad
+barrier source, ECL 733, Present 193). Earlier in the same run, the selected
+depth candidate was a stale 359x379 fmt-28 resource; depth-generation-stale
+was the first reported rejection, followed later by `mv-stale-present`.
+There were zero `mv-om-bind` records and zero mismatched-list MV snapshot
+records; ten depth-OM-bind records were observed, while the early logged
+selected depth was 1902x1033 fmt-45 with one sample. These facts establish
+that the observed touch records do not track the currently selected MV/depth
+pair closely enough for the existing recency gate. They do **not** establish
+that the engine stopped updating its inputs: record-time list coverage and
+unobserved/replaced command-list vtables remain gaps. A ledger match is
+identity-and-observation evidence only, not proof of execution or freshness
+of contents.
+
+**Next:** keep REAL fail-closed. The highest-value follow-up is to trace why
+candidate selection and the observed per-resource touch ledger diverge—first
+audit the depth/MV adoption and generation update paths, then add only a
+bounded diagnostic at the already-covered observation point if source
+inspection identifies a specific missing link. Do not refresh candidates,
+relax the three-Present threshold, or infer same-frame inputs from the
+ledger. Motion Blur state was not controlled or verified in this automated
+run and is not part of its result.
+
+**Reversal:** remove only the `ResourceTouchLedger` declarations/helpers,
+their three `Note*TouchIdentity` call paths, and the added
+`shadow-eval real-inputs` ledger fields in `src/d3d12_hooks.cpp`; rebuild with
+`src\build_asi.bat`. Remove this section from `docs/STATUS.md` to undo the
+documentation. Do not restore either whole file: both contain unrelated
+pre-existing work.
+
+## Historical experiment — bounded command-list reattachment (superseded)
+
+The following records the abandoned experiment only. Its implementation was
+removed after run `20261009T230121Z`; do not treat its “Next” or “Reversal” text
+as current guidance. The current decision and verified rollback are at the top
+of this document.
+
+### Initial strict probe (run 225615Z)
+
+**Change:** added a maximum-three-attempt, one-success reattachment path at
+the observed graphics-queue submission point. It only considers a registered
+DIRECT list, copies its current 64-slot table, and will swap to a new clone by
+compare-and-swap only if all 13 intercepted entries exactly match the methods
+saved at first installation. It leaves old clones/records intact. Snapshot
+selection now prefers the registry entry matching the current vtable, so a
+future new recording would not be confused with the old generation. No REAL
+gate, selection, NGX parameter, or render behavior was changed.
+
+**Build/run:** build succeeded. `scripts\launch_test.bat --duration 40
+--real-test` reached freeroam (`thePlayer`, PID 13004); 3,845 Presents, 15
+successful placeholder evaluations with handoff, 3,094 REAL validation
+heartbeats, zero REAL evaluations, zero fatal markers, zero Reset/evaluation
+failures, and zero breaker events. The runner recorded process exit code 1
+without a plugin fatal marker; cause is unknown, not classified as crash or
+clean exit. Runtime INI restoration passed. Artifacts:
+`logs/test_runs/20261009T225615Z/`.
+
+**Result:** the bounded path made three guarded eligibility checks and
+reattached nothing: all three current tables failed the strict 13-slot
+identity comparison. The run recorded 118,476 clone mismatches, 24 OM calls
+but zero qualifying MV-target OM observations or draws, and zero submitted
+MV recordings. Selected MV ALT was 1920x1080 fmt-34 gen1; its matched barrier
+touch was at Present 191 (age 3,744 at the last sampled evaluation). The
+selected depth candidate was `CDBBFFDC80` gen1 while the last broad-barrier
+ledger tuple was `CD630F4400` gen0 at Present 197. Inputs remained
+placeholders. These findings show observation is lost and the strict
+predicate is not met; they do not show that mismatched lists contain MV work
+or that BeamNG stopped updating the resources.
+
+**Next:** the probe now logs the exact differing slot numbers and current vs
+saved function/module addresses, bounded to the three eligibility attempts.
+Use that output to decide whether chaining the current table is defensible;
+do not weaken the slot check by assumption. Keep the one-success limit and
+fail-closed REAL path. A reattachment pass would prove only renewed
+record-time observation, not GPU writes or same-frame alignment.
+
+**Reversal:** remove only `TryReattachCommandListForObservation`, its ECL
+call/declaration and attempt counters, the current-vtable-preferred snapshot
+lookup block, and the later slot-difference telemetry in
+`src/d3d12_hooks.cpp`; rebuild. Remove this section to undo the record.
+Preserve all other pre-existing source, docs, and artifacts.
+
+### Slot-owner diagnosis and abandoned design (runs 225816Z–225946Z)
+
+**Run:** another 40-second REAL test reached freeroam (`thePlayer`, PID 2552),
+Present 1→3845, 15 successful placeholder evaluations with handoff, 3,101
+REAL-mode heartbeats, zero REAL evaluations, zero fatal markers, zero Reset
+or evaluation failures, and zero breaker events. Harness overall was `FAIL`
+for REAL inputs; `realInputs` restoration passed. The runner recorded game
+exit code 1 with no plugin fatal marker; cause remains unknown. Artifacts:
+`logs/test_runs/20261009T225816Z/`.
+
+**New evidence:** the three bounded reattachment checks again did not mutate
+any list. For each sampled candidate, the same six hook targets differed:
+slots 32 (root descriptor table), 21/22 (viewport/scissor), and 12/13/14
+(draw/draw-indexed/dispatch). Their current functions resolved to module
+base `7FFB167C0000`; the saved implementations resolved to `7FFB78860000`.
+The other seven intercepted slots matched. Across the run, coverage ended at
+45 OM calls, zero qualifying MV-target OM binds, zero draw observations, and
+zero MV-record submissions; clone mismatches reached 118,974. This confirms
+that selected interception methods are replaced by a different code module,
+but its identity and wrapper behavior are not yet known. It does not prove
+that those lists contain MV work.
+
+**Module ownership resolved in run 225946Z:** a read-only live-process module
+snapshot mapped `7FFB167C0000` to NVIDIA `nvwgf2umx.dll` and `7FFB78860000`
+to Microsoft `D3D12Core.dll`, matching the current and saved method targets
+in the same process. The current vtable is therefore a mixed runtime/driver
+table, not an unidentified private hook. The 225946Z run itself used the
+previous strict-check binary and made no reattachment; it remained stable
+(15 placeholder evals, 0 fatal/reset/eval failures), with 42 OM observations,
+zero qualifying MV binds/draws, and 119,975 clone mismatches. Its REAL
+objective failed; runtime INI was restored and hashes matched.
+
+**Design consequence:** reattachment can preserve the exact current table
+and chain through its existing executable image methods; it must not restore
+the older D3D12Core targets selectively. The code now performs that bounded
+policy (one successful attachment; at most three attempts; CAS; reject any
+null, ScaleNG-owned, or non-image/non-executable target). Build and gameplay
+validation are pending. REAL gates remain untouched; same-frame MV/depth and
+quality remain unproven.
+
+**Reversal:** no additional source behavior changed in this run. The
+diagnostic slot-owner lines are part of the bounded eligibility probe; to
+remove them, delete only the slot-diff logging block and retain the earlier
+fail-closed reattachment guard. Remove this section to undo the record.
