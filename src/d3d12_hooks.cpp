@@ -1634,6 +1634,24 @@ static CommandListShim* FindCommandListShim(ID3D12GraphicsCommandList* list)
     return result;
 }
 
+// Seen-check for the ECL submission path (replaces the unlocked s_hookedLists
+// vector gate, whose scan/push_back raced on concurrent submissions). True if
+// any entry already names this list, REGARDLESS of vtable, so foreign tables
+// are preserved and table use stays bounded exactly as the old gate behaved.
+// Shared-lock scan released before InstallCommandListHooks takes exclusive:
+// sequential, never nested, so no lock-order inversion. No COM ref retained.
+static bool WasListHooked(ID3D12GraphicsCommandList* list)
+{
+    if (!list) return true;
+    AcquireSRWLockShared(&g_commandListShimLock);
+    bool seen = false;
+    for (auto& existing : g_commandListShims) {
+        if (existing.list == list) { seen = true; break; }
+    }
+    ReleaseSRWLockShared(&g_commandListShimLock);
+    return seen;
+}
+
 // If a third party replaces a list's vtable after we installed our clone,
 // wrappers must still forward exactly once. Prefer the currently installed
 // method when it is not one of our wrappers; if it is our wrapper, recover the
@@ -4378,7 +4396,8 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
         Log("hooks: ExecuteCommandLists #%d (queue %p, %u lists)", s_execCalls, (void*)queue, numLists);
     }
     if (g_device && lists && numLists > 0) {
-        static std::vector<ID3D12GraphicsCommandList*> s_hookedLists;
+        // No s_hookedLists gate: WasListHooked + InstallCommandListHooks cover
+        // dedup under g_commandListShimLock (see below).
         for (UINT i = 0; i < numLists; ++i) {
             ID3D12GraphicsCommandList* cl = nullptr;
             if (SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&cl))) && cl) {
@@ -4536,11 +4555,7 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                         }
                     }
                 }
-                bool seen = false;
-                for (auto* p : s_hookedLists)
-                    if (p == cl) { seen = true; break; }
-                if (!seen) {
-                    s_hookedLists.push_back(cl);
+                if (!WasListHooked(cl)) {
                     InstallCommandListHooks(cl);
                 }
                 cl->Release();
@@ -10936,7 +10951,11 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
     if (!slot) {
         InterlockedIncrement64(&g_installFailTotal);
         ReleaseSRWLockExclusive(&g_commandListShimLock);
-        Log("hooks: command-list shim table full");
+        // Capped: without the old once-per-pointer vector gate, a full table
+        // would otherwise log on every submission of every unhookable list.
+        static volatile LONG s_tableFullLogs = 0;
+        if (InterlockedIncrement(&s_tableFullLogs) <= 8 || (s_tableFullLogs % 5000) == 0)
+            Log("hooks: command-list shim table full");
         return;
     }
 
