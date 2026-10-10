@@ -101,6 +101,11 @@ unsigned int g_mvStamp = 0;
 // Zero = no observation since adoption (fail closed on first eval).
 static unsigned long long g_mvLastTouchPresent = 0;
 static unsigned long long g_depthLastTouchPresent = 0;
+// Diagnostic-only per-interval touch-rate counters (observability). Incremented
+// lock-free at the existing touch sites below; exchanged-to-zero by the sampled
+// topo snapshot. Interval zeros vs nonzeros separate "engine produces nothing
+// the hooks can see" from "produces but gates reject". Never affect gates.
+static volatile LONG64 g_diagMvOm = 0, g_diagMvBar = 0, g_diagDepthDsv = 0, g_diagDepthBar = 0;
 // Diagnostic-only per-resource touch records. A nonblocking writer lock keeps
 // each pointer/generation/serial/source tuple coherent across recording threads;
 // contended samples are dropped and counted. These records never affect gates.
@@ -1141,13 +1146,17 @@ static void LogTopoSnapshot(unsigned long long presentSerial,
     if (presentSerial > 5 && presentSerial - s_lastSnapshot < 120)
         return;
     s_lastSnapshot = presentSerial;
-    Log("topo-state: snapshot present=%llu ecl=%llu queue=%p bb=%p scene=%p alt=%p bound=%p lastCopySrc=%p lastCopyFmt=%u bridgeReady=%d deferred=%d bridgeBb=%p bridgeOut=%p",
+    Log("topo-state: snapshot present=%llu ecl=%llu queue=%p bb=%p scene=%p alt=%p bound=%p lastCopySrc=%p lastCopyFmt=%u bridgeReady=%d deferred=%d bridgeBb=%p bridgeOut=%p mvOm=%llu mvBar=%llu depDsv=%llu depBar=%llu",
         presentSerial,
         (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0),
         (void*)g_graphicsQueue, (void*)g_bbCached, (void*)g_sceneColor,
         (void*)g_sceneColorAlt, (void*)g_boundRtvResource, g_topoLastSrc,
         g_topoLastFmt, (int)bridgeReady, deferredPending,
-        (void*)bridgePresentBb, (void*)bridgeOutput);
+        (void*)bridgePresentBb, (void*)bridgeOutput,
+        (unsigned long long)InterlockedExchange64(&g_diagMvOm, 0),
+        (unsigned long long)InterlockedExchange64(&g_diagMvBar, 0),
+        (unsigned long long)InterlockedExchange64(&g_diagDepthDsv, 0),
+        (unsigned long long)InterlockedExchange64(&g_diagDepthBar, 0));
     LogTopoResource("bb", g_bbCached);
     LogTopoResource("scene", g_sceneColor);
     LogTopoResource("sceneAlt", g_sceneColorAlt);
@@ -10162,11 +10171,17 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                     // Present serial is only the time at which this hook saw
                     // the recorded barrier; the command list may be replayed.
                     if (res == g_depthResource)
+                    {
                         g_depthLastTouchPresent = SceneSetNow();
+                        InterlockedIncrement64(&g_diagDepthBar);
+                    }
                     if (res == g_depthResource)
                         NoteDepthTouchIdentity(res, TOUCH_SOURCE_BARRIER);
                     if (res == g_mvResource || res == g_mvResourceAlt)
+                    {
                         g_mvLastTouchPresent = SceneSetNow();
+                        InterlockedIncrement64(&g_diagMvBar);
+                    }
                     if (res == g_mvResource || res == g_mvResourceAlt)
                         NoteMvTouchIdentity(res, TOUCH_SOURCE_BARRIER);
                     else {
@@ -10192,6 +10207,7 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                                     }
                                 }
                                 g_mvLastTouchPresent = SceneSetNow();
+                                InterlockedIncrement64(&g_diagMvBar);
                                 NoteMvTouchIdentity(res, TOUCH_SOURCE_BROAD_BARRIER);
                                 g_mvStamp = g_frameCounter;
                             }
@@ -10208,6 +10224,7 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                                     }
                                 }
                                 g_depthLastTouchPresent = SceneSetNow();
+                                InterlockedIncrement64(&g_diagDepthBar);
                                 NoteDepthTouchIdentity(res, TOUCH_SOURCE_BROAD_BARRIER);
                                 g_depthStamp = g_frameCounter;
                             }
@@ -10360,6 +10377,7 @@ static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRend
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
                         g_mvLastTouchPresent = SceneSetNow();
+                        InterlockedIncrement64(&g_diagMvOm);
                         NoteMvTouchIdentity(g_boundRtvResource, TOUCH_SOURCE_OM_BIND);
                         if (first) g_mvFirstValidFrame = g_frameCounter;
                         }
@@ -10384,6 +10402,7 @@ static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRend
                         SetTrackedResourceGeneration(&g_mvResourceAlt, g_boundRtvResource);
                 }
                 g_mvLastTouchPresent = SceneSetNow();
+                InterlockedIncrement64(&g_diagMvOm);
                 NoteMvTouchIdentity(g_boundRtvResource, TOUCH_SOURCE_OM_BIND);
                 static volatile LONG64 s_mvOmBindCount = 0;
                 LONG64 observed = InterlockedIncrement64(&s_mvOmBindCount);
@@ -10453,6 +10472,7 @@ static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRend
             const bool selectedDepth = boundDepth == g_depthResource;
             if (selectedDepth) {
                 g_depthLastTouchPresent = SceneSetNow();
+                InterlockedIncrement64(&g_diagDepthDsv);
                 NoteDepthTouchIdentity(boundDepth, TOUCH_SOURCE_DSV_BIND);
             }
             static volatile LONG64 s_depthOmBindCount = 0;
