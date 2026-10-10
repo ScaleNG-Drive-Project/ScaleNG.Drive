@@ -1,5 +1,46 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (vector gate removed via reviewed B-variant; built, untested)
+
+- **Review outcome:** two independent reviewers returned NO-GO on verbatim
+  option B: (1) changed-vtable lists would dedup-miss, mint permanent
+  second slots, and overwrite foreign vtables (slot burn irreversible,
+  coexistence broken); (2) the uncapped `table full` log would fire per
+  list per submission once the 64-entry table fills (today's
+  push-before-install accidentally rate-limits it to once per pointer).
+  Both findings verified by lead against source. Verbatim B rejected.
+- **Implemented variant (lead decision):** `WasListHooked` shared-lock
+  pointer-seen check (any vtable) at the ECL site + unchanged
+  `InstallCommandListHooks` (locked dedup/install) + capped `table full`
+  log (`<=8 || %5000`, file convention). This preserves the old gate's
+  exact semantics (seen→skip incl. changed-vtable; new→install) while
+  killing the race AND the unbounded vector growth, with no new lock
+  (reuses `g_commandListShimLock`; shared-then-release-then-exclusive is
+  sequential, never nested). Commit `668df64` (src-only, 26+/7-):
+  `https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/commit/668df649a367a08d25f3c34b68793398545ceb79`
+  (exact hunks: `WasListHooked` helper
+  after `FindCommandListShim`, decl removal at ECL guard, call-site swap,
+  table-full log cap). `s_hookedLists` fully gone (only comments mention
+  it). Refcount pairing (`QI`/`Release`) untouched; REAL gates,
+  validation, breakers, E1/E2 untouched.
+- **Behavior-equivalence (reviewed):** new pointer→install (same);
+  seen+same vtable→skip (same); seen+changed vtable→skip, foreign
+  preserved (same as gate); new pointer+full table→drop with now-capped
+  log (was once-per-pointer log; slight repeat-scan/counter delta,
+  disclosed). Changed-vtable lists can no longer burn slots or be
+  overwritten — strictly safer than verbatim B.
+- **Build evidence:** `src\build_asi.bat` clean (no errors/warnings
+  shown). `dist/ScaleNG.asi` SHA-256 `C80D4E01…457171F` PE `0x6aca3bb4`;
+  helper PE `0x6aca3bb6`. NOT deployed, NOT run — no fix claim.
+- **Controlled test PLAN (not executed):** one serialized 40-75 s
+  `--real-test` when approved. Watch: purge-site AV (refutes everything),
+  reader-shaped Present-thread AV, ECL `instOk`/`instFail`/`instDedup`
+  deltas, `table full` log rate (must stay capped), coverage counters,
+  breakers/fatals. Stop immediately on any ScaleNG fault; preserve dump.
+  Success = clean run + sane counters; it cannot prove race absence.
+- **Rollback:** `git revert 668df64`, rebuild via `src\build_asi.bat`,
+  redeploy. Dumps/logs/runs intact and local-only.
+
 ## Checkpoint — 2026-10-10 (bounds audit: all arrays clean; new lead — vector race)
 
 - **Scope/method.** Seven read-only workstreams at HEAD `aa3b008`
