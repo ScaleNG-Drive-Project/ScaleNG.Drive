@@ -3010,6 +3010,33 @@ static bool LookupTrackedStates(ID3D12Resource* a, D3D12_RESOURCE_STATES* aOut,
     return aTr && bTr;
 }
 
+// C2712-safe single lookups for callers that own direct __try frames
+// (notably InjectAtPresentImpl): they cannot hold a BookGuard local, so the
+// lock lives here instead. Only copied VALUES escape - never an iterator,
+// reference, or pointer into map storage. A copied state can be stale by the
+// time the caller barriers, but Barrier() re-reads under guard and no-ops on
+// mismatch; callers keep their existing fail-closed untracked branches.
+static bool FindTrackedState(ID3D12Resource* res, D3D12_RESOURCE_STATES* out)
+{
+    if (!res || !out) return false;
+    BookGuard _bg;
+    auto it = g_resourceStates.find(res);
+    if (it == g_resourceStates.end()) return false;
+    *out = it->second;
+    return true;
+}
+
+// Same pattern for the handle->resource map (MV registry re-adoption path).
+static bool FindRtvResource(SIZE_T handle, ID3D12Resource** out)
+{
+    if (!handle || !out) return false;
+    BookGuard _bg;
+    auto it = g_rtvMap.find(handle);
+    if (it == g_rtvMap.end()) return false;
+    *out = it->second;
+    return true;
+}
+
 // Locked state-map restore WITHOUT recording: when a command list is
 // discarded unexecuted (e.g. NGX faulted mid-record and the list won't
 // Close), the GPU never saw our transitions, so the map must return to
@@ -7037,8 +7064,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     if (doStepLog) { ++s_stepLogs; Log("step: adopted bb=%p display=%ux%u fmt=%u", (void*)bb, g_displayW, g_displayH, g_bbFormat); }
 
     g_injStep = "adopted";
-    auto it = g_resourceStates.find(bb);
-    if (it == g_resourceStates.end()) {
+    // Guarded single lookup (value copy; no iterator escapes). bb's own entry
+    // state is unused downstream - only tracked/untracked matters here.
+    D3D12_RESOURCE_STATES bbProbe = D3D12_RESOURCE_STATE_COMMON;
+    if (!FindTrackedState(bb, &bbProbe)) {
         Log("hooks: backbuffer %p untracked - present injection skipped", (void*)bb);
         bb->Release();
         return;
@@ -7231,11 +7260,10 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
     g_injAlloc->Reset();
     g_injList->Reset(g_injAlloc, nullptr);
 
-    D3D12_RESOURCE_STATES bbState = it->second;
-    auto dit = g_resourceStates.find(g_depthResource);
-    auto mit = g_resourceStates.find(g_mvResource);
-    D3D12_RESOURCE_STATES depthState = dit != g_resourceStates.end() ? dit->second : D3D12_RESOURCE_STATE_COMMON;
-    D3D12_RESOURCE_STATES mvState = mit != g_resourceStates.end() ? mit->second : D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES mvState = D3D12_RESOURCE_STATE_COMMON;
+    FindTrackedState(g_depthResource, &depthState);
+    FindTrackedState(g_mvResource, &mvState);
 
     if (doDlss) {
         // P2#10: device health gates EVERYTHING - an adapter killed during
@@ -7270,14 +7298,15 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
             // engine will never recreate (fixed map/spawn). If its descriptor
             // key is still mapped, adopt it back - bridge SEH covers frees.
             if (!g_mvResource && g_mvLastRtvKey) {
-                auto ri = g_rtvMap.find(g_mvLastRtvKey);
-                if (ri != g_rtvMap.end() && ri->second) {
+                // Guarded single lookup (value copy; no iterator escapes).
+                ID3D12Resource* riRes = nullptr;
+                if (FindRtvResource((SIZE_T)g_mvLastRtvKey, &riRes) && riRes) {
                     // Format guard: the handle slot may have been recycled for a
                     // non-MV view since the key was recorded (the handle map is
                     // format-neutral by design). Never adopt a non-motion-vector
                     // resource as MV; valid re-adoptions pass unchanged.
                     D3D12_RESOURCE_DESC mrd = {};
-                    if (!SafeGetDesc(ri->second, &mrd) ||
+                    if (!SafeGetDesc(riRes, &mrd) ||
                         mrd.Format != DXGI_FORMAT_R16G16_FLOAT) {
                         static int s_mvKeyMismatchLogs = 0;
                         if (++s_mvKeyMismatchLogs <= 3)
@@ -7285,12 +7314,12 @@ void InjectAtPresentImpl(ID3D12CommandQueue* injQueue)
                                 (unsigned)mrd.Format);
                     } else {
                         // Metadata only on a real store (self-adopt guard).
-                        if (!StoreTracked(&g_mvResource, ri->second)) { /* keep prior MV metadata */ }
+                        if (!StoreTracked(&g_mvResource, riRes)) { /* keep prior MV metadata */ }
                         else {
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
                         if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
-                        Log("hooks: MV re-adopted from registry %p", (void*)ri->second);
+                        Log("hooks: MV re-adopted from registry %p", (void*)riRes);
                         }
                     }
                 }
