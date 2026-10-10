@@ -1,5 +1,102 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (reviewer handoff: verifiable source + audit)
+
+- **Source identity.** Branch `master`, HEAD `65d2152`
+  (`65d21526c0bc6752160dfd4171b62d8ba5b1e140`), remote `origin/master`
+  identical (verified via `ls-remote`; no upstream configured, pushes use
+  explicit `origin master`). `src/d3d12_hooks.cpp` and `docs/STATUS.md` are
+  committed and clean; only pre-existing `dist/*`/`src/vc140.pdb` build
+  outputs (E1 test build) plus untouched untracked helper files remain
+  dirty. Commit chain since `8203f77`: `c4ba182` (triage docs) →
+  `4b6930a` (preserve pre-existing work) → `2a8b7f0` (focused 5-line fix)
+  → `093bae0`/`65d2152` (docs). Full file:
+  `https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp` ;
+  fix commit:
+  `https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/commit/2a8b7f0634097c34e4e8f6cde28b6db02a9e79b2`
+- **Why line numbers differ from `c4ba182`.** `c4ba182` was docs-only, so
+  its `src/d3d12_hooks.cpp` equals `8203f77`'s. Commit `4b6930a`
+  (+595/-30, 24 hunks, e.g. `@@ -95,12 +95,27 @@`, `@@ -842,6
+  +852,85 @@`, `@@ -1529,6 +1625,185 @@`) inserted census/ledger code
+  above the cited regions, shifting every later line (e.g. `BookGuard`
+  moved `:418-421` → `:444-447`, purge `:3403-10` vs older offsets).
+  Commit `2a8b7f0` swaps 5 single lines 1-for-1 (no shift). All numbers
+  below are verified in `2a8b7f0` (`git show … | Select-String`).
+- **Fix (5 lines, `2a8b7f0`, 5+/5-):**
+  [`L3051`](https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp#L3051),
+  [`L9852`](https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp#L9852),
+  [`L9857`](https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp#L9857),
+  [`L9866`](https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp#L9866),
+  [`L9895`](https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp#L9895):
+  each `g_resourceStates[X] = Y;` became
+  `{ BookGuard _bgState; g_resourceStates[X] = Y; }`. Nothing else changed.
+- **Complete `g_resourceStates` audit** (24 grep matches; control flow and
+  lock scopes inspected, not just text search):
+  | line(s) | function (thread) | access | lock held | overlaps purge? | disposition |
+  |---|---|---|---|---|---|
+  | 2977-78 | `Barrier` (Present, own lists) | find | `BookGuard` yes | reader | already safe |
+  | 2988 | `Barrier` (Present) | write | `BookGuard` yes | same-lock | already safe |
+  | 3006-09 | `LookupTrackedStates` (Present, via shadow eval) | find x2 | `BookGuard` yes | reader | already safe |
+  | 3024-25 | `NoteTrackedStates` (Present, `:8567` useReal path) | write x2 | `BookGuard` yes | same-lock | already safe |
+  | 3051 | `CreateDlssOut` (Present `:7085` AND recording threads via `DoInjection` `:3237` <- `:9999/:10006`) | write | NONE | YES | FIXED `2a8b7f0` |
+  | 3409 | `RecordTrackedAddressReuse` (creation-hook threads) | erase | `BookGuard` yes (`:3404-10`) | self | already safe |
+  | 7040-41 | `InjectAtPresentImpl` (Present, `:6857`) | find | NONE | read-vs-write UB remains | follow-up, NOT fixed |
+  | 7234-38 | `InjectAtPresentImpl` (Present) | find x2 + reuse of `:7040` iterator | NONE | same + stale-iterator risk | follow-up, NOT fixed |
+  | 9852/57/66 | `CopyTexBody` (recording threads, via copy shims `:2309`/`:10015`) | write | NONE | YES | FIXED `2a8b7f0` |
+  | 9895 | `CopyTexBody` (recording) | write | NONE | YES | FIXED `2a8b7f0` |
+  | 10125 | `TrackResourceBarriers` (recording, via barrier shims `:2675`/`:10204`) | write | `BookGuard` yes | same-lock | already safe |
+  No `.clear/.insert/.emplace/.at/.count/.size/.begin/.end` on this map
+  anywhere; iteration exists only in `EraseResourceMappings` (`:3354-61`,
+  correct erase-while-iterate idiom), whose sole caller is the purge under
+  guard. `StoreTracked` performs no state-map writes (only `g_copyMapLock`
+  shared reads).
+- **`g_copySrcCount` audit (complete, same method):** declaration `:405`;
+  reads under shared lock `:595`, `:10376`, `:10387`; erase under
+  exclusive lock `:3413` (purge); write under exclusive lock `:9786`.
+  No iteration, no unguarded access found — not a suspect.
+- **Lock review.** [`BookGuard :444-447`](https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/blob/2a8b7f0/src/d3d12_hooks.cpp#L444):
+  recursive Windows `CRITICAL_SECTION` + one-time `InitOnce`; ctor/dtor
+  touch no other lock (leaf). At all five points no other ScaleNG lock is
+  held (`g_copyMapLock` released at `:9787`; `StoreTracked`'s internal
+  shared scope is closed before each write; `AdoptDisplaySize` takes no
+  book lock — body `:3059-3117` verified). No new nesting or inversion;
+  recursivity makes even accidental re-entry safe. C2712-safe: neither
+  `CreateDlssOut` (`:3028-53`) nor `CopyTexBody` (`:9586-10007`) contains a
+  direct `__try` (`:9768` is inside nested `Local::AltIsPairHalf`, `:10014`
+  is the caller). RAII releases on all C++ exits; SEH faults do not run
+  C++ dtors — a pre-existing property shared by all ~40 existing guard
+  sites, not newly introduced (the faulting thread died holding the
+  purge's guard, but the process died with it). Contention: each new scope
+  spans one map `operator[]`; the purge's long-held guard across four map
+  iterations is pre-existing and unchanged.
+- **Verified crash evidence:** TID 14220, read AV `[0+0x28]`
+  (`cmp [rax+0x28],rdi`, `rax=0`), `ScaleNG.asi+0x1A810`, fault bytes
+  SHA256-identical across crash backup, post-crash rebuild, stable-run
+  backup, and dump memory; `rdi` = recycled texture from the run's last
+  log line (`RecordTrackedAddressReuse` `:3391`, n=10, api=Placed,
+  present=301); stack RVAs + locals match the placed-creation hook frame;
+  `[rcx]=freed-head`, `[rcx+8]=0x54`. No symbol names used (no matching
+  PDB exists; 197-ASI sweep found zero `0x6ac974aa`).
+- **Remaining hypotheses (not facts):** exact map identity unproven
+  (`g_resourceStates` leads on locking evidence; `g_copySrcCount` is
+  clean); unrelated heap corruption from another source cannot be
+  excluded; Present-thread read-side races (`:7040`, `:7234-38`, incl. a
+  200-line stale iterator) persist by design-scope and are follow-up work.
+- **Gameplay test: YES, one was run** — `20261010T112850Z` (PID 4432, E1
+  build, 40 s `--real-test`, identical setup to the crash run):
+  Present 1→3849, 14 fallback ZERO-mode evals with handoff, 0 REAL evals
+  (rejections `mv-stale-present`/`mv-retired`; fail-closed intact, 2,948
+  heartbeats, 0 violations), 0 failures/fatals/breakers, exit 1 (harness
+  cleanup), no dump, INI restored. Purge path ran 500+ times clean.
+  Supports the diagnosis; does not prove it.
+- **Next falsifiable experiment:** soak (longer + repeated REAL-mode runs)
+  watching specifically for purge-site AVs; then, separately, guard the
+  Present-thread reads — that function HAS direct `__try`, so it needs
+  helper-outlining (as `NoteTrackedStates` does), not inline guards.
+- **Rollback:** `git revert 2a8b7f0`, rebuild `src\build_asi.bat`,
+  redeploy; local-only tag `local/preserved-e1-full` additionally preserves
+  the pre-split tree. Dump, logs, and run artifacts intact and local-only.
+
 ## Checkpoint — 2026-10-10 (E1 guard fix published; NOT yet tested)
 
 - **Source revision for all line references:** worktree `src/d3d12_hooks.cpp`
