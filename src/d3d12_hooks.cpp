@@ -1280,6 +1280,10 @@ typedef void (STDMETHODCALLTYPE* PFN_CreateDepthStencilView)(ID3D12Device*, ID3D
 typedef void (STDMETHODCALLTYPE* PFN_CreateShaderResourceView)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandQueue)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandList)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
+// ID3D12Device4::CreateCommandList1 — SDK-verified slot 51 on the shared device vtable
+// (10.0.28000.0, header line 13031-13038). Signature differs from CreateCommandList:
+// no allocator/initialState, has D3D12_COMMAND_LIST_FLAGS parameter.
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandList1)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_FLAGS, REFIID, void**);
 typedef void (STDMETHODCALLTYPE* PFN_ExecuteCommandLists)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 typedef void (STDMETHODCALLTYPE* PFN_CopyBufferRegion)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
 typedef void (STDMETHODCALLTYPE* PFN_CopyTextureRegion)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
@@ -1331,6 +1335,11 @@ PFN_CopyDescriptors Real_CopyDescriptors = nullptr;
 PFN_CopyDescriptorsSimple Real_CopyDescriptorsSimple = nullptr;
 PFN_CreateCommandQueue Real_CreateCommandQueue = nullptr;
 PFN_CreateCommandList Real_CreateCommandList = nullptr;
+// Observation-only hook handle for CreateCommandList1 (slot 51, Device4).
+// NOT used for shim installation — forwards only. See Hook_CreateCommandList1_Diag.
+static PFN_CreateCommandList1 Real_CreateCommandList1 = nullptr;
+static volatile LONG g_diagCC1Installed = 0;
+static volatile LONG g_diagCC1Calls = 0;
 PFN_ExecuteCommandLists Real_ExecuteCommandLists = nullptr;
 // Device QueryInterface original for the QI census. Same save-once pattern as
 // the other device vtable entries: only the first observed table is ever
@@ -4489,6 +4498,22 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                         if (ptrRegistered) InterlockedIncrement64(&s_eclPtrRegTotal);
                         else InterlockedIncrement64(&s_eclPtrUnregTotal);
                     }
+                    // Vtable identity classification for shim-miss registered lists.
+                    // Uses data from FindShimByListOnly — NO writes, NO new allocations.
+                    // Distinguishes: clone-active (our hooks), original-restored
+                    // (runtime swapped back to driver vtable), foreign-vtable (third-party).
+                    if (!preShim && ptrRegistered) {
+                        const char* vtblClass;
+                        if (actual == expectedCloned) vtblClass = "clone-active";
+                        else if (actual == expectedOriginal) vtblClass = "original-restored";
+                        else vtblClass = "foreign-vtable";
+                        static volatile LONG64 s_eclVtblClassTotal = 0;
+                        LONG64 vc = InterlockedIncrement64(&s_eclVtblClassTotal);
+                        if (vc <= 10 || (vc % 1000) == 0) {
+                            Log("hooks: ECL vtable-class list=%p class=%s actual=%p clone=%p original=%p (vc=%lld)",
+                                (void*)cl, vtblClass, actual, expectedCloned, expectedOriginal, vc);
+                        }
+                    }
                     if (sampled) {
                         LONG64 hits = InterlockedCompareExchange64(&s_eclHitTotal, 0, 0);
                         LONG64 misses = InterlockedCompareExchange64(&s_eclMissTotal, 0, 0);
@@ -4706,6 +4731,29 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList(
                     (void*)device, (void*)g_device, *outList, (unsigned)type, (int)m);
             }
         }
+    }
+    return hr;
+}
+
+// --- Observation-only CreateCommandList1 diagnostic hook ---
+// Installed at device slot 51 (ID3D12Device4::CreateCommandList1, SDK-verified).
+// Logs list-count + first-N for correlation with ECL coverage diagnostics.
+// Does NOT call InstallCommandListHooks — preserves original vtable, no behavior change.
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList1_Diag(
+    ID3D12Device* device, UINT nodeMask, D3D12_COMMAND_LIST_TYPE type,
+    D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void** outList)
+{
+    if (!Real_CreateCommandList1)
+        return E_POINTER;
+    LONG n = InterlockedIncrement(&g_diagCC1Calls);
+    HRESULT hr = Real_CreateCommandList1(device, nodeMask, type, flags, riid, outList);
+    // Bounded: first 8 + every 200th. No InstallCommandListHooks — observation only.
+    if (SUCCEEDED(hr) && outList && *outList && (n <= 8 || (n % 200) == 0)) {
+        void* list = *outList;
+        void** vtbl = nullptr;
+        __try { vtbl = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Log("hooks: CreateCommandList1 #%d list=%p type=%u flags=%u vtbl=%p device=%p (cc1diag)",
+            (int)n, list, (unsigned)type, (unsigned)flags, (void*)vtbl, (void*)device);
     }
     return hr;
 }
@@ -10813,6 +10861,24 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
             } else {
                 Log("hooks: device CreateCommandList hook create FAILED target=%p st=%d",
                     ccl, (int)lst);
+            }
+            // Observation-only: hook CreateCommandList1 (ID3D12Device4, slot 51)
+            // to census which creation path the game uses. Forwards to real only;
+            // does NOT install command-list shims. Same-vtable guard as Device4
+            // hooks at 10630: only instrument if the Device4 vtable is shared.
+            void* cc1Target = dv[51];
+            if (cc1Target && InterlockedCompareExchange(&g_diagCC1Installed, 0, 0) == 0) {
+                MH_STATUS cc1st = MH_CreateHook(cc1Target, (void*)&Hook_CreateCommandList1_Diag,
+                                                (void**)&Real_CreateCommandList1);
+                if (cc1st == MH_OK || cc1st == MH_ERROR_ALREADY_CREATED) {
+                    MH_STATUS cc1en = MH_EnableHook(cc1Target);
+                    Log("hooks: CreateCommandList1 diag hook INSTALLED slot=51 target=%p st=%d enable=%d",
+                        (void*)cc1Target, (int)cc1st, (int)cc1en);
+                    InterlockedExchange(&g_diagCC1Installed, 1);
+                } else {
+                    Log("hooks: CreateCommandList1 diag hook FAILED slot=51 target=%p st=%d",
+                        (void*)cc1Target, (int)cc1st);
+                }
             }
         }
         // Install RTV/SRV/resource-creation hooks. Diagnostic-only forwarding.
