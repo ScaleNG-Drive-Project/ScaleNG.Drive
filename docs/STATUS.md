@@ -1,5 +1,29 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (approved vector-fix soak: clean short run, not proof)
+
+- **Run `20261010T132749Z` (PID 5240, approved single 40 s `--real-test`):**
+  source == reviewed `668df64` (empty diff pre-launch) → harness rebuilt
+  16:27:51 → `dist` == plugins `66FA7507…E48E6AE2A`, PE `0x6aca3d5b` →
+  loaded (`asiBase` logged, fresh-PID markers, deployment check passed).
+  Present 1→3797, 14 ZERO-mode evals + handoff, 0 REAL evals
+  (`mv-retired`, fail-closed; 2,956 heartbeats), 0 failures/fatals/
+  breakers, exit 1 (orderly eval tail to Present 3797, no PID-5240 dump,
+  no leftover process, INI restored) — cleanup termination, same pattern
+  as prior clean runs.
+- **Watched signals:** purge path entered 26+ logged times (capped log)
+  with concurrent presents/evals; shim totals `instOk=38 instDedup=0
+  instFail=0` (dedup-hits correctly absorbed by the `WasListHooked`
+  seen-check, so internal dedup never fires; 38 distinct installs, zero
+  failures); `table full` occurrences = 0 (no flood; table never filled).
+  No AV, no device-removal error, no purge-entry crash.
+- **Outcome class: SHORT RUN COMPLETED WITHOUT CRASH.** This does not
+  prove the race eliminated (2/12 prior runs crashed; timing-dependent),
+  does not establish the original cause either way, and says nothing
+  about REAL correctness. REAL validation unweakened throughout.
+- **Rollback:** `git revert 668df64`, rebuild, redeploy. Dumps/logs/runs
+  intact and local-only. No second test without another review.
+
 ## Checkpoint — 2026-10-10 (vector gate removed via reviewed B-variant; built, untested)
 
 - **Review outcome:** two independent reviewers returned NO-GO on verbatim
