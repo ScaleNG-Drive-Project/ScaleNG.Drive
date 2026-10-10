@@ -1,5 +1,53 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (E1 guard fix published; NOT yet tested)
+
+- **Source revision for all line references:** worktree `src/d3d12_hooks.cpp`
+  at parent commit `c4ba182` (pushed) for the pre-existing code; the fix
+  itself is the focused commit `2a8b7f0` (5 insertions, 5 deletions, pushed
+  alongside this STATUS). The edit replaces 5 single lines 1-for-1, so every
+  cited line number is identical before and after — re-verified post-edit.
+- **Complete `g_resourceStates` access audit** (24 grep matches,
+  `src/d3d12_hooks.cpp`): declaration `:1252`; lock comment `:437`.
+  WRITES (8): guarded `:2988` (`Barrier`), `:3024-25`
+  (`NoteTrackedStates`), `:10125` (`TrackResourceBarriers`); UNGUARDED →
+  now fixed `:3051` (`CreateDlssOut`), `:9852/:9857/:9866/:9895`
+  (`CopyTexBody`). ERASES (1): `:3409` guarded (purge, `BookGuard` held
+  `:3404-10`). READS: guarded `:2977-78`, `:3006-09`
+  (`LookupTrackedStates`); UNGUARDED (left as-is, see uncertainty)
+  `:7040` and `:7234-38` (Present-thread inject flow; `:7234` reuses the
+  `:7040` iterator ~200 lines later). No `.clear/.insert/.emplace/.at/.count`
+  on this map anywhere. `g_copySrcCount` writes are exclusive-locked
+  (`:9786`, `:3413`) and reads shared — not a suspect; all handle-map
+  writers found are guarded.
+- **The five scopes (complete diff, one line each):**
+  `:3051` and `:9852/:9857/:9866/:9895` changed from
+  `g_resourceStates[X] = Y;` to
+  `{ BookGuard _bgState; g_resourceStates[X] = Y; }`. Nothing else touched.
+- **Lock-order analysis:** `BookGuard` (`:444-447`) wraps a recursive
+  Windows `CRITICAL_SECTION` (`g_bookCS`, one-time `InitOnce` init) and
+  touches no other lock — it is a leaf. At all five points no other lock is
+  held: `:3051` sits in `CreateDlssOut` (`:3028-53`, no locks, no `__try`);
+  the four `CopyTexBody` points sit after `g_copyMapLock` release (`:9787`),
+  `StoreTracked`'s internal shared-lock scope is closed before each write,
+  and `AdoptDisplaySize` (`:9896`, after the last scope) takes no book lock
+  (verified body `:3059-3117`). No new nesting, no inversion.
+  C2712-safe: `CopyTexBody` (`:9586-10007`) has no direct `__try` (`:9768`
+  is inside nested `Local::AltIsPairHalf`, `:10014` is the caller
+  `Hook_CopyTextureRegion`); the file comment at `:9765` already reserves
+  this. The `:7234` stale-iterator read and the `:7040` unguarded find are
+  intentionally OUT of scope — recorded as follow-up, not silently fixed.
+- **Build evidence:** `src\build_asi.bat` succeeded after the edit (no
+  C2712, no warnings-as-errors breakage). Fresh `dist/ScaleNG.asi` PE
+  timestamp `0x6aca209d` SHA-256 `5FDDFDDA…A5EC65`; helper `0x6aca209e`
+  `77005B4E…C47DC7`. NOT deployed, NOT run — no fix claim is made.
+- **Falsifiability (unchanged):** one serialized short test of the changed
+  build; clean runs support the race diagnosis, a repeat AV at the same
+  site/shape refutes sufficiency. REAL stays fail-closed throughout.
+- **Reviewer note:** raw dump, run logs, and `%TEMP%\opencode` scripts
+  remain local-only and intact; this section plus the pushed src commit are
+  the reviewable record.
+
 ## Checkpoint — 2026-10-10 (offline crash triage: map race; docs-only pass)
 
 - **Dump triage completed offline (read-only; no game run, no code edit).**
@@ -57,8 +105,9 @@
   site/shape refutes sufficiency. REAL stays fail-closed; no breakers, hooks,
   or settings touched. Revert = 5 small scopes, rebuild.
 - **This pass:** STATUS text only (this section + correction below). No
-  source edit, no rebuild, no BeamNG run. Commit/push is docs-only so the web
-  reviewer can inspect; raw dump and `%TEMP%\opencode` scripts stay local.
+  source edit, no rebuild, no BeamNG run in this pass. The E1 source commit
+  follows as its own focused commit; both are pushed for reviewer
+  inspection. Raw dump and `%TEMP%\opencode` scripts stay local.
 
 ## Checkpoint — 2026-10-10 (REAL diagnostic run faulted inside ScaleNG)
 
