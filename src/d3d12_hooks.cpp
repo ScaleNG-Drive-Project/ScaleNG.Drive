@@ -95,12 +95,27 @@ unsigned int g_mvStamp = 0;
 // g_frameCounter (camera clock) only advances when the engine patches
 // camera CBs — it freezes during steady state, making the frame-counter
 // age gate (10/20000 frames) certify week-old resources as "fresh".
-// g_presentSerial advances on every Present, so (presentSerial -
-// g_mvLastTouchPresent) proves the engine touched this input within a real,
-// observable frame interval. Zero = no observation since adoption (fail
-// closed on first eval).
+// g_presentSerial advances on every Present, so the age bounds when a covered
+// callback was observed. It does not prove the recorded list executed, that a
+// draw wrote the resource, or that its contents align with the evaluated color.
+// Zero = no observation since adoption (fail closed on first eval).
 static unsigned long long g_mvLastTouchPresent = 0;
 static unsigned long long g_depthLastTouchPresent = 0;
+// Diagnostic-only per-resource touch records. A nonblocking writer lock keeps
+// each pointer/generation/serial/source tuple coherent across recording threads;
+// contended samples are dropped and counted. These records never affect gates.
+struct ResourceTouchLedger {
+    volatile LONG writer;
+    ID3D12Resource* resource;
+    LONG64 generation;
+    LONG64 present;
+    LONG64 ecl;
+    LONG source;
+    volatile LONG64 dropped;
+};
+static ResourceTouchLedger g_mvPrimaryTouchLedger = {};
+static ResourceTouchLedger g_mvAltTouchLedger = {};
+static ResourceTouchLedger g_depthTouchLedger = {};
 unsigned int g_evalFailStreak = 0;
 bool g_dlaaHalted = false;
 // Frame stamp of the last successful camera-CB patch: our "gameplay is
@@ -375,17 +390,12 @@ bool g_injectedThisFrame = false;
 ID3D12Resource* g_grave[4] = {};
 int g_graveN = 0;
 
-// Tracked-resource ownership: discovery AddRefs every engine resource it
-// adopts so the pointer can never dangle if the engine releases its own ref
-// between our frames (use-after-free was the mv-barrier TDR source). The
-// previous occupant is parked in the graveyard and released after the next
-// injection fence proves the GPU is done with it.
-// Created-table: refs taken INSIDE creation hooks (object provably alive,
-// engine holds its own ref alongside ours). Adoption later TRANSFERS that
-// ref into the tracked slot. Observing an unknown resource adopts it as a
-// WEAK pointer - AddRef-on-observation is illegal (the object may be mid-
-// destruction; resurrecting it corrupted the engine's object graph and
-// caused deterministic teardown AVs).
+// Legacy ownership scaffolding. Current engine-resource candidate slots and
+// maps store weak pointers; they do not AddRef or own observed resources.
+// CreatedRef_Put and the g_owned helpers below currently have no call sites.
+// Do not infer resource lifetime from address-generation bookkeeping or from
+// these unused helpers; ownership changes need a bounded acquire/release
+// design and evidence that acquiring at the observation point is safe.
 ID3D12Resource* g_createdRefs[256] = {};
 int g_createdN = 0;
 // Slots currently owning a transferred ref (graveyard/replace decisions).
@@ -842,6 +852,85 @@ static SRWLOCK g_sceneSetLock = SRWLOCK_INIT;
 static unsigned long long SceneSetNow()
 { return (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0); }
 
+enum ResourceTouchSource : LONG {
+    TOUCH_SOURCE_NONE = 0,
+    TOUCH_SOURCE_BARRIER = 1,
+    TOUCH_SOURCE_BROAD_BARRIER = 2,
+    TOUCH_SOURCE_OM_BIND = 3,
+    TOUCH_SOURCE_DSV_BIND = 4
+};
+
+static void RecordTouchLedger(ResourceTouchLedger* ledger,
+                              ID3D12Resource* resource, LONG64 generation,
+                              LONG source)
+{
+    if (!ledger || !resource) return;
+    if (InterlockedCompareExchange(&ledger->writer, 1, 0) != 0) {
+        InterlockedIncrement64(&ledger->dropped);
+        return;
+    }
+    ledger->resource = resource;
+    ledger->generation = generation;
+    ledger->present = (LONG64)SceneSetNow();
+    ledger->ecl = InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+    ledger->source = source;
+    InterlockedExchange(&ledger->writer, 0);
+}
+
+struct ResourceTouchSnapshot {
+    bool valid;
+    ID3D12Resource* resource;
+    LONG64 generation;
+    LONG64 present;
+    LONG64 ecl;
+    LONG source;
+    LONG64 dropped;
+};
+
+static bool CaptureTouchLedger(ResourceTouchLedger* ledger,
+                               ResourceTouchSnapshot* out)
+{
+    if (!ledger || !out) return false;
+    if (InterlockedCompareExchange(&ledger->writer, 1, 0) != 0) return false;
+    ResourceTouchSnapshot snapshot = {};
+    snapshot.resource = ledger->resource;
+    snapshot.generation = ledger->generation;
+    snapshot.present = ledger->present;
+    snapshot.ecl = ledger->ecl;
+    snapshot.source = ledger->source;
+    snapshot.dropped = InterlockedCompareExchange64(&ledger->dropped, 0, 0);
+    snapshot.valid = snapshot.resource != nullptr;
+    InterlockedExchange(&ledger->writer, 0);
+    *out = snapshot;
+    return true;
+}
+
+// Record the exact candidate identity behind a touch as diagnostic telemetry.
+// The existing shared timestamp and all gate behavior remain unchanged.
+static void NoteMvTouchIdentity(ID3D12Resource* resource, LONG source)
+{
+    if (!resource) return;
+    LONG64 generation = 0;
+    ResourceTouchLedger* ledger = nullptr;
+    if (resource == g_mvResource) {
+        generation = InterlockedCompareExchange64(&g_mvResourceGeneration, 0, 0);
+        ledger = &g_mvPrimaryTouchLedger;
+    } else if (resource == g_mvResourceAlt) {
+        generation = InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0);
+        ledger = &g_mvAltTouchLedger;
+    }
+    if (ledger) RecordTouchLedger(ledger, resource, generation, source);
+}
+
+static void NoteDepthTouchIdentity(ID3D12Resource* resource, LONG source)
+{
+    if (!resource) return;
+    LONG64 generation = resource == g_depthResource
+        ? InterlockedCompareExchange64(&g_depthResourceGeneration, 0, 0) : 0;
+    if (resource == g_depthResource)
+        RecordTouchLedger(&g_depthTouchLedger, resource, generation, source);
+}
+
 // Scene-color formats: the HDR pipeline renders linear HALF-float scene
 // color (R16G16B16A16_FLOAT, verified live: 1920x1080 fmt-10 RTV-bound,
 // barriered PSR->RT, and viewported on one list at present 192); UNORM is
@@ -1196,6 +1285,11 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_CommandListReset)(ID3D12GraphicsCommandL
 typedef void (STDMETHODCALLTYPE* PFN_DrawInstanced)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstanced)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_Dispatch)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+static HRESULT STDMETHODCALLTYPE Shim_CommandListClose(ID3D12GraphicsCommandList*);
+static HRESULT STDMETHODCALLTYPE Shim_CommandListReset(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+static void STDMETHODCALLTYPE Shim_DrawInstanced(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+static void STDMETHODCALLTYPE Shim_DrawIndexedInstanced(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+static void STDMETHODCALLTYPE Shim_Dispatch(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_ResourceMap)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
 typedef void (STDMETHODCALLTYPE* PFN_ResourceUnmap)(ID3D12Resource*, UINT, const D3D12_RANGE*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
@@ -1297,6 +1391,8 @@ struct CommandListShim {
     PFN_Dispatch dispatch;
     volatile LONG64 recordingEpoch;
     volatile LONG recordingClosed;
+    volatile LONG recordingResetInProgress;
+    volatile LONG recordingResetFailed;
     ID3D12Resource* volatile currentOmMvTarget;
     ID3D12Resource* volatile recordedMvTarget;
     volatile LONG mvTargetWidth;
@@ -1527,6 +1623,185 @@ static CommandListShim* FindCommandListShim(ID3D12GraphicsCommandList* list)
     }
     ReleaseSRWLockShared(&g_commandListShimLock);
     return result;
+}
+
+// If a third party replaces a list's vtable after we installed our clone,
+// wrappers must still forward exactly once. Prefer the currently installed
+// method when it is not one of our wrappers; if it is our wrapper, recover the
+// saved original by pointer identity. This helper never retains the COM object.
+static void* ResolveCommandListForward(ID3D12GraphicsCommandList* list,
+                                      UINT slot, void* ourShim)
+{
+    if (!list || slot >= 64) return nullptr;
+    void** actual = nullptr;
+    void* target = nullptr;
+    __try {
+        actual = *(void***)list;
+        if (actual) target = actual[slot];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        actual = nullptr;
+        target = nullptr;
+    }
+    if (target && target != ourShim) return target;
+
+    void* saved = nullptr;
+    AcquireSRWLockShared(&g_commandListShimLock);
+    for (auto& shim : g_commandListShims) {
+        if (shim.list != list || !shim.originalVtbl) continue;
+        __try { saved = shim.originalVtbl[slot]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { saved = nullptr; }
+        if (saved && saved != ourShim) break;
+    }
+    ReleaseSRWLockShared(&g_commandListShimLock);
+    return saved;
+}
+
+struct MvRecordingSnapshot {
+    bool found;
+    bool closed;
+    bool stable;
+    bool resetInProgress;
+    bool resetFailed;
+    bool clonedVtblMatches;
+    void** actualVtbl;
+    void** expectedClonedVtbl;
+    void** expectedOriginalVtbl;
+    UINT listType;
+    LONG64 epoch;
+    ID3D12Resource* target;
+    LONG width;
+    LONG height;
+    LONG64 omCount;
+    LONG64 drawCount;
+    LONG64 indexedDrawCount;
+    LONG64 dispatchCount;
+    LONG64 recordPresent;
+    LONG64 recordEcl;
+};
+
+static bool CaptureMvRecordingSnapshot(ID3D12GraphicsCommandList* list,
+                                       MvRecordingSnapshot* out)
+{
+    if (!list || !out) return false;
+    MvRecordingSnapshot snapshot = {};
+    void** actualVtbl = nullptr;
+    __try { actualVtbl = *(void***)list; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    AcquireSRWLockShared(&g_commandListShimLock);
+    CommandListShim* selectedShim = nullptr;
+    CommandListShim* historicalShim = nullptr;
+    for (auto& shim : g_commandListShims) {
+        if (shim.list != list || !shim.clonedVtbl) continue;
+        if (!historicalShim) historicalShim = &shim;
+        if (actualVtbl == shim.clonedVtbl) {
+            selectedShim = &shim;
+            break;
+        }
+    }
+    // Prefer the attachment generation that owns the current vtable. If a
+    // third party has replaced it, retain the oldest available snapshot only
+    // as explicitly historical mismatch evidence.
+    CommandListShim* shim = selectedShim ? selectedShim : historicalShim;
+    if (shim) {
+        snapshot.found = true;
+        LONG resetBefore = InterlockedCompareExchange(&shim->recordingResetInProgress, 0, 0);
+        snapshot.resetInProgress = resetBefore != 0;
+        snapshot.resetFailed = InterlockedCompareExchange(&shim->recordingResetFailed, 0, 0) != 0;
+        snapshot.closed = InterlockedCompareExchange(&shim->recordingClosed, 0, 0) != 0;
+        snapshot.clonedVtblMatches = actualVtbl == shim->clonedVtbl;
+        snapshot.actualVtbl = actualVtbl;
+        snapshot.expectedClonedVtbl = shim->clonedVtbl;
+        snapshot.expectedOriginalVtbl = shim->originalVtbl;
+        snapshot.listType = shim->listType;
+        snapshot.epoch = InterlockedCompareExchange64(&shim->recordingEpoch, 0, 0);
+        snapshot.target = (ID3D12Resource*)InterlockedCompareExchangePointer(
+            (PVOID volatile*)&shim->recordedMvTarget, nullptr, nullptr);
+        snapshot.width = InterlockedCompareExchange(&shim->mvTargetWidth, 0, 0);
+        snapshot.height = InterlockedCompareExchange(&shim->mvTargetHeight, 0, 0);
+        snapshot.omCount = InterlockedCompareExchange64(&shim->mvTargetOmCount, 0, 0);
+        snapshot.drawCount = InterlockedCompareExchange64(&shim->mvTargetDrawCount, 0, 0);
+        snapshot.indexedDrawCount = InterlockedCompareExchange64(&shim->mvTargetIndexedDrawCount, 0, 0);
+        snapshot.dispatchCount = InterlockedCompareExchange64(&shim->dispatchCount, 0, 0);
+        snapshot.recordPresent = InterlockedCompareExchange64(&shim->mvTargetRecordPresent, 0, 0);
+        snapshot.recordEcl = InterlockedCompareExchange64(&shim->mvTargetRecordEcl, 0, 0);
+        snapshot.stable = !snapshot.resetInProgress && !snapshot.resetFailed && snapshot.closed &&
+            InterlockedCompareExchange(&shim->recordingResetInProgress, 0, 0) == 0 &&
+            InterlockedCompareExchange(&shim->recordingResetFailed, 0, 0) == 0 &&
+            InterlockedCompareExchange64(&shim->recordingEpoch, 0, 0) == snapshot.epoch &&
+            InterlockedCompareExchange(&shim->recordingClosed, 0, 0) != 0;
+    }
+    ReleaseSRWLockShared(&g_commandListShimLock);
+    *out = snapshot;
+    return snapshot.found;
+}
+
+static volatile LONG64 g_mvRecordingSubmittedTotal = 0;
+static volatile LONG64 g_mvRecordingSubmittedDetail = 0;
+static volatile LONG64 g_mvRecordingDrawTotal = 0;
+static volatile LONG64 g_mvRecordingOmSetTotal = 0;
+static volatile LONG64 g_mvRecordingQualifyingOmTotal = 0;
+static volatile LONG64 g_mvRecordingResetTotal = 0;
+static volatile LONG64 g_mvRecordingResetSuccessTotal = 0;
+static volatile LONG64 g_mvRecordingResetFailTotal = 0;
+static volatile LONG64 g_mvRecordingCloseTotal = 0;
+static volatile LONG64 g_mvRecordingCloseSuccessTotal = 0;
+static volatile LONG64 g_mvRecordingCloseFailTotal = 0;
+static volatile LONG64 g_mvRecordingCloneMismatchTotal = 0;
+
+static void NoteMvOmTarget(ID3D12GraphicsCommandList* list,
+                           CommandListShim* shim, UINT count,
+                           const D3D12_CPU_DESCRIPTOR_HANDLE* handles)
+{
+    if (!shim) return;
+    ID3D12Resource* candidate = nullptr;
+    D3D12_RESOURCE_DESC candidateDesc = {};
+    // Track the final qualifying RTV in the OM set. This only records a
+    // requested bind; it does not infer draw output or resource contents.
+    for (UINT i = 0; handles && i < count && i < 8; ++i) {
+        if (!handles[i].ptr) continue;
+        ID3D12Resource* resource = nullptr;
+        {
+            BookGuard guard;
+            auto it = g_rtvMap.find(handles[i].ptr);
+            if (it != g_rtvMap.end()) resource = it->second;
+        }
+        if (!resource) continue;
+        D3D12_RESOURCE_DESC desc = {};
+        if (!SafeGetDesc(resource, &desc)) continue;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc.Format == DXGI_FORMAT_R16G16_FLOAT && desc.Width >= 1000 &&
+            desc.Height >= 500 && desc.SampleDesc.Count == 1) {
+            candidate = resource;
+            candidateDesc = desc;
+        }
+    }
+
+    InterlockedExchangePointer((PVOID volatile*)&shim->currentOmMvTarget,
+                               candidate);
+    if (!candidate) return;
+
+    InterlockedExchangePointer((PVOID volatile*)&shim->recordedMvTarget,
+                               candidate);
+    InterlockedIncrement64(&g_mvRecordingQualifyingOmTotal);
+    InterlockedExchange(&shim->mvTargetWidth, (LONG)candidateDesc.Width);
+    InterlockedExchange(&shim->mvTargetHeight, (LONG)candidateDesc.Height);
+    InterlockedIncrement64(&shim->mvTargetOmCount);
+    InterlockedExchange64(&shim->mvTargetRecordPresent,
+        InterlockedCompareExchange64(&g_presentSerial, 0, 0));
+    InterlockedExchange64(&shim->mvTargetRecordEcl,
+        InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+
+    static volatile LONG s_mvOmDetails = 0;
+    LONG detail = InterlockedIncrement(&s_mvOmDetails);
+    if (detail <= 12 || (detail % 1000) == 0)
+        Log("mv-record: om-target list=%p type=%u target=%p size=%ux%u fmt=%u epoch=%lld present=%llu ecl=%llu detail=%ld",
+            (void*)list, shim->listType, (void*)candidate,
+            (unsigned)candidateDesc.Width, (unsigned)candidateDesc.Height,
+            (unsigned)candidateDesc.Format,
+            (long long)InterlockedCompareExchange64(&shim->recordingEpoch, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0),
+            detail);
 }
 
 // Diagnostic only: find a registry entry by list pointer alone, regardless of
@@ -2283,6 +2558,111 @@ static void CorrNoteViewport(ID3D12GraphicsCommandList* list, UINT numViewports,
     }
 }
 
+static HRESULT STDMETHODCALLTYPE Shim_CommandListReset(
+    ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* initialState)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    PFN_CommandListReset original = shim ? shim->reset : nullptr;
+    if (!original) original = (PFN_CommandListReset)ResolveCommandListForward(
+        list, 10, (void*)&Shim_CommandListReset);
+    if (!original) return E_POINTER;
+    InterlockedIncrement64(&g_mvRecordingResetTotal);
+    if (shim) InterlockedExchange(&shim->recordingResetInProgress, 1);
+    HRESULT hr = original(list, allocator, initialState);
+    if (SUCCEEDED(hr)) InterlockedIncrement64(&g_mvRecordingResetSuccessTotal);
+    if (SUCCEEDED(hr) && shim) {
+        InterlockedExchange(&shim->recordingResetFailed, 0);
+        InterlockedExchange(&shim->recordingClosed, 0);
+        InterlockedIncrement64(&shim->recordingEpoch);
+        InterlockedExchangePointer((PVOID volatile*)&shim->currentOmMvTarget, nullptr);
+        InterlockedExchangePointer((PVOID volatile*)&shim->recordedMvTarget, nullptr);
+        InterlockedExchange(&shim->mvTargetWidth, 0);
+        InterlockedExchange(&shim->mvTargetHeight, 0);
+        InterlockedExchange64(&shim->mvTargetOmCount, 0);
+        InterlockedExchange64(&shim->mvTargetDrawCount, 0);
+        InterlockedExchange64(&shim->mvTargetIndexedDrawCount, 0);
+        InterlockedExchange64(&shim->dispatchCount, 0);
+        InterlockedExchange64(&shim->mvTargetRecordPresent, 0);
+        InterlockedExchange64(&shim->mvTargetRecordEcl, 0);
+    } else if (FAILED(hr)) {
+        if (shim) {
+            InterlockedExchange(&shim->recordingResetFailed, 1);
+            InterlockedExchange(&shim->recordingResetInProgress, 0);
+        }
+        InterlockedIncrement64(&g_mvRecordingResetFailTotal);
+    }
+    if (SUCCEEDED(hr) && shim) InterlockedExchange(&shim->recordingResetInProgress, 0);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Shim_CommandListClose(ID3D12GraphicsCommandList* list)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    PFN_CommandListClose original = shim ? shim->close : nullptr;
+    if (!original) original = (PFN_CommandListClose)ResolveCommandListForward(
+        list, 9, (void*)&Shim_CommandListClose);
+    if (!original) return E_POINTER;
+    InterlockedIncrement64(&g_mvRecordingCloseTotal);
+    HRESULT hr = original(list);
+    if (SUCCEEDED(hr)) {
+        if (shim) InterlockedExchange(&shim->recordingClosed, 1);
+        InterlockedIncrement64(&g_mvRecordingCloseSuccessTotal);
+    } else {
+        InterlockedIncrement64(&g_mvRecordingCloseFailTotal);
+    }
+    return hr;
+}
+
+static void STDMETHODCALLTYPE Shim_DrawInstanced(
+    ID3D12GraphicsCommandList* list, UINT vertexCount, UINT instanceCount,
+    UINT startVertex, UINT startInstance)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    PFN_DrawInstanced original = shim ? shim->drawInstanced : nullptr;
+    if (!original) original = (PFN_DrawInstanced)ResolveCommandListForward(
+        list, 12, (void*)&Shim_DrawInstanced);
+    if (!original) return;
+    if (shim && InterlockedCompareExchangePointer((PVOID volatile*)&shim->currentOmMvTarget,
+                                          nullptr, nullptr))
+    {
+        InterlockedIncrement64(&shim->mvTargetDrawCount);
+        InterlockedIncrement64(&g_mvRecordingDrawTotal);
+    }
+    original(list, vertexCount, instanceCount, startVertex, startInstance);
+}
+
+static void STDMETHODCALLTYPE Shim_DrawIndexedInstanced(
+    ID3D12GraphicsCommandList* list, UINT indexCount, UINT instanceCount,
+    UINT startIndex, INT baseVertex, UINT startInstance)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    PFN_DrawIndexedInstanced original = shim ? shim->drawIndexedInstanced : nullptr;
+    if (!original) original = (PFN_DrawIndexedInstanced)ResolveCommandListForward(
+        list, 13, (void*)&Shim_DrawIndexedInstanced);
+    if (!original) return;
+    if (shim && InterlockedCompareExchangePointer((PVOID volatile*)&shim->currentOmMvTarget,
+                                          nullptr, nullptr))
+    {
+        InterlockedIncrement64(&shim->mvTargetIndexedDrawCount);
+        InterlockedIncrement64(&g_mvRecordingDrawTotal);
+    }
+    original(list, indexCount, instanceCount, startIndex,
+             baseVertex, startInstance);
+}
+
+static void STDMETHODCALLTYPE Shim_Dispatch(
+    ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z)
+{
+    CommandListShim* shim = FindCommandListShim(list);
+    PFN_Dispatch original = shim ? shim->dispatch : nullptr;
+    if (!original) original = (PFN_Dispatch)ResolveCommandListForward(
+        list, 14, (void*)&Shim_Dispatch);
+    if (!original) return;
+    if (shim) InterlockedIncrement64(&shim->dispatchCount);
+    original(list, x, y, z);
+}
+
 static void STDMETHODCALLTYPE Shim_ResourceBarrier(ID3D12GraphicsCommandList* list,
                                                    UINT count, const D3D12_RESOURCE_BARRIER* barriers)
 {
@@ -2303,12 +2683,16 @@ static void STDMETHODCALLTYPE Shim_OMSetRenderTargets(
     const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
 {
     CommandListShim* shim = FindCommandListShim(list);
+    InterlockedIncrement64(&g_mvRecordingOmSetTotal);
     LONG64 invocation = InterlockedIncrement64(&g_shimOmCalls);
     LogCommandListShimCounter("OMSetRenderTargets", invocation, list, shim);
     ObserveNativeOmUsage(list, count, handles, singleRange, depth);
     // LEGACY RECONNECT: bound-RTV tracking for SceneColorBound() (the
     // viewport-patch prerequisite). Forwarding below is unchanged.
     ID3D12Resource* omRes = TrackOMBind(list, count, handles, depth);
+    // Diagnostic only: note a display-sized R16G16_FLOAT RTV requested by
+    // this command-list recording. The census does not infer writes/content.
+    NoteMvOmTarget(list, shim, count, handles);
     // Targeted diagnostic: prove whether main gameplay OM is observed
     {
         bool isTargeted = false;
@@ -3962,6 +4346,65 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
         for (UINT i = 0; i < numLists; ++i) {
             ID3D12GraphicsCommandList* cl = nullptr;
             if (SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&cl))) && cl) {
+                // Bounded producer census: an observed closed recording has
+                // an OM-bound display-sized fmt-34 target and direct draws,
+                // and this list pointer is present in the submitted batch.
+                // This is not GPU-completion, contents, or frame-alignment
+                // proof. Indirect draws/bundles and unshimmed records are gaps.
+                MvRecordingSnapshot mvSnapshot = {};
+                bool haveMvSnapshot = CaptureMvRecordingSnapshot(cl, &mvSnapshot);
+                if (haveMvSnapshot && !mvSnapshot.clonedVtblMatches) {
+                    InterlockedIncrement64(&g_mvRecordingCloneMismatchTotal);
+                    // A mismatch means our recording hooks may have missed a
+                    // later Reset/recording on this object. Report only the
+                    // last MV-like state our shim observed, never label it as
+                    // the current recording or as fresh GPU work.
+                    if (mvSnapshot.target && mvSnapshot.omCount > 0 &&
+                        (mvSnapshot.drawCount > 0 || mvSnapshot.indexedDrawCount > 0)) {
+                        static volatile LONG64 s_lastObservedMvDetail = 0;
+                        LONG64 detail = InterlockedIncrement64(&s_lastObservedMvDetail);
+                        if (detail <= 8 || (detail % 5000) == 0) {
+                            Log("mv-record: last-observed-on-mismatched-list detail=%lld list=%p queue=%p batchIndex=%u batchCount=%u actualVtbl=%p expectedClone=%p expectedOriginal=%p type=%u epoch=%lld closed=%u stableAtSnapshot=%u resetInProgress=%u resetFailed=%u target=%p size=%dx%d om=%lld draw=%lld indexed=%lld dispatch=%lld recordPresent=%lld recordEcl=%lld submitPresent=%lld submitEcl=%lld",
+                                detail, (void*)cl, (void*)queue, i, numLists,
+                                mvSnapshot.actualVtbl, mvSnapshot.expectedClonedVtbl,
+                                mvSnapshot.expectedOriginalVtbl, mvSnapshot.listType,
+                                (long long)mvSnapshot.epoch, mvSnapshot.closed ? 1u : 0u,
+                                mvSnapshot.stable ? 1u : 0u,
+                                mvSnapshot.resetInProgress ? 1u : 0u,
+                                mvSnapshot.resetFailed ? 1u : 0u,
+                                (void*)mvSnapshot.target, (int)mvSnapshot.width,
+                                (int)mvSnapshot.height, (long long)mvSnapshot.omCount,
+                                (long long)mvSnapshot.drawCount,
+                                (long long)mvSnapshot.indexedDrawCount,
+                                (long long)mvSnapshot.dispatchCount,
+                                (long long)mvSnapshot.recordPresent,
+                                (long long)mvSnapshot.recordEcl,
+                                (long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                                (long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+                        }
+                    }
+                }
+                if (haveMvSnapshot && mvSnapshot.clonedVtblMatches &&
+                    mvSnapshot.stable && mvSnapshot.omCount > 0 &&
+                    (mvSnapshot.drawCount > 0 || mvSnapshot.indexedDrawCount > 0)) {
+                    LONG64 submitted = InterlockedIncrement64(&g_mvRecordingSubmittedTotal);
+                    LONG64 logged = InterlockedIncrement64(&g_mvRecordingSubmittedDetail);
+                    if (logged <= 12 || (submitted % 1000) == 0) {
+                        Log("mv-record: submitted count=%lld list=%p queue=%p batchIndex=%u batchCount=%u type=%u epoch=%lld cloneVtbl=%u target=%p size=%dx%d om=%lld draw=%lld indexed=%lld dispatch=%lld recordPresent=%lld recordEcl=%lld submitPresent=%lld submitEclBefore=%lld",
+                            (long long)submitted, (void*)cl, (void*)queue, i, numLists,
+                            mvSnapshot.listType, (long long)mvSnapshot.epoch,
+                            mvSnapshot.clonedVtblMatches ? 1u : 0u,
+                            (void*)mvSnapshot.target, (int)mvSnapshot.width,
+                            (int)mvSnapshot.height, (long long)mvSnapshot.omCount,
+                            (long long)mvSnapshot.drawCount,
+                            (long long)mvSnapshot.indexedDrawCount,
+                            (long long)mvSnapshot.dispatchCount,
+                            (long long)mvSnapshot.recordPresent,
+                            (long long)mvSnapshot.recordEcl,
+                            (long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+                    }
+                }
                 // Diagnostic only: record shim coverage per submitted list.
                 // Does not change install/forwarding behavior below.
                 // Type comes from our own shim table when available; no guarded
@@ -4002,6 +4445,18 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                         Log("hooks: ECL list list=%p shimHit=%d type=%u (n=%d hits=%lld misses=%lld ptrReg=%lld ptrUnreg=%lld instOk=%lld instDedup=%lld instFail=%lld)",
                             (void*)cl, preShim ? 1 : 0, clType, (int)nd, hits, misses,
                             ptrReg, ptrUnreg, instOk, instDedup, instFail);
+                        Log("mv-record: coverage submitted=%lld om=%lld qualifyingOm=%lld draws=%lld resets=%lld/%lld/%lld closes=%lld/%lld/%lld cloneMismatch=%lld",
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingSubmittedTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingOmSetTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingQualifyingOmTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingDrawTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingResetTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingResetSuccessTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingResetFailTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingCloseTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingCloseSuccessTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingCloseFailTotal, 0, 0),
+                            (long long)InterlockedCompareExchange64(&g_mvRecordingCloneMismatchTotal, 0, 0));
                     }
                     // Integrity detail only on sampled misses whose pointer is
                     // registered: snapshot states whether our clone is intact,
@@ -7790,6 +8245,18 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     ID3D12Resource* depCand = nullptr;  // selected engine depth candidate (scope for diagnostics)
     LONG64 mvGeneration = 0;
     LONG64 depthGeneration = 0;
+    ResourceTouchSnapshot mvTouchDiag = {}, depthTouchDiag = {};
+    bool mvTouchDiagRead = false, depthTouchDiagRead = false;
+    bool mvTouchDiagMatch = false, depthTouchDiagMatch = false;
+    unsigned long long mvTouchDiagAge = 9999, depthTouchDiagAge = 9999;
+    const char* mvTouchDiagSlot = "none";
+    ResourceTouchLedger* mvTouchDiagLedger = nullptr;
+    ResourceTouchLedger* depthTouchDiagLedger = nullptr;
+        ID3D12Resource* mvAltDiag = g_mvResourceAlt;
+        LONG64 mvAltGenerationDiag = InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0);
+        bool mvAltGenerationCurrent = false;
+        bool mvAltDescRead = false;
+        D3D12_RESOURCE_DESC mvAltDesc = {};
     if (g_shadowRealInputs) {
         realWhy = "unchecked";
         ID3D12Resource* mv = g_mvResource;
@@ -7805,18 +8272,41 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         // wrong-sized primary must not pin us to zeros while a live,
         // display-sized ALT exists (observed: stable 1902x1033 primary vs
         // live 1920x1080 ALTs all run).
-        if ((!mvAlive || mvd.Format != DXGI_FORMAT_R16G16_FLOAT ||
-             mvd.Width != g_displayW || mvd.Height != g_displayH) &&
-            g_mvResourceAlt &&
-            ResourceGenerationMatches(g_mvResourceAlt,
-                InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0)) &&
-            SafeGetDesc(g_mvResourceAlt, &mvd)) {
-            mv = g_mvResourceAlt;
-            mvGeneration = InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0);
+        bool considerMvAlt = !mvAlive || mvd.Format != DXGI_FORMAT_R16G16_FLOAT ||
+                             mvd.Width != g_displayW || mvd.Height != g_displayH;
+        if (considerMvAlt && mvAltDiag) {
+            mvAltGenerationCurrent = ResourceGenerationMatches(mvAltDiag, mvAltGenerationDiag);
+            if (mvAltGenerationCurrent) mvAltDescRead = SafeGetDesc(mvAltDiag, &mvAltDesc);
+        }
+        if (considerMvAlt && mvAltDiag && mvAltGenerationCurrent && mvAltDescRead) {
+            mv = mvAltDiag;
+            mvd = mvAltDesc;
+            mvGeneration = mvAltGenerationDiag;
             mvGenerationCurrent = true;
             mvAlive = true;
         }
         mvCand = mv; depCand = dep;
+        if (mv == g_mvResource) {
+            mvTouchDiagSlot = "primary";
+            mvTouchDiagLedger = &g_mvPrimaryTouchLedger;
+            mvTouchDiagRead = CaptureTouchLedger(mvTouchDiagLedger, &mvTouchDiag);
+        } else if (mv == g_mvResourceAlt) {
+            mvTouchDiagSlot = "alt";
+            mvTouchDiagLedger = &g_mvAltTouchLedger;
+            mvTouchDiagRead = CaptureTouchLedger(mvTouchDiagLedger, &mvTouchDiag);
+        }
+        if (dep == g_depthResource) {
+            depthTouchDiagLedger = &g_depthTouchLedger;
+            depthTouchDiagRead = CaptureTouchLedger(depthTouchDiagLedger, &depthTouchDiag);
+        }
+        mvTouchDiagMatch = mvTouchDiagRead && mvTouchDiag.valid &&
+            mvTouchDiag.resource == mv && mvTouchDiag.generation == mvGeneration;
+        depthTouchDiagMatch = depthTouchDiagRead && depthTouchDiag.valid &&
+            depthTouchDiag.resource == dep && depthTouchDiag.generation == depthGeneration;
+        if (mvTouchDiagMatch && (LONG64)presentSerial >= mvTouchDiag.present)
+            mvTouchDiagAge = presentSerial - (unsigned long long)mvTouchDiag.present;
+        if (depthTouchDiagMatch && (LONG64)presentSerial >= depthTouchDiag.present)
+            depthTouchDiagAge = presentSerial - (unsigned long long)depthTouchDiag.present;
         bool depAlive = depthGenerationCurrent && dep && SafeGetDesc(dep, &depd);
         if (InterlockedCompareExchange(&g_resourceAddressGenerationOverflow, 0, 0))
             realWhy = "resource-generation-overflow";
@@ -7904,9 +8394,15 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             ID3D12Resource* depP = depCand ? depCand : inDepth;
             bool mOk = mvP && SafeGetDesc(mvP, &mvd2);
             bool dOk = depP && SafeGetDesc(depP, &depd2);
-            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s frame=%u mvAge=%u depthAge=%u mvStateB=%u depthStateB=%u present=%llu mvTouchAge=%llu depthTouchAge=%llu",                useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
+            Log("hooks: shadow-eval inputs %s why=%s candMv=%p(%u %ux%u%s) altMv=%p altGen=%lld altGenOK=%u altDescOK=%u altFmt=%u altSize=%ux%u candDepth=%p(%u %ux%u) mvScale=%.0fx%.0f mvClass=%s depthClass=%s frame=%u mvAge=%u depthAge=%u mvStateB=%u depthStateB=%u present=%llu mvTouchAge=%llu depthTouchAge=%llu",
+                useReal ? "REAL" : "ZERO", realWhy, (void*)mvP,
                 mOk ? (unsigned)mvd2.Format : 0, mOk ? (unsigned)mvd2.Width : 0, mOk ? (unsigned)mvd2.Height : 0,
                 (mvP == g_mvResourceAlt) ? " ALT" : "",
+                (void*)mvAltDiag, (long long)mvAltGenerationDiag,
+                mvAltGenerationCurrent ? 1u : 0u, mvAltDescRead ? 1u : 0u,
+                mvAltDescRead ? (unsigned)mvAltDesc.Format : 0u,
+                mvAltDescRead ? (unsigned)mvAltDesc.Width : 0u,
+                mvAltDescRead ? (unsigned)mvAltDesc.Height : 0u,
                 (void*)depP,
                 dOk ? (unsigned)depd2.Format : 0, dOk ? (unsigned)depd2.Width : 0, dOk ? (unsigned)depd2.Height : 0,
                 mvScaleX, mvScaleY, shMvClass, shDepthClass,
@@ -7923,13 +8419,32 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     // are active, BEFORE the NGX evaluation call — so the result survives a fault.
     if (g_shadowRealInputs) {
         Log("hooks: shadow-eval real-inputs why=%s useReal=%d mvTouchAge=%llu depthTouchAge=%llu "
-            "mvTouch=%llu depthTouch=%llu present=%llu",
+            "mvTouch=%llu depthTouch=%llu present=%llu mvCandidate=%p mvGeneration=%lld "
+            "mvSlot=%s mvLedgerRead=%d mvLedgerMatch=%d mvLedgerResource=%p mvLedgerGeneration=%lld "
+            "mvLedgerAge=%llu mvLedgerPresent=%lld mvLedgerEcl=%lld mvLedgerSource=%ld mvLedgerDrops=%lld "
+            "depthCandidate=%p depthGeneration=%lld depthLedgerRead=%d depthLedgerMatch=%d "
+            "depthLedgerResource=%p depthLedgerGeneration=%lld depthLedgerAge=%llu "
+            "depthLedgerPresent=%lld depthLedgerEcl=%lld depthLedgerSource=%ld depthLedgerDrops=%lld",
             realWhy, useReal ? 1 : 0,
             g_mvLastTouchPresent ? (presentSerial - g_mvLastTouchPresent) : 9999,
             g_depthLastTouchPresent ? (presentSerial - g_depthLastTouchPresent) : 9999,
             (unsigned long long)g_mvLastTouchPresent,
             (unsigned long long)g_depthLastTouchPresent,
-            (unsigned long long)presentSerial);
+            (unsigned long long)presentSerial,
+            (void*)mvCand, (long long)mvGeneration,
+            mvTouchDiagSlot, mvTouchDiagRead ? 1 : 0, mvTouchDiagMatch ? 1 : 0,
+            (void*)mvTouchDiag.resource, (long long)mvTouchDiag.generation,
+            mvTouchDiagAge, (long long)mvTouchDiag.present, (long long)mvTouchDiag.ecl,
+            (long)mvTouchDiag.source,
+            (long long)(mvTouchDiagRead ? mvTouchDiag.dropped :
+                (mvTouchDiagLedger ? InterlockedCompareExchange64(&mvTouchDiagLedger->dropped, 0, 0) : 0)),
+            (void*)depCand, (long long)depthGeneration,
+            depthTouchDiagRead ? 1 : 0, depthTouchDiagMatch ? 1 : 0,
+            (void*)depthTouchDiag.resource, (long long)depthTouchDiag.generation,
+            depthTouchDiagAge, (long long)depthTouchDiag.present, (long long)depthTouchDiag.ecl,
+            (long)depthTouchDiag.source,
+            (long long)(depthTouchDiagRead ? depthTouchDiag.dropped :
+                (depthTouchDiagLedger ? InterlockedCompareExchange64(&depthTouchDiagLedger->dropped, 0, 0) : 0)));
     }
 
     UpscalerEvaluateParams ep = {};
@@ -9619,8 +10134,12 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                     // the recorded barrier; the command list may be replayed.
                     if (res == g_depthResource)
                         g_depthLastTouchPresent = SceneSetNow();
+                    if (res == g_depthResource)
+                        NoteDepthTouchIdentity(res, TOUCH_SOURCE_BARRIER);
                     if (res == g_mvResource || res == g_mvResourceAlt)
                         g_mvLastTouchPresent = SceneSetNow();
+                    if (res == g_mvResource || res == g_mvResourceAlt)
+                        NoteMvTouchIdentity(res, TOUCH_SOURCE_BARRIER);
                     else {
                         // Broader MV touch: engines using implicit COMMON-state
                         // transitions never call ResourceBarrier on the MV texture,
@@ -9644,6 +10163,7 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                                     }
                                 }
                                 g_mvLastTouchPresent = SceneSetNow();
+                                NoteMvTouchIdentity(res, TOUCH_SOURCE_BROAD_BARRIER);
                                 g_mvStamp = g_frameCounter;
                             }
                             if (IsDepthFamilyFormat((unsigned)brd.Format)) {
@@ -9659,6 +10179,7 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                                     }
                                 }
                                 g_depthLastTouchPresent = SceneSetNow();
+                                NoteDepthTouchIdentity(res, TOUCH_SOURCE_BROAD_BARRIER);
                                 g_depthStamp = g_frameCounter;
                             }
                         }
@@ -9810,6 +10331,7 @@ static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRend
                         g_mvValid = true;
                         g_mvStamp = g_frameCounter;
                         g_mvLastTouchPresent = SceneSetNow();
+                        NoteMvTouchIdentity(g_boundRtvResource, TOUCH_SOURCE_OM_BIND);
                         if (first) g_mvFirstValidFrame = g_frameCounter;
                         }
                     }
@@ -9833,6 +10355,7 @@ static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRend
                         SetTrackedResourceGeneration(&g_mvResourceAlt, g_boundRtvResource);
                 }
                 g_mvLastTouchPresent = SceneSetNow();
+                NoteMvTouchIdentity(g_boundRtvResource, TOUCH_SOURCE_OM_BIND);
                 static volatile LONG64 s_mvOmBindCount = 0;
                 LONG64 observed = InterlockedIncrement64(&s_mvOmBindCount);
                 if (observed <= 10 || (observed % 500) == 0)
@@ -9899,7 +10422,10 @@ static ID3D12Resource* TrackOMBind(ID3D12GraphicsCommandList* list, UINT numRend
         // does not prove that a depth-writing draw executed in this Present.
         if (boundDepth) {
             const bool selectedDepth = boundDepth == g_depthResource;
-            if (selectedDepth) g_depthLastTouchPresent = SceneSetNow();
+            if (selectedDepth) {
+                g_depthLastTouchPresent = SceneSetNow();
+                NoteDepthTouchIdentity(boundDepth, TOUCH_SOURCE_DSV_BIND);
+            }
             static volatile LONG64 s_depthOmBindCount = 0;
             LONG64 observed = InterlockedIncrement64(&s_depthOmBindCount);
             if (observed <= 10 || (observed % 500) == 0)
@@ -10397,6 +10923,25 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
     slot->copyCount = 0;
     slot->originalVtbl = original;
     slot->clonedVtbl = cloned;
+    slot->close = (PFN_CommandListClose)original[9];
+    slot->reset = (PFN_CommandListReset)original[10];
+    slot->drawInstanced = (PFN_DrawInstanced)original[12];
+    slot->drawIndexedInstanced = (PFN_DrawIndexedInstanced)original[13];
+    slot->dispatch = (PFN_Dispatch)original[14];
+    InterlockedExchange64(&slot->recordingEpoch, 1); // New lists begin recording.
+    InterlockedExchange(&slot->recordingClosed, 0);
+    InterlockedExchange(&slot->recordingResetInProgress, 0);
+    InterlockedExchange(&slot->recordingResetFailed, 0);
+    InterlockedExchangePointer((PVOID volatile*)&slot->currentOmMvTarget, nullptr);
+    InterlockedExchangePointer((PVOID volatile*)&slot->recordedMvTarget, nullptr);
+    InterlockedExchange(&slot->mvTargetWidth, 0);
+    InterlockedExchange(&slot->mvTargetHeight, 0);
+    InterlockedExchange64(&slot->mvTargetOmCount, 0);
+    InterlockedExchange64(&slot->mvTargetDrawCount, 0);
+    InterlockedExchange64(&slot->mvTargetIndexedDrawCount, 0);
+    InterlockedExchange64(&slot->dispatchCount, 0);
+    InterlockedExchange64(&slot->mvTargetRecordPresent, 0);
+    InterlockedExchange64(&slot->mvTargetRecordEcl, 0);
     // ID3D12GraphicsCommandList vtable slots from the Windows SDK
     // (10.0.28000.0 DECLSPEC_XFGVIRT order cross-checked):
     // CopyBufferRegion=15, CopyTextureRegion=16, CopyResource=17,
@@ -10427,6 +10972,11 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
     cloned[22] = (void*)&Shim_RSSetScissorRects;
     cloned[46] = (void*)&Shim_OMSetRenderTargets;
     cloned[26] = (void*)&Shim_ResourceBarrier;
+    cloned[9] = (void*)&Shim_CommandListClose;
+    cloned[10] = (void*)&Shim_CommandListReset;
+    cloned[12] = (void*)&Shim_DrawInstanced;
+    cloned[13] = (void*)&Shim_DrawIndexedInstanced;
+    cloned[14] = (void*)&Shim_Dispatch;
 
     bool installed = true;
     __try { *(void***)list = cloned; }
@@ -10447,6 +10997,16 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
         slot->rsSetScissorRects = nullptr;
         slot->omSetRenderTargets = nullptr;
         slot->resourceBarrier = nullptr;
+        slot->close = nullptr;
+        slot->reset = nullptr;
+        slot->drawInstanced = nullptr;
+        slot->drawIndexedInstanced = nullptr;
+        slot->dispatch = nullptr;
+        InterlockedExchange(&slot->recordingClosed, 1);
+        InterlockedExchange(&slot->recordingResetInProgress, 0);
+        InterlockedExchange(&slot->recordingResetFailed, 1);
+        InterlockedExchangePointer((PVOID volatile*)&slot->currentOmMvTarget, nullptr);
+        InterlockedExchangePointer((PVOID volatile*)&slot->recordedMvTarget, nullptr);
         VirtualFree(cloned, 0, MEM_RELEASE);
         InterlockedIncrement64(&g_installFailTotal);
         ReleaseSRWLockExclusive(&g_commandListShimLock);
@@ -10454,15 +11014,20 @@ void InstallCommandListHooks(ID3D12GraphicsCommandList* list, UINT listType)
         return;
     }
 
-    void* targets[8] = { (void*)&Shim_CopyBufferRegion,
+    void* targets[13] = { (void*)&Shim_CopyBufferRegion,
                          (void*)&Shim_CopyTextureRegion,
                          (void*)&Shim_CopyResource,
                          (void*)&Shim_SetGraphicsRootDescriptorTable,
                          (void*)&Shim_RSSetViewports,
                          (void*)&Shim_RSSetScissorRects,
                          (void*)&Shim_OMSetRenderTargets,
-                         (void*)&Shim_ResourceBarrier };
-    CfgMarkValid(targets, 8);
+                         (void*)&Shim_ResourceBarrier,
+                         (void*)&Shim_CommandListClose,
+                         (void*)&Shim_CommandListReset,
+                         (void*)&Shim_DrawInstanced,
+                         (void*)&Shim_DrawIndexedInstanced,
+                         (void*)&Shim_Dispatch };
+    CfgMarkValid(targets, 13);
     InterlockedIncrement64(&g_installOkTotal);
     ReleaseSRWLockExclusive(&g_commandListShimLock);
     Log("hooks: command-list read-only shim installed list=%p original=%p cloned=%p",
