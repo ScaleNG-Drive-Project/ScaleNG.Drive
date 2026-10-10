@@ -1,5 +1,66 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (REAL-blocker parallel investigation + touch-rate diagnostic)
+
+- **Agents (all read-only, all returned):** A run-artifact table (6 runs,
+  counts verified two ways); B MV call-path map; C depth path; D
+  color/handoff/frame-association; E concurrency re-review (7 hazards);
+  F harness semantics + observability gaps. Head verified `572c59e` by
+  every agent; line numbers below are `src/d3d12_hooks.cpp` at that HEAD
+  unless marked NEW (diagnostic commit follows).
+- **Agreed blocker (A+B+C reconciled):** decisive gate is
+  `mv-stale-present` (`:8362`) — newest run `20261010T120242Z`: 3115/3118
+  heartbeats, MV touch frozen at present 240 (ages 602+ vs threshold 3)
+  while candidate ALT stays live, gen-current, correctly sized.
+  First-in-time minority: `depth-generation-stale` (`:8349`, 3x) from
+  genuine address reuse (candidate reused as 359x379/f28) — correct
+  rejection. Depth mechanism proven working end-to-end (later adoption
+  e13 goes generation-current and passes the depth gates; majority lines
+  then block on MV). Zero `useReal=1`, zero `ENGINE_*` in all runs.
+- **H1-vs-H2 decided by NEW diagnostic data (with a disclosed flaw):**
+  per-interval touch counters on the sampled topo snapshot (NEW commit,
+  22+/2-, gates untouched) show post-load windows at all zeros on the
+  OM-bind (`mvOm`) and selected-DSV (`depDsv`) channels — direct-hook
+  paths, not shim-dependent — with a positive control (loading bursts +
+  a 148/162 churn burst at p1085 register nonzero). FAVORS H2 (genuine
+  engine silence at hook points in the static scene) over H1
+  (shim-blindness). FLAW FOUND BY LEAD REVIEW: in the run's build the two
+  barrier-channel increments sat OUTSIDE their pointer-match `if`s, so
+  `mvBar`/`depBar` counted generic barrier traffic (VOID for that run);
+  OM/DSV channels were correctly scoped and stand. Corrected in the
+  committed diagnostic (braced blocks, rebuilt clean). Barrier-channel
+  data must be recollected; broad-pattern adoption logs remain cap-blind
+  (caps of 4 hit in loading).
+- **E-hazard triage (lead-verified):** #5 deadlock REFUTED — brace-scope
+  script over all 42 `BookGuard` sites: zero book→candidate nests (only
+  candidate→book at `:5760`, no cycle; script limits + spot checks
+  noted). #7 SEH hang REFUTED for the ASI (`/EHa` at `build_asi.bat:38`;
+  `/EHsc` is the helper EXE only). #2 re-adopt dangling: open but
+  contained (generation left 0 → shadow fail-closed; bridge flow has
+  outer `__try` abandon). #1 raw-`GetDesc` sites: open, pre-existing,
+  none implicated. #3 stale fail-open: narrowed (bb untracked→skip is
+  fail-closed; `Barrier` no-ops untracked). #4 TOCTOU, #6 leak: noted,
+  benign-or-theoretical. NO new code change from E beyond E1/E2.
+- **D gaps stand:** fallback inputs are owned zeros (no association
+  question); REAL path logs identity+recency only; ~10 code disclaimers
+  deny same-frame proof; handoff bit = submitted copy; queue identity and
+  engine-fence waits absent. Gates passing would still not prove
+  same-frame color/MV/depth.
+- **Diagnostic run `20261010T123142Z` (PID 14792, 40 s, flawed-counter
+  build `4368FD4F`):** Present 1→3725, 14 ZERO evals + handoff, 0 REAL
+  evals, 2,995 heartbeats, 0 failures/fatals/breakers, exit 1 (orderly
+  tails, no dump, INI restored). Touch windows: loading bursts nonzero,
+  steady state zeros (OM/DSV channels valid read). mvTouch frozen 230,
+  depthTouch max 1016. Establishes the H2 lean + validates the
+  counter machinery; barrier channels recollected later.
+- **No gate/validation change in this pass.** Diagnostic only (reversible,
+  9 small hunks). Committed as focused src commit; STATUS here records
+  audit. Next: motion test (camera drive / Motion Blur) with the
+  CORRECTED build to test H2's boundary (static-culling vs structural
+  invisibility); then frame-association instrumentation design.
+- **Rollback:** revert diagnostic src commit, rebuild, redeploy. Dumps,
+  logs, runs intact and local-only.
+
 ## Checkpoint — 2026-10-10 (E2 implemented, built, tested once; under review)
 
 - **What:** E2 guards the remaining unguarded shared-map reads on the
