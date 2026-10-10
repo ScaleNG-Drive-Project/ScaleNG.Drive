@@ -3048,7 +3048,7 @@ void CreateDlssOut()
         return;
     }
     g_dlssOutValid = true;
-    g_resourceStates[g_dlssOut] = D3D12_RESOURCE_STATE_COMMON;
+    { BookGuard _bgState; g_resourceStates[g_dlssOut] = D3D12_RESOURCE_STATE_COMMON; }
     Log("hooks: dlssOut %p allocated (%ux%u)", (void*)g_dlssOut, g_displayW, g_displayH);
 }
 
@@ -9849,12 +9849,12 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     if (!srcIsTracked && !g_sceneColorAlt) {
                         // Metadata only on a real store (self-adopt guard).
                         if (StoreTracked(&g_sceneColorAlt, src->pResource)) {
-                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        { BookGuard _bgState; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
                         Log("hooks: terminal pair node adopted as ALT %p (f10)", (void*)src->pResource);
                         }
                     } else if (!dstIsTracked && !g_sceneColorAlt) {
                         if (StoreTracked(&g_sceneColorAlt, dst->pResource)) {
-                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        { BookGuard _bgState; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
                         Log("hooks: terminal pair node adopted as ALT %p (f10 dst)", (void*)dst->pResource);
                         }
                     } else if (!altIsPairHalf && g_sceneColorAlt &&
@@ -9863,7 +9863,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                         (void)oldAlt;
                         ID3D12Resource* cand = srcIsTracked ? dst->pResource : src->pResource;
                         if (StoreTracked(&g_sceneColorAlt, cand)) {
-                        g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON;
+                        { BookGuard _bgState; g_resourceStates[g_sceneColorAlt] = D3D12_RESOURCE_STATE_COMMON; }
                         Log("hooks: terminal pair REPLACED non-pair ALT -> %p (f10)", (void*)cand);
                         }
                     }
@@ -9892,7 +9892,7 @@ static void CopyTexBody(ID3D12GraphicsCommandList* list,
                     if (!StoreTracked(&g_sceneColor, src->pResource)) { /* keep prior */ }
                     else {
                     g_sceneColorValid = true;
-                    g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    { BookGuard _bgState; g_resourceStates[g_sceneColor] = D3D12_RESOURCE_STATE_COPY_SOURCE; }
                     AdoptDisplaySize((unsigned int)sd.Width, (unsigned int)sd.Height);
                     Log("hooks: scene color adopted from copy source %p", (void*)g_sceneColor);
                     }
