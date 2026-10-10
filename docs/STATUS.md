@@ -202,6 +202,66 @@ Modify `WasListHooked` (line 1643-1653) to read the current vtable from the list
 - **Rollback:** `git revert 668df64`, rebuild via `src\build_asi.bat`,
   redeploy. Dumps/logs/runs intact and local-only.
 
+## Checkpoint — 2026-10-10 (observation-only diagnostics committed)
+
+### Committed: 03a7bdf711bf9a978db39cc1aa279bcdcdc084bf
+- **Binary (ScaleNG.asi) SHA256:** `53F9B84353002B0D4E33FE9D6190B549B0324AA9667263BD81F02F64A10D0620`
+- **PE TimeDateStamp:** `0x6ACA5C6C` (2026-10-10 15:40:28 UTC)
+- **Build:** `src/build_asi.bat` via MSVC 19.x (/O2 /EHa /std:c++17 /LD /MT)
+- **Source change:** 66 insertions in `src/d3d12_hooks.cpp`, 0 deletions, 0 other files
+
+### What changed
+1. **Part A — CreateCommandList1 diagnostic hook (slot 51, ID3D12Device4).**
+   MinHook on `dv[51]` mirroring the existing `CreateCommandList` hook at slot 12.
+   The hook forwards to the real method; logs count + first 8 + every 200th.
+   Does **NOT** call `InstallCommandListHooks` or modify any list vtable.
+   Guarded by `g_realListHookInstalled` and one-shot `g_diagCC1Installed`.
+
+2. **Part B — ECL vtable identity classification.**
+   In `Hook_ExecuteCommandLists`, classifies `actualVtbl` against
+   `expectedCloned` and `expectedOriginal` for shim-miss registered lists.
+   Categories: `clone-active`, `original-restored`, `foreign-vtable`.
+   Bounded: first 10 + every 1000th. Uses existing `FindShimByListOnly` data.
+
+3. **Part C — No changes** to REAL gates, fail-closed validation, breakers,
+   table capacity, or creation/install logic.
+
+### Reviewer verdicts
+- Reviewer 1 (hook-recovery safety): VERIFIED — no vtable writes, no table entries,
+  ABI correct, log-volume bounded, concurrency safe (atomic counters, no locks needed).
+- Reviewer 3 (CreateCommandList1 slot verification): VERIFIED slot 51 against
+  SDK 10.0.28000.0 header (d3d12.h line 13031); confirmed CreateCommandList1
+  is on ID3D12Device4 (not ID3D12Device1); confirmed game QI's to Device4.
+- Compiler note: variable names with trailing digits (lst1, ccl1) triggered C2059;
+  renaming to cc1st/cc1Target resolved the build.
+
+### What the instrumentation will tell us
+- **Part A:** Whether the engine calls `CreateCommandList1` at all. Log shows
+  `#N` count and list pointer/vtable for first 8 + every 200th call.
+  If 0 calls → problem is vtable restoration, not creation path.
+  If >0 calls → lists from this path lack creation-time hooks.
+
+- **Part B:** Classification of all 113,967 shim-miss submissions.
+  If all `original-restored` → runtime state-vtable swap (safe to re-point later).
+  If any `foreign-vtable` → third-party hook detected (must not overwrite).
+
+### What the instrumentation cannot establish
+- Slot 51 correctness at RUNTIME: relies on `dv[51]` being non-null and a
+  valid function address. If the game never QI's to Device4, slot 51 may be
+  invalid — MinHook would fail and log the failure (non-fatal).
+- Vtable change timing: between reading and logging, the runtime could
+  swap again. The log captures a single observation point.
+- Causal link: logs show correlation (list X lost vtable at submission Y),
+  not causation (which runtime operation caused the swap).
+
+### Proposed single controlled test
+One 40–75 s BeamNG session (`-level GridMap -vehicle pickup -console -gfx d3d12`):
+- Watch: crash absence, `table full` log rate, CCL1 diag hook install result,
+  vtable-class distribution, `instOk`/`instFail` deltas, breakers/fatals.
+- Stop immediately on any ScaleNG fault; preserve dump.
+- Success = clean run + sane counters + clear vtable-class evidence.
+- **NOT yet launched** — awaiting approval.
+
 ## Checkpoint — 2026-10-10 (bounds audit: all arrays clean; new lead — vector race)
 
 - **Scope/method.** Seven read-only workstreams at HEAD `aa3b008`
