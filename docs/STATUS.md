@@ -44,6 +44,21 @@
 - **Falsifiability (unchanged):** one serialized short test of the changed
   build; clean runs support the race diagnosis, a repeat AV at the same
   site/shape refutes sufficiency. REAL stays fail-closed throughout.
+- **Test evidence — run `20261010T112850Z` (PID 4432, E1 build, 40s
+  `--real-test`, same setup as the crash run):** freeroam + `thePlayer`;
+  Present 1→3845/3849 across 37 snapshots; 14 fallback (ZERO-mode)
+  shadow-eval ok with handoff, 0 eval/reset/allocator failures, 0 fatal
+  markers, 0 breaker events; exit code 1 (harness post-observation cleanup,
+  same as stable run `230600Z`); outcome `FAIL` ONLY for the REAL-input
+  objective (0 REAL evals; rejections `mv-stale-present`/`mv-retired` —
+  validation unweakened, 2,948 REAL heartbeats, 0 violations). No crash dump
+  for PID 4432, no leftover process, runtime INI restored (`True`). The
+  previously-fatal purge path executed 500+ times (`tracked-address-reuse
+  generation n=500 … present=3561`, same recycled-address scenario) with
+  continued operation to Present 3849. This SUPPORTS the race diagnosis; it
+  does not prove it (one run; races are timing-dependent) and the race
+  remains the leading hypothesis, not a proven fact. Artifacts:
+  `logs/test_runs/20261010T112850Z/` (kept local-only).
 - **Reviewer note:** raw dump, run logs, and `%TEMP%\opencode` scripts
   remain local-only and intact; this section plus the pushed src commit are
   the reviewable record.
