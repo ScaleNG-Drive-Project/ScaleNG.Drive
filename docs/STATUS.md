@@ -1,5 +1,56 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (E3 blocked: second early-loading crash, E1-falsifying)
+
+- **E3 motion test DID NOT EXECUTE (Outcome D).** Run `20261010T124606Z`
+  (PID 14692) crashed with `0xC0000005` at Present ~245-260 before any
+  evals — same early-loading signature as `20261009T231132Z`. The motion
+  driver never sent keys (its tail-polled present anchor missed as the log
+  truncated at the crash), so no motion data exists and the H1/H2 question
+  is untouched. No input confound: crash is spontaneous. No further runs.
+- **Crash identity (verified, read-only):** event 1000, `ScaleNG.asi` ts
+  `0x6aca3394`, offset `0x1A970`, PID `0x3964`=14692, report
+  `49dd15e9-3a23-4bab-856c-24fc8441974b`. Loaded binary = harness rebuild
+  of diagnostic source (`27c31a7` content; log stamp `Oct 10 2026
+  15:46:09`, `asiBase 7FF875EE0000`). Dump `...14692.dmp` (174,338,660 B)
+  preserved; no leftover process. Last plugin line AGAIN the purge entry:
+  `tracked-address-reuse n=9 api=Placed res=80ECEF3440 depth=1 ...
+  present=260 ecl=999`. Snapshot just before shows the NEW counters live
+  (`mvOm=0 mvBar=1 depDsv=3 depBar=7`) plus bb/scene `desc-fault`s.
+- **Falsification result:** dump triage (same MINIDUMP method) shows a
+  BYTE-IDENTICAL fault: read of `0x28` (`cmp [rax+0x28],rdi`, `rax=0`),
+  `rdi`/`rdx` = just-created placed texture, `rcx`/`rbx` = ASI+`0x107280`
+  (same image offset), `r8` = uncaptured heap, module size `0x123000`,
+  near-identical BEAM caller stack. Only the RVA moved (`0x1A810`→
+  `0x1A970`, +`0x160` from inserted helper/diagnostic code). THEREFORE the
+  corruption vector is NOT among E1's five sites — E1 is upheld as
+  hygiene (those races were real by code inspection) but FALSIFIED as the
+  crash fix. E1/E2 stay; no revert warranted (fault code predates them).
+- **Audit extensions completed (all read-only):** no `->second =`
+  iterator writes (3 matches, all reads/compares); no cross-TU map access
+  (`main`/`camera_cb` clean; `dlss_ngx` has only a local config map); no
+  map aliases (`&g_...` none; only by-ref params called under guard);
+  CopyDescriptors find/erase/insert paths guarded (`:4237`, `:4300`);
+  `Log` uses bounded custom formatter + spinlock (heap-overflow via Log
+  unlikely). The six `std::map` globals are the complete set.
+- **Remaining hypotheses, ranked:** (1) an unsynchronized writer STILL
+  unidentified (audit methods: name/method/alias/TU scans — macro or
+  generated mutation not yet excluded); (2) heap overflow from fixed
+  arrays/counters stomping a map node (NOT yet audited — concrete next
+  workstream: bounds-check `g_createdRefs[256]`, `g_owned[16]`,
+  `g_sceneSet[8]`, `g_nativeCandidates[96]`, `g_commandListShims[64]`,
+  copy `copied[256]` paths); (3) same-thread logic reentrancy (no
+  evidence). Crash recurrence is now 2/~11 runs, both in early-loading
+  purge bursts — timing/load-gated, not deterministic.
+- **E3 motion verdict:** INCONCLUSIVE (blocked, not failed). Driver flaw
+  noted (tail-poll anchor; must scan whole file next attempt). Static
+  baseline stands from prior evidence; no motion data collected.
+- **No code change, no rebuild, no redeploy, no retest in this pass.**
+  Deployed binary remains the E3 crash build (harness re-deploys with
+  backup every run; no action needed while no game runs). Next: fixed-
+  array bounds audit offline, then a defensive-plan review — NOT another
+  identical run.
+
 ## Checkpoint — 2026-10-10 (REAL-blocker parallel investigation + touch-rate diagnostic)
 
 - **Agents (all read-only, all returned):** A run-artifact table (6 runs,
