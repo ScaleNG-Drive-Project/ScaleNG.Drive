@@ -1,5 +1,63 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-10 (E2 implemented, built, tested once; under review)
+
+- **What:** E2 guards the remaining unguarded shared-map reads on the
+  Present path with outlined `BookGuard` helpers (C2712-safe: the lock
+  lives in the helper, never as a local in `InjectAtPresentImpl`, which
+  owns direct `__try` frames). Commit `254686c`
+  (`254686c7cafb955a5ce742ca3195ba17039444e5`), src-only, 41+/12-:
+  `https://github.com/ScaleNG-Drive-Project/ScaleNG.Drive/commit/254686c7cafb955a5ce742ca3195ba17039444e5`
+- **Helpers** (`src/d3d12_hooks.cpp:3019-3043` in `254686c`):
+  `FindTrackedState(res, out)` and `FindRtvResource(handle, out)` — null
+  checks, internal `BookGuard`, single `find`, value copy out, bool
+  result. Placed beside `LookupTrackedStates`; that region has no `__try`.
+- **Call-site swaps (3):** (a) `:7070` backbuffer untracked early-return
+  now uses `FindTrackedState` (the old `it` and the write-only `bbState`
+  are gone — `bbState` had zero downstream reads, verified by grep);
+  (b) `:7265-66` depth/MV entry-state restores use `FindTrackedState`
+  with identical `COMMON` defaults; (c) `:7303` MV-registry re-adopt uses
+  `FindRtvResource` (`(SIZE_T)` cast is same-width, lossless) with the
+  null-value check and all downstream `SafeGetDesc`/`StoreTracked`/log
+  uses preserved verbatim. No iterator, reference, or map-storage pointer
+  escapes any protected scope (re-grepped: remaining `find` iterators all
+  live inside guard scopes, incl. `:10346` under `_bgOmrt2`).
+- **Fail-closed:** null inputs return false; untracked keeps the exact old
+  branches (release+return at `:7070-76`, `COMMON` defaults at
+  `:7265-66`); format/self-adopt guards untouched; REAL gates untouched.
+- **Lifetime (explicit):** the map guard proves nothing about COM
+  lifetime. `bb` lifetime is ref-held (`GetBuffer`/`Release` pairing
+  unchanged); `g_depthResource`/`g_mvResource` stay weak with the existing
+  generation + `SafeGetDesc` gates; copied states feed `Barrier()`, which
+  re-reads under guard and no-ops on untracked/match, so a stale copy can
+  at most cause a redundant restore transition inside the existing outer
+  `__try` abandon scope. No new lifetime claim is made.
+- **Lock review:** helpers are leaf (lock + map op only); callers hold no
+  `BookGuard` (none exists in `:6857-7330` outside the helpers);
+  recursive CS tolerates re-entry; RAII covers C++ exits (SEH
+  non-unwinding is pre-existing file-wide behavior). Contention: 3-4
+  single finds per Present vs the purge's pre-existing long-held guard.
+- **Build:** `src\build_asi.bat` clean (no C2712). Manual E2 build ASI
+  `56F6E76D…F1FA3E` PE `0x6aca2946`.
+- **Test (ONE controlled 40 s `--real-test`, run `20261010T120242Z`, PID
+  14988):** source == `254686c` content (worktree clean at build),
+  harness rebuilt 15:02:45, deployed `99CA2BE7…097D62` (matches dist),
+  `asiBase 7FF875DA0000` logged. Present 1→3845, 15 ZERO-mode evals +
+  handoff, 0 REAL evals (`depth-generation-stale`/`mv-stale-present`),
+  3,118 heartbeats, 0 failures/fatals/breakers, exit 1 (orderly tails,
+  live UI, no PID-14988 dump, INI restored) — cleanup termination, same
+  pattern as prior clean runs. Purge path entered 24+ logged times
+  (capped log: n<=24 shown, so >=24 executions) with concurrent
+  presents/evals; per-Present guarded bb lookups ran ~3,845 times. No
+  reader-shaped AV observed. Supports E1+E2; proves neither (one run;
+  race timing-dependent). REAL validation unweakened.
+- **Rollback:** `git revert 254686c`, rebuild, redeploy. Dump/logs/runs
+  intact and local-only.
+- **Next unresolved issue:** exact faulting map still unproven by policy
+  (no symbol inference); reader-side AV never observed in any run; soak
+  continuation watches for purge-site AV (refutes E1) vs Present-thread
+  read-shaped AV (would refute E2's sufficiency).
+
 ## Checkpoint — 2026-10-10 (E1 follow-up: reads audit + soak evidence)
 
 - **Published-state record.** Branch `master`; local HEAD `eedfa30`
